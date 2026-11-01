@@ -1,8 +1,8 @@
 # Windows プログラマブル・ウィンドウマネージャー 統合設計書
 
-Version: 2.3（Opus批判的レビュー＋Phase 0実現性リサーチ[feasibility.md]＋GitHub Actions windows-latestでのPhase 0実機検証[failure-catalog.md]の結果を反映）
+Version: 2.4（Result型によるエラー耐性設計を追加。Opus批判的レビュー＋Phase 0実現性リサーチ[feasibility.md]＋GitHub Actions windows-latestでのPhase 0実機検証[failure-catalog.md]の結果を反映）
 Date: 2026-11-01
-Status: 基本アーキテクチャ決定／個別APIと性能値はPoCで検証／中核状態モデルとPhase順序を本版で見直し／Win32 API挙動の一部をdocs/feasibility.mdの調査結果で具体化／ADR-012・6.2のハング耐性方針はdocs/failure-catalog.mdで実機実証済み
+Status: 基本アーキテクチャ決定／個別APIと性能値はPoCで検証／中核状態モデルとPhase順序を本版で見直し／Win32 API挙動の一部をdocs/feasibility.mdの調査結果で具体化／ADR-012・6.2のハング耐性方針はdocs/failure-catalog.mdで実機実証済み／例外・Result・EffectFailure・PlanValidator・PolicyArtifactのエラー表現をADR-014で整理
 Implementation language: F# / .NET
 Target: Windows 11を初期検証対象とするWindowsデスクトップ。主なCore開発はLinux
 Audience: 開発者、設計レビュアー、AIコーディングエージェント
@@ -10,7 +10,7 @@ Audience: 開発者、設計レビュアー、AIコーディングエージェ�
 
 本書は従来のv1.0〜v1.3を統合し、最新の採用方針で再編集した単独で読める基準設計書である。F*、全ポリシーのDeep Embedded DSL化は採用しない。設計中のF#コードは契約例であり、コンパイル済みの完成実装を意味しない。
 
-関連資料：[feasibility.md](./feasibility.md)（Win32 API挙動の文献調査、既存Windows用タイル型WMの実装調査）、[spikes.md](./spikes.md)（Phase 0技術スパイクの計画）、[failure-catalog.md](./failure-catalog.md)（GitHub Actions windows-latestランナーでの実機検証結果。特に7章ADR-012と6.2のハング耐性方針はここで実証済み）。
+関連資料：[feasibility.md](./feasibility.md)（Win32 API挙動の文献調査、既存Windows用タイル型WMの実装調査）、[spikes.md](./spikes.md)（Phase 0技術スパイクの計画）、[failure-catalog.md](./failure-catalog.md)（GitHub Actions windows-latestランナーでの実機検証結果。特に7章ADR-012と6.2のハング耐性方針はここで実証済み）、[review-result-design.md](./review-result-design.md)（ADR-014のエラー表現設計に対するOpus批判的レビュー全文）。
 ## 0. 意思決定と設計状態
 | ID | 判断 | 状態 |
 |---|---|---|
@@ -27,6 +27,7 @@ Audience: 開発者、設計レビュアー、AIコーディングエージェ�
 | ADR-011 | タイル型WMの中核状態（Workspace、窓順序/Stack、フォーカス履歴、CoreCommand）をCoreの第一級の状態として4章で定義する。Policy IRや診断機構より先にこれを固定する | 採用（v2.1で新設。旧版はこの状態がどこにも定義されておらず、WM本体が空白になっていた） |
 | ADR-012 | OS呼出（Effect適用）は専用スレッド・タイムアウト付きで行い、ハングした対象アプリがCoreの入力処理・安全停止経路をブロックしないようにする | 採用（v2.1で新設） |
 | ADR-013 | Windows Event Normalizerを純粋関数として切り出し、Raw観測（WinEvent種別＋その時点でShellが問い合わせた属性集合）をJournalの入力として記録する。疑似OSはRaw層から駆動できるようにする | 採用（v2.1で新設。旧版は疑似OSが正規化済みイベントより後段からしか駆動できず、分類・正規化起因の不具合を再現できなかった） |
+| ADR-014 | エラー表現を3層に分ける：(1)予期された外部の失敗は境界で`Result`/`NativeCallRecord`に変換、(2)ユーザー提供のLayout関数の失敗は呼出点で捕捉し`LayoutError`に変換、(3)それ以外の例外は変換せずスレッド単位の最上位ハンドラで捕捉し安全停止へ。`EffectFailure`はCoreの反応軸（TargetGone/TargetHung/Denied/Transient/Unclassified）で切り、原因の多様性は`NativeCallRecord`（生の事実、ADR-013のNormalizerと同じ扱いの`classify`関数が解釈する）側で持つ。PlanValidatorの型保証は検証時点のDesiredだけでなく、Shell直前の`GatedEffect`にも及ぶ。PolicyArtifactは`PinnedPolicy`（当時のまま）と`DeployablePolicy`（現行Analyzer通過済み）に分離する | 採用（v2.4で新設。Opusレビュー[review-result-design.md]で「型による保証はシリアライズ・Replay・Retry経路・プロセス境界で途切れる」という指摘を受け、保証の及ぶ範囲を精密化した） |
 
 
 最優先で検証する仮説：実Windowsで観測した不具合を、同じCoreと取得した証拠に基づく疑似OS上に持ち込み、失敗する最小シナリオを作成して修正前後の挙動を比較できる。
@@ -150,6 +151,7 @@ Deep DSLが有利なのは、設定の構造検査や静的な変換・保存で
 [<Struct>] type LayoutId = LayoutId of string
 [<Struct>] type EvidenceId = EvidenceId of string
 [<Struct>] type ScenarioId = ScenarioId of string
+[<Struct>] type BatchId = BatchId of int64 // v2.4で追加（ADR-014/1-5対応）。ApplyBatchの識別子。子Effectは自分のRequestIdを保つ
 WindowIdはCore内の寿命管理済みIDであり、生の`HWND`ではない。Shellが`HWND → WindowId`を対応付け、破棄後は同じIDを再利用しない。HWNDの再利用・プロセス再起動・遅延イベントを考慮して、対象の同一性を再確認する。`RequestId`は発行要求の追跡、`IntentEpoch`は新しい意図で古いPendingを失効させるための識別子とする。
 ### 4.2 座標と属性
 type PixelRect = {
@@ -160,7 +162,7 @@ type PixelRect = {
 }
 
 type Observation<'T> = {
-    Value: 'T
+    Value: Result<'T, NativeCallRecord> // v2.4で変更（ADR-014、1-9対応）。NativeCallRecordは7.1参照
     SampleSequence: int64
     MonotonicTime: int64
     Source: string
@@ -185,6 +187,8 @@ X/Yは負値を許容し、`Width/Height`は正でなければならない。実
 **座標系の契約（v2.1で追加、A-3対応／v2.2でfeasibility.md §6により具体化／v2.3でGitHub Actions windows-latest実機検証により確定：自作WinForms窓・notepad.exeの両方で`diff(L,T,R,B)=(7,0,7,7)`pxを実測、failure-catalog.md F01）**：CoreとPolicy/LayoutがやりとりするPixelRectは「可視フレーム矩形（DWM拡張フレーム境界、`DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`で取得）」を指すと定義する。`SetRect` Effect（7.1参照）が渡す値もこの可視フレーム矩形であり、Shellは`SetWindowPos`に渡す実際のウィンドウ矩形（`GetWindowRect`）との差分（Windows 10標準で1辺あたり約7px、DPIにより変動）を自分で補正する。この補正無しでは、ほぼ全ての窓でDesiredとObservedが恒常的に数px食い違い、収束不能（Suspended化）が初日から多発する。実装パターンは、既存のWindows用タイル型WM（komorebi）の`window_rect`/`shadow_rect`関数が確立している：`DWMWA_EXTENDED_FRAME_BOUNDS`を優先的に取得し失敗時のみ`GetWindowRect`にフォールバックする（`window_rect`）、両者の差分を「シャドウ分」として別管理し`SetWindowPos`呼び出し時に加算する（`shadow_rect`）、という2関数構成をShell実装の指針とする。ただし、**ウィンドウがまだ一度も表示されていない生成直後は`DwmGetWindowAttribute`が`GetWindowRect`と同値を返す**という既知の注意点があり、初回配置のタイミング（最初の`ObserveWindow`の発行時点）に反映する。またkomorebi自身もDPIスケーリングが100%でない場合の差分計算を未完了（TODOコメントが残る）としており、本WMもこの点をPhase 0で未解決領域として明示的に扱う。Phase 0の完了条件（18章）に「対象アプリごとに可視フレームとウィンドウ矩形の差分を計測し、補正込みで一致判定できる」ことを含める。
 
 MinWidthHint等は観測・推定・設定の由来を区別する。単発の「500pxを要求して700pxを観測」を「OSが保証する最小幅700px」という確定事実に昇格させない。
+
+**観測の失敗を型で区別する（v2.4で追加、ADR-014/1-9対応）**：`Observation<'T>`の`Value`を`Result<'T, NativeCallRecord>`にしたのは、「まだ観測していない」（`WindowSnapshot`の各フィールドが`option`で`None`）と「観測を試みたが`GetWindowRect`/`DwmGetWindowAttribute`等が失敗した」（`Some { Value = Error ... }`）を区別するためである。これにより11.1の`EvidenceGap`（`MissingVisibleBounds`等）が、単に未取得なのか取得に失敗し続けているのかを機械的に判別できる。
 ### 4.3 管理状態
 - Discovered：候補として見つかったが属性の調査中。
 - Managed：タイル配置の対象。
@@ -367,6 +371,7 @@ type Placement = { Window: WindowId; Target: PixelRect }
 type LayoutError =
     | InvalidInput of string
     | Unsatisfiable of string
+    | LayoutCrashed of exnType: string // v2.4で追加（ADR-014/4-2対応）。メッセージは非決定的なので型名のみ記録
 
 type LayoutFunction =
     LayoutArgs -> LayoutContext -> Result<Placement list, LayoutError>
@@ -380,16 +385,27 @@ type LayoutImplementation = {
 PolicyIRは`LayoutId + ApiVersion + Args`のみを保存し、RegistryがF#関数を解決する。`ImplementationDigest`はビルド成果物と対応し、再現時に同じ実装であるか検証する。異なるアセンブリを同一バージョンとみなさない。
 
 F#の型だけでは`Calculate`の純粋性を証明できない。CoreからI/O依存を排除し、コードレビュー、依存ルール、繰り返し評価テスト、入力固定テストで管理する。自由なユーザーF#コードをHostへ無条件にロードすることは避け、初期は信頼済み拡張のみとする。
+
+**Layout呼出点での例外捕捉（v2.4で追加、ADR-014/4-2対応）**：`Calculate`は「自由なF#製レイアウトアルゴリズム」（1.2）であり、`Result`を返す型であっても内部で0除算や範囲外アクセス等の例外を投げ得る。Registryが`Calculate`を呼ぶ唯一の地点で捕捉し、`LayoutCrashed`へ変換する。
+```fsharp
+let invokeLayout (impl: LayoutImplementation) (args: LayoutArgs) (ctx: LayoutContext) : Result<Placement list, LayoutError> =
+    try impl.Calculate args ctx
+    with ex -> Error (LayoutCrashed (ex.GetType().FullName))
+```
+これにより、1つのレイアウト実装のバグで6.3の「前回のDesiredへ」フォールバックに正しく入り、Reducerループ（16.2の「安全な停止」）まで例外が伝播してWM全体が止まることを避ける。同じ入力からは同じ`LayoutCrashed`が再現されるため、決定性（2.2）も保たれる。`StackOverflowException`や無限ループはこの捕捉で防げず、20章の既存リスク「任意F#拡張がHostを止める」に残る。
 ## 6. 配置計画、検査、制約解決
 ### 6.1 処理パイプライン
 Window Snapshot → Classify → Select LayoutRef → Resolve Registry
     → F# LayoutFunction → Placement Proposal → PlanValidator
-    → Desired Update → Reconciler → Effect IR → Windows/Sim Shell
+    → Desired Update → Reconciler → Effect IR → **GatedEffect（Shell直前の最終ゲート、6.2参照）** → Windows/Sim Shell
     → Observation → Reconciliation (again)
 - LayoutFunctionは希望配置の提案を返すだけでOSへは触れない。
 - PlanValidatorは配置計算のコードと独立した共通経路に置き、全レイアウト出力を検証する。
 - Reconcilerは現在のObservedとPendingを参照し、必要な差分Effectだけを生成する。
 - ShellはEffectをOSに適用するが、レイアウトの妥当性判断は担当しない。
+- **GatedEffect**（v2.4で追加）は、PlanValidatorとは別の、Shell直前に置く最終防衛線である。6.2末尾を参照。
+
+**`result { }` computation expressionは今は導入しない（v2.4で追加、ADR-014/3-1対応）**：本パイプラインの各段は異なるエラー型（`LayoutError`、`ValidationError list`等）の`Result`を返すため、`FSharp.Core`標準の`Result.bind`/`Result.mapError`の連結で素直に書ける。CEを導入しない理由は「ADR-008/3.2の最小主義に合わせて」ではなく、**CEがこのパイプラインの本当の課題（失敗時のTrace欠落）を解決しないため**である：`Result.bind`は失敗した時点でそれまでの段のTrace（どのRuleを選び、どのLayoutを呼んだか）を捨ててしまい、Explain（9.1）が最も必要とする「失敗時の経路」が残らない。この課題は`result { }`を導入しても自動では解決せず、「各段が`(結果, Trace断片)`を返し、`step`が明示的にTraceを連結する」という小さなヘルパー（Writer相当、10行程度）で対処する。また5.4のClassify（三値`Truth`）はResultに乗らない概念（Unknownはエラーではない正常系の分岐）なので、パイプライン全体を`result { }`で統一することもできない。
 ### 6.2 PlanValidatorの契約
 以下を必須条件として検査する。
 1. 配置先WindowIdが現在管理対象かつ生存している。
@@ -400,10 +416,85 @@ Window Snapshot → Classify → Select LayoutRef → Resolve Registry
 6. そのレイアウトに必要な対象の未配置を検出する（仕様で許す部分配置は別の明示契約を使用）。
 重なりを一律に禁止しない：Monocleは意図的に同位置へ重ねる。ギャップ、比率、推定最小サイズ等はソフト制約として扱い、要求を満たせない場合は調整・Floating・Suspended等へ劣化させる。OSの実際の反応は保証しない。
 
-**レイアウト切替の一括適用（v2.1で追加、A-4対応／v2.2でfeasibility.md §4により方針変更／v2.3でGitHub Actions windows-latest実機検証により確定：failure-catalog.md F09-F10。ハング窓を含む3窓を`DeferWindowPos`系で一括適用すると4000ms超ブロックしたが、個別`SetWindowPos`+`SWP_ASYNCWINDOWPOS`では3窓全てが1ms以内にリターンした。以下の既定方針は提案ではなく実機で実証済みの確定事項とする）**：複数窓を個別に`SetWindowPos`すると、適用途中の状態が見える（窓の重なり・ちらつき）。当初`BeginDeferWindowPos`/`DeferWindowPos`/`EndDeferWindowPos`を第一候補としていたが、調査の結果、既存のWindows用タイル型WM（komorebi、GlazeWM）は**いずれも`DeferWindowPos`系を使わず**、各ウィンドウへ個別に`SetWindowPos`を`SWP_ASYNCWINDOWPOS`付きで呼ぶ方式を採用していることが判明した。`SWP_ASYNCWINDOWPOS`は「呼び出し元スレッドと対象ウィンドウ所有スレッドが異なる入力キューに属する場合、要求を対象スレッドへポストし、呼び出し元スレッドをブロックしない」という公式の効果を持ち、ADR-012（ハング耐性）と直接合致する。一方`DeferWindowPos`は公式ドキュメントで「失敗時はバッチ全体を中止すべき」と明記されており、ハング耐性に関する公式な言及がない。**本WMはちらつき抑制よりハング耐性を優先し、Shell側の`ApplyBatch`実装は個別`SetWindowPos` + `SWP_ASYNCWINDOWPOS`を既定とする**（`DeferWindowPos`系はPhase 0のスパイクでちらつきの差を比較した上で、必要なら代替として採用を検討する）。7.1のEffectにこのバッチを表す型（`ApplyBatch`）を用意する。最大化・Aero Snap状態の窓は`SetWindowPos`だけでは意図した通りに動かないため、先に`ShowWindow(SW_RESTORE)`相当のEffectを発行してから配置する契約とする。バッチの一部だけが失敗した場合の扱い（残りを適用するか全体を中止するか）はPending追跡（7.2）と合わせて定義する。
+**全違反の蓄積とsmart constructor（v2.4で追加、ADR-014/2-1・2-2対応）**：PlanValidatorはfail-fastで最初の違反だけを返すのではなく、**全ての違反を一度に収集する**。Explain/Journalで「なぜ拒否されたか」を1回の検証で全部提示できることを優先する。
+
+```fsharp
+type ValidationInput = {
+    Context: LayoutContext                      // WorkAreaを含む（6.2 #4対応）
+    Management: Map<WindowId, Management>        // #1/#5対応
+    Alive: Set<WindowId>                          // #1対応
+}
+
+type ValidationError =
+    | UnmanagedOrDeadWindow of WindowId
+    | DuplicateInPlan of WindowId
+    | NonPositiveSize of WindowId * width: int * height: int
+    | ArithmeticOverflow of WindowId              // #3対応
+    | OutsideWorkArea of WindowId * PixelRect     // #4対応（UnknownMonitorより具体的）
+    | ExcludedTarget of WindowId                  // #5対応
+    | MissingPlacement of WindowId                // #6対応
+
+// private constructor：PlanValidatorの外からは構築できない
+type ValidatedPlan = private { Placements: Placement list }
+module ValidatedPlan =
+    let placements (p: ValidatedPlan) = p.Placements
+
+let validate (input: ValidationInput) (placements: Placement list) : Result<ValidatedPlan, ValidationError list> =
+    let errors =
+        [ yield! checkManagedAndAlive input placements
+          yield! checkNoDuplicates placements
+          yield! checkPositiveSize placements
+          yield! checkNoOverflow placements
+          yield! checkWithinWorkArea input placements
+          yield! checkNotExcluded input placements
+          yield! checkNoMissingPlacement input placements ]
+    match errors with
+    | [] -> Ok { Placements = placements }
+    | es -> Error es
+```
+
+`ValidatedPlan`のprivateコンストラクタが保証するのは「このDesiredはvalidateを1回通過した」という事実**だけ**であり、22章の受け入れ条件4番（「任意のLayout関数出力もPlanValidatorを通過しなければEffectを発行できない」）そのものはこれだけでは成立しない。理由：(a) `Effect`（7.1）は公開DUなので誰でも構築できる、(b) 検証からEffect発行までの間に対象が消滅・Excluded化する鮮度の問題がある、(c) `RestoreBeforeMove`/`RequestForeground`やREPLのIntervene由来のEffectはLayoutを経由しない。受け入れ条件4番を実際に満たす仕組みは、Shell直前の`GatedEffect`（本節末尾）である。`ValidatedPlan`はあくまで「Layout出力からDesiredへ渡す経路」の整合性を保証するものと位置づける。
+
+**「集める」診断と「決める」判断を分離する（v2.4で追加、ADR-014/2-3対応）**：`ValidationError list`は診断のための全量報告であり、どの単位を拒否するかの判断は別の純粋関数`decide`が行う。6.3の「明示された安全な単位」は、**Planから違反窓を引くこと**ではなく、**LayoutContextから違反窓を引いてLayoutを1回だけ再計算すること**と定義する（Master–Stack等の幾何は全窓を前提に計算されるため、Planから1窓だけ引くと隙間の空いた配置になり、#6が防ぐ未配置状態そのものを作ってしまう）。
+
+```fsharp
+type Disposition =
+    | RejectWholePlan
+    | RelayoutWithout of Set<WindowId>  // 検証時点で死亡/Excluded化していた窓を除いて1回だけ再計算する
+
+let decide (errors: ValidationError list) : Disposition =
+    let removable =
+        errors
+        |> List.forall (function UnmanagedOrDeadWindow _ | ExcludedTarget _ -> true | _ -> false)
+    let targets =
+        errors
+        |> List.choose (function UnmanagedOrDeadWindow w | ExcludedTarget w -> Some w | _ -> None)
+        |> Set.ofList
+    if removable && not (Set.isEmpty targets) then RelayoutWithout targets
+    else RejectWholePlan
+```
+
+呼び出し元（6.1パイプライン）は`RelayoutWithout targets`を受け取ったら、`LayoutContext.TiledWindows`から`targets`を除いてLayoutFunctionを**1回だけ**再実行し、再度`validate`する。2回目も失敗したら`RejectWholePlan`へ進む（15.1 #7と同系統の「要求の無制限増殖防止」を、再計算1回という形で保証する）。`ValidationError`の中に`NonPositiveSize`/`ArithmeticOverflow`/`OutsideWorkArea`/`MissingPlacement`等（窓の生死に関係しない構造的な問題）が混ざっている場合は再計算の対象にならないため`RejectWholePlan`になる。
+
+**レイアウト切替の一括適用（v2.1で追加、A-4対応／v2.2でfeasibility.md §4により方針変更／v2.3でGitHub Actions windows-latest実機検証により確定：failure-catalog.md F09-F10。ハング窓を含む3窓を`DeferWindowPos`系で一括適用すると4000ms超ブロックしたが、個別`SetWindowPos`+`SWP_ASYNCWINDOWPOS`では3窓全てが1ms以内にリターンした。以下の既定方針は提案ではなく実機で実証済みの確定事項とする）**：複数窓を個別に`SetWindowPos`すると、適用途中の状態が見える（窓の重なり・ちらつき）。当初`BeginDeferWindowPos`/`DeferWindowPos`/`EndDeferWindowPos`を第一候補としていたが、調査の結果、既存のWindows用タイル型WM（komorebi、GlazeWM）は**いずれも`DeferWindowPos`系を使わず**、各ウィンドウへ個別に`SetWindowPos`を`SWP_ASYNCWINDOWPOS`付きで呼ぶ方式を採用していることが判明した。`SWP_ASYNCWINDOWPOS`は「呼び出し元スレッドと対象ウィンドウ所有スレッドが異なる入力キューに属する場合、要求を対象スレッドへポストし、呼び出し元スレッドをブロックしない」という公式の効果を持ち、ADR-012（ハング耐性）と直接合致する。一方`DeferWindowPos`は公式ドキュメントで「失敗時はバッチ全体を中止すべき」と明記されており、ハング耐性に関する公式な言及がない。**本WMはちらつき抑制よりハング耐性を優先し、Shell側の`ApplyBatch`実装は個別`SetWindowPos` + `SWP_ASYNCWINDOWPOS`を既定とする**（`DeferWindowPos`系はPhase 0のスパイクでちらつきの差を比較した上で、必要なら代替として採用を検討する）。7.1のEffectにこのバッチを表す型（`ApplyBatch`）を用意する。最大化・Aero Snap状態の窓は`SetWindowPos`だけでは意図した通りに動かないため、先に`ShowWindow(SW_RESTORE)`相当のEffectを発行してから配置する契約とする。バッチの一部だけが失敗した場合の扱い（残りを適用するか全体を中止するか）はPending追跡（7.2）と合わせて定義する（v2.4で確定：7.1の`EffectBatchReturned`で窓ごとに結果を返すため、「全体を中止」ではなく生きている窓だけ成立させる）。
+
+**Shell直前の最終ゲート：GatedEffect（v2.4で追加、ADR-014/2-1対応）**：`ValidatedPlan`が保証する範囲は「Desiredを作る経路」だけであり、Reconcilerの再送（7.2）、`RestoreBeforeMove`、`RequestForeground`（CoreCommand由来）、REPLのIntervene由来のEffectはPlanValidatorを経由しない。22章の受け入れ条件4番と16.1「全てのOS変更EffectはPlanValidatorや権限ゲートを通る」を実際に満たすのは、**Effectの発行元を問わず、Shellへ渡す直前に通る唯一の安価な最終ゲート**である。
+
+```fsharp
+type GatedEffect = private GatedEffect of Effect
+type GateRejection = { Target: WindowId option; Reason: string }
+
+module GatedEffect =
+    // 生存・非Excluded・矩形正値など「直前に変化していないか」の安価な再確認のみ。
+    // PlanValidatorの幾何的な整合性チェック（WorkArea内か、未配置がないか等）はここでは行わない。
+    let gate (state: WmState) (effects: Effect list) : GatedEffect list * GateRejection list =
+        ...
+```
+
+`step`（7.1）が`StepResult.Effects`を構築する最後の一手として必ず`GatedEffect.gate`を呼び、Shell/Simulationが受け取る型を`GatedEffect`だけにする（Effect自体をShellへ直接渡せる経路を残さない）。15.1 #1/#6の性質ベーステストは、型があっても省略しない（型が保証するのは「どこかでPlanValidatorを通った」ことだけで、「直前に再確認した」ことではないため）。
 ### 6.3 例外とフォールバック
-- レイアウトの計算エラー：前回の有効なDesired、または既定の安全レイアウトへ移行。
-- Validatorの失敗：Plan全体または明示された安全な単位を拒否し、診断Journalを残す。
+- レイアウトの計算エラー：`LayoutCrashed`等を含め、前回の有効なDesired、または既定の安全レイアウトへ移行（5.6参照）。
+- Validatorの失敗（v2.4で具体化）：6.2の`decide`が`RelayoutWithout`を返せば、違反窓を除いて1回だけLayoutを再計算する。それでも失敗、または`RejectWholePlan`であれば前回の有効なDesiredを維持し、診断Journalを残す。
 - 属性不明：原則、危険な移動を保留して追加観測を提案。
 - 無限に要求が収束しない：同種要求の再送を抑制、Backoff、Floating/Suspendedを選択。
 ## 7. Functional Coreと実行意味論
@@ -411,12 +502,32 @@ Window Snapshot → Classify → Select LayoutRef → Resolve Registry
 type Effect =
     | SetRect of RequestId * WindowId * PixelRect
     | RestoreBeforeMove of RequestId * WindowId // ShowWindow(SW_RESTORE)相当。最大化/Snap状態の窓をSetRectの前に解除する
-    | ApplyBatch of RequestId * Effect list // DeferWindowPos相当の一括適用。途中状態を見せない
+    | ApplyBatch of BatchId * Effect list // v2.4でRequestId→BatchIdに変更（ADR-014/1-5対応）。子Effectは自分のRequestIdを保ち、結果は窓ごとに返る
     | RequestForeground of RequestId * WindowId
     | ObserveWindow of WindowId
     | ObserveAll
     | ArmTimer of timerId:int64 * deadlineTicks:int64
     | CancelTimer of timerId:int64
+
+// ===== エラー表現（v2.4で追加、ADR-014対応） =====
+// Wm.Contracts：OS非依存。Wm.Simulationも同じ形を作れる（ADR-002：同じCoreをShell/Simulationが実行）。
+type ErrorSpace = Win32LastError | HResult | BoolFalseNoCode
+type NativeCallRecord = { Api: string; Space: ErrorSpace; Code: int; ElapsedUs: int64 }
+
+// Coreが分岐する反応の軸で切る（1-8対応：原因ベースの早すぎる確定を避ける）。
+// 原因の多様性はNativeCallRecord（生の事実）側で持つ。
+type DenialKind = IntegrityMismatch | ForegroundDenied | OtherDenial // 3種で開始。Phase 0の失敗カタログで増える分だけclassifyの対応表に追加する
+type EffectFailure =
+    | TargetGone           // → Cancelled
+    | TargetHung           // → Suspend、再試行しない
+    | Denied of DenialKind // → Suspend/Floating
+    | Transient            // → Retry/Backoff
+    | Unclassified         // → Retry上限付き、診断で要調査フラグ（分類漏れを数えられるようにする。11.1のEvidenceGapと同じ考え方）
+
+// Windows Event Normalizer（ADR-013）と同じ扱いの純粋関数。Shell/Simulation共用、normalizerSchemaVersionで版管理。
+// Journalには結果（Result<unit, NativeCallRecord>）だけを永続化し、EffectFailureはReplay時にclassifyで再計算する
+// （ADR-004「再計算できるものは永続化しない」と整合。X-3参照）。
+val classify: NativeCallRecord -> EffectFailure
 
 type InputEvent =
     | WindowObserved of WindowSnapshot
@@ -424,8 +535,10 @@ type InputEvent =
     | ForegroundObserved of WindowId option
     | UserCommand of CoreCommand
     | EffectSubmitted of RequestId
-    | EffectRejected of RequestId * string
-    | EffectTimedOut of RequestId // ハングした対象へのOS呼出がタイムアウトした（ADR-012）
+    | EffectCallReturned of RequestId * Result<unit, NativeCallRecord> // v2.4でEffectRejectedを置き換え（1-4対応）。JournalのPayloadはこの形そのもの
+    | EffectBatchReturned of BatchId * (RequestId * Result<unit, NativeCallRecord>) list // v2.4で追加（1-5対応）。ApplyBatchは窓ごとに結果を返す
+    | EffectCallAbandoned of RequestId * waitedMs: int // v2.4でEffectTimedOutを置き換え（4-4対応）。SWP_ASYNCWINDOWPOSが使えない呼出が専用スレッドの期限を越えた場合のみ発生する
+    | InternalFault of component: string // v2.4で追加（ADR-014/4-3対応）。想定外の例外（プログラムのバグ）をスレッド単位の最上位ハンドラが捕捉した
     | MoveSizeStarted of WindowId // ユーザーのドラッグ/リサイズ開始。自動整列を抑止する
     | MoveSizeEnded of WindowId
     | VisibilityChanged of WindowId * isVisible: bool
@@ -447,7 +560,20 @@ type StepResult = {
 val step: RuntimePolicy -> WmState -> EventEnvelope<InputEvent> -> StepResult
 EventEnvelopeにはReducerへ投入したSequence、論理/単調時刻、入力の発生元、観測元時刻、SessionId等を含める。時刻、乱数、ID採番は状態やイベントの入力として明示し、Core内からOS時計を呼ばない。コレクションの暗黙の列挙順やバックグラウンドスレッドの状態に依存しない。.NET Core以降`string.GetHashCode`はプロセスごとにランダム化されるため、`HashSet<string>`/`Dictionary<string,_>`の列挙順にCoreの判断が依存するとReplayでプロセス間の再現性が崩れる。F#の`Map`/`Set`（順序付き）を用いるか、明示的にソートする。
 
-**実行スレッドモデルと耐ハング性（v2.1で追加、ADR-012対応、E-1対応／v2.2でfeasibility.md §5により補強／v2.3でGitHub Actions windows-latest実機検証により実証：failure-catalog.md F05-F08。メッセージポンプを止めた窓への`SetWindowPos`は`SWP_ASYNCWINDOWPOS`なしで4000ms超ブロックし、付きでは0msで返った。`IsHungAppWindow`は6秒後に正しく`true`を返し、`SendMessageTimeout(SMTO_ABORTIFHUNG)`はハング窓に対し即時[0ms]に中断した）**：`SetWindowPos`等は対象窓を所有するスレッドへメッセージを送るため、対象アプリがハングしていると呼び出し側がブロックされる（公式ドキュメントに「`SetWindowPos`が内部で同期送信する」という直接の一文はないが、`SWP_ASYNCWINDOWPOS`フラグの説明「異なる入力キューに属する場合は要求をポストしブロックしない」が既定動作でのブロックを前提にしており、これを根拠とする）。Effect適用（Windows Shell側の実装）はWinEventコールバックや安全停止の制御経路（8.4）と同じスレッドで行わない。専用のEffect適用スレッドを設け、既定で各`SetWindowPos`に`SWP_ASYNCWINDOWPOS`を付ける（6.2参照）。`SendMessageTimeout(SMTO_ABORTIFHUNG, ...)`を主たるハング検知手段とし、`IsHungAppWindow`は補助的な事前チェックとしてのみ使う（公式ドキュメントが「一般利用を意図していない。将来のWindowsバージョンで変更・廃止される可能性がある」と明記しているため、これに依存した設計にしない）。タイムアウトした場合は`EffectTimedOut`をReducerへ投入し、対象窓をSuspendedへ劣化させる（6.3のフォールバックと同じ扱い）。WinEventフックのコールバック自体は、登録したスレッドのメッセージポンプ中に同期的に再入され得るため（24章「Guarding Against Reentrancy」参照）、コールバックからOS呼出APIを直接呼ばず、最小限の情報をキューへ渡すだけに留める（8.1と同じ方針をCore〜Shell間のスレッド境界として明文化する）。
+**実行スレッドモデルと耐ハング性（v2.1で追加、ADR-012対応、E-1対応／v2.2でfeasibility.md §5により補強／v2.3でGitHub Actions windows-latest実機検証により実証：failure-catalog.md F05-F08。メッセージポンプを止めた窓への`SetWindowPos`は`SWP_ASYNCWINDOWPOS`なしで4000ms超ブロックし、付きでは0msで返った。`IsHungAppWindow`は6秒後に正しく`true`を返し、`SendMessageTimeout(SMTO_ABORTIFHUNG)`はハング窓に対し即時[0ms]に中断した／v2.4でADR-014により実測値に厳密に整合させた）**：`SetWindowPos`等は対象窓を所有するスレッドへメッセージを送るため、対象アプリがハングしていると呼び出し側がブロックされる（公式ドキュメントに「`SetWindowPos`が内部で同期送信する」という直接の一文はないが、`SWP_ASYNCWINDOWPOS`フラグの説明「異なる入力キューに属する場合は要求をポストしブロックしない」が既定動作でのブロックを前提にしており、これを根拠とする）。Effect適用（Windows Shell側の実装）はWinEventコールバックや安全停止の制御経路（8.4）と同じスレッドで行わない。専用のEffect適用スレッドを設け、既定で各`SetWindowPos`に`SWP_ASYNCWINDOWPOS`を付ける（6.2参照）。
+
+**ハング事前確認は毎回行う（v2.4で確定）**：`SWP_ASYNCWINDOWPOS`が既定である以上、`SetRect`の呼出自体はハング窓に対しても即時に返る（F08/F10実証）ため、**「タイムアウトした」という事象はSetRectからは発生しない**。代わりにShellは`SetRect`を発行する**前**に毎回`SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG, ...)`で対象を事前確認する（F06で0msと実証済みのため、毎回確認してもコストは無視できる）。ハングと判定されれば呼出自体を行わず、即座に`EffectCallReturned(RequestId, Error { Api="SendMessageTimeout"; ...})`を返す。これが`classify`で`TargetHung`に分類され、7.2で再試行せずSuspendへ進む。`IsHungAppWindow`は公式ドキュメントが「一般利用を意図していない。将来のWindowsバージョンで変更・廃止される可能性がある」と明記しているため、補助的な事前チェックとしてのみ使い、主たるハング検知手段にはしない。
+
+`SWP_ASYNCWINDOWPOS`が使えない呼出（`GetWindowText`等、同期的な`WM_GETTEXT`を要する観測系API）は専用スレッド上でハード期限を設け、越えた場合に`EffectCallAbandoned`をReducerへ投入する（対象窓をSuspendedへ劣化させる、6.3のフォールバックと同じ扱い）。WinEventフックのコールバック自体は、登録したスレッドのメッセージポンプ中に同期的に再入され得るため（24章「Guarding Against Reentrancy」参照）、コールバックからOS呼出APIを直接呼ばず、最小限の情報をキューへ渡すだけに留める（8.1と同じ方針をCore〜Shell間のスレッド境界として明文化する）。
+
+**例外とResultの境界原則（v2.4で追加、ADR-014/4-3対応）**：3層に分ける。
+1. **予期された外部の失敗**（エラーコード・拒否・消滅・ハング）→ 境界で`Result`/`NativeCallRecord`に変換する（8.1の`Native`モジュール参照）。
+2. **ユーザー提供コードの失敗**（Layout関数、5.6）→ 呼出点で捕捉し`LayoutError`へ変換する。
+3. **それ以外の例外**（自分たちのバグ・不変条件違反）→ 変換せず、**スレッド単位の最上位ハンドラ**（Reducerループ、Effect適用スレッド、JournalWriter、IPCハンドラ、8.4の監視コンポーネント）で捕捉し、`InternalFault of component`として安全停止経路（8.4）へ渡す。Effectスレッドが落ちた場合はPendingを即座に全件`Cancelled`扱いにする。
+
+ここで原則を誤ると、2方向のまずさが起きる：境界で捕まえすぎると（`NullReferenceException`等まで`Result`に変換すると）バグがEffect失敗として7.2の`Retry/Backoff`に吸収され、Journal上は「アプリが拒否した」ように見えて13章のような調査を誤らせる。逆に何も捕まえないと、Effect適用スレッドが死んだままCoreがそれに気づけない。
+
+Reducerループは「**入力をJournalに書いてから`step`を呼ぶ**」順序を固定する。これにより`step`実行中に例外を起こした入力（poison input）が必ずJournalに残り、Replayで再現できる（9.4「Input accepted → Core decision」の順序の具体化）。
 ### 7.2 Desired / Observed / Pending
 | 状態 | 意味 | 注意 |
 |---|---|---|
@@ -458,13 +584,18 @@ EventEnvelopeにはReducerへ投入したSequence、論理/単調時刻、入力
 
 PendingRequestは最低限、RequestId/WindowId/IntentEpoch/TargetRect/IssuedAt/Deadline/Attempts/Statusを持つ。対象が消えた、Policyが変更された、同じ窓へ新しい意図が生じた場合、古い要求を失効させる。
 Idle → Planned → Dispatched → AwaitingObservation
-                             ├─ Observed matches   → Satisfied
-                             ├─ Mismatch            → Reevaluate
-                             ├─ Timeout             → Retry/Backoff/Suspend
-                             ├─ EffectRejected      → Retry/Backoff/Suspend（OS呼出自体が失敗した場合。v2.1で追加）
-                             ├─ EffectTimedOut      → Suspend（ハングした対象。再試行しない。v2.1で追加）
-                             ├─ Window destroyed    → Cancelled
-                             └─ Superseded intent   → Superseded
+                             ├─ Observed matches        → Satisfied
+                             ├─ Mismatch                 → Reevaluate
+                             ├─ Timeout                  → Retry/Backoff/Suspend（観測が来ないまま期限切れ。呼出自体は成功している）
+                             ├─ EffectCallReturned(Error) → classify の結果で分岐（v2.4でEffectRejectedを置き換え）
+                             │     ├─ TargetGone          → Cancelled
+                             │     ├─ TargetHung          → Suspend（再試行しない）
+                             │     ├─ Denied              → Suspend/Floating
+                             │     ├─ Transient           → Retry/Backoff
+                             │     └─ Unclassified        → Retry上限付き、要調査フラグ
+                             ├─ EffectCallAbandoned      → Suspend（専用スレッドの期限超過。v2.4でEffectTimedOutを置き換え）
+                             ├─ Window destroyed         → Cancelled
+                             └─ Superseded intent        → Superseded
 SetRectのネイティブAPI呼び出しが成功しても、目標矩形を観測するまでは`Satisfied`にしない。WinEvent通知そのものを特定Requestへの応答と断定せず、窓ID・epoch・観測の鮮度・矩形条件を照合する。最新Observedの選択では古い取得結果が新しいSnapshotを上書きしないよう、ソース・取得順・再観測の品質を考慮する。
 
 `IntentEpoch`は窓単位で発行する（グローバル単一値にはしない）。全体で単一のEpochにすると、1窓に新しい意図が生じただけで他の全窓のPendingが失効してしまう。
@@ -501,6 +632,35 @@ SetRectのネイティブAPI呼び出しが成功しても、目標矩形を観�
 **フォーカス移動の実現性（v2.1で追加、B-3対応／v2.2でfeasibility.md §2により具体化／v2.3でGitHub Actions windows-latest実機検証を実施、ただし結論は保留：failure-catalog.md F04参照）**：CI実機検証では、別プロセス（検証ハーネス自身が起動した子プロセス）が直前にフォアグラウンドだった状態から、`mouse_event`自己プライミングの有無にかかわらず`SetForegroundWindow`が成功した。ただし公式ドキュメントの許可条件には「フォアグラウンドプロセスが呼び出し元プロセスによって起動された」という項目があり、今回の子プロセスとの親子関係がこの条件を満たして成功した可能性を排除できていない。したがって「自己プライミングは不要」という結論には至らず、無関係な第三者プロセス（実際にユーザーが操作しているアプリ）からの奪取が本当にトリック無しで通るかは、Phase Bの実機dogfoodingで再検証する。それまでkomorebi/GlazeWM方式（自己`SendInput`/`mouse_event`プライミング）を既定の実装として維持する。`SetForegroundWindow`は「直前に入力イベントを受け取ったプロセスか」等のOS側の判定で拒否され得る。公式ドキュメントは条件を満たしても拒否され得ると明記しており（「It is possible for a process to be denied the right to set the foreground window even if it meets these conditions」）、ホットキー受信から「キュー→Reducer→Journal→Effect」という非同期経路を経た後は許可が落ちることを前提にする。既存のWindows用タイル型WM（komorebi、GlazeWM）はいずれも、`RequestForeground`相当のEffect適用時に**自分自身のプロセスへ`SendInput`でダミー入力（マウスイベント）を送出してから`SetForegroundWindow`を呼ぶ**という同一のパターンで対処している（`AttachThreadInput`はデッドロック報告があり両WMとも採用していない）。Shellの`RequestForeground` Effect実装はこのパターンを既定とする。komorebiはさらに起動時に`SPI_SETFOREGROUNDLOCKTIMEOUT`でシステム全体の`ForegroundLockTimeout`を0に変更しているが、これはユーザー環境のシステム設定を書き換える副作用が大きい回避策であり、本WMでは既定で採用せず、Phase 0での実測で自己`SendInput`方式だけでは不十分と判明した場合にのみ設定可能なオプションとして検討する。
 
 **フルスクリーンアプリの除外（v2.1で追加、E-4対応／v2.3でGitHub Actions windows-latest実機検証により修正：failure-catalog.md F03）**：枠なし全画面のゲーム・プレゼン・動画プレイヤーを通常の窓として誤ってタイル化しないよう検出する。実機検証で、ボーダレスかつモニター全体と同じ矩形の窓に対し`SHQueryUserNotificationState`は`QUNS_QUIET_TIME`を返し**検出に失敗**した（このAPIは主にD3D排他的フルスクリーンや集中モードの検出が目的で、汎用のボーダレス全画面窓には反応しない）。一方「モニター全体と同じ矩形かつ枠なし」のジオメトリヒューリスティックは正しく検出できた。したがって検出はジオメトリヒューリスティックを主手段とし、`SHQueryUserNotificationState`は補助情報としてのみ扱う。
+
+**P/Invoke呼出しの変換点（v2.4で追加、ADR-014/4-1対応）**：生のWin32 API（`[<DllImport(..., SetLastError = true)>]`で宣言したもの）は失敗しても例外を投げず、呼出し規約ごとに戻り値で知らせる。規約ごとに変換点を分け、いずれも7.1の`NativeCallRecord`を作る。
+
+```fsharp
+module Native =
+    // GetLastPInvokeErrorは呼出直後・同スレッド・他のP/Invokeを挟まず読む契約。順序を守るためラッパーに閉じ込める
+    let callBool (api: string) (f: unit -> bool) : Result<unit, NativeCallRecord> =
+        if f () then Ok ()
+        else Error { Api = api; Space = Win32LastError; Code = Marshal.GetLastPInvokeError(); ElapsedUs = 0L }
+
+    let callBoolNoCode (api: string) (f: unit -> bool) : Result<unit, NativeCallRecord> =
+        // SetForegroundWindow等、falseを返してもGetLastErrorを設定しないAPI用
+        if f () then Ok () else Error { Api = api; Space = BoolFalseNoCode; Code = 0; ElapsedUs = 0L }
+
+    let callHr (api: string) (f: unit -> int) : Result<unit, NativeCallRecord> =
+        let hr = f () in if hr >= 0 then Ok () else Error { Api = api; Space = HResult; Code = hr; ElapsedUs = 0L }
+```
+
+`SetWindowPos`/`RegisterHotKey`は`callBool`、`DwmGetWindowAttribute`は`callHr`、`SetForegroundWindow`は`callBoolNoCode`を使う。Wm.Windows内の全P/Invoke呼出しはこの3関数のいずれかを経由し、生のBOOL/HRESULTをCore/Policy/Layoutsへ流さない。
+
+`classify`（7.1）の対応表は、Phase 0の失敗カタログ（18章）で埋める。実測・文献から判明している初期エントリの例：
+
+| NativeCallRecord | EffectFailure |
+|---|---|
+| `Win32LastError, 1400`（ERROR_INVALID_WINDOW_HANDLE） | `TargetGone` |
+| `Win32LastError, 5`（ERROR_ACCESS_DENIED。昇格窓等） | `Denied OtherDenial` |
+| `Win32LastError, 1409`（ERROR_HOTKEY_ALREADY_REGISTERED。failure-catalog.md F11） | ※`RegisterHotKey`はEffectではなく起動時の登録。`EffectFailure`には含めない（1-8注記） |
+| `BoolFalseNoCode, _`（`SetForegroundWindow`） | `Denied ForegroundDenied` |
+| 上記以外 | `Unclassified` |
 ### 8.2 ウィンドウ分類の補助属性
 プロセスID/実行ファイル識別、トップレベル/所有関係、スタイル、可視性、最小化、DWM Cloak、モニター/WorkArea、フォーカス、DPIを検討する。Win32の通知がすべて揃うとは想定せず、時折全体再観測する。
 ### 8.3 DPI・矩形
@@ -547,9 +707,13 @@ type JournalEntry = {
     Kind: JournalKind
     Payload: JournalPayload
 }
-型付きKind（抜粋）。**永続化するもの**（9.1参照）：`InputReceived`、`EffectDispatchStarted`、`EffectCallReturned`、`ObservationReceived`、`PendingSatisfied`/`PendingTimedOut`、`ReplIntervention`、`ProbeRequested`、`EvidenceCaptured`。**揮発性リングバッファ＋Replay再構成で足りるもの**（都度永続化しない）：`PolicyPredicateEvaluated`、`RuleSelected`、`LayoutInvoked`、`PlanAccepted`/`PlanRejected`、`DesiredUpdated`、`EffectPlanned`、`ModelCandidateCreated`、`SimulationResult`。
+型付きKind（抜粋）。**永続化するもの**（9.1参照）：`InputReceived`、`EffectDispatchStarted`、`EffectCallReturned`、`EffectBatchReturned`（v2.4で追加、1-5対応）、`EffectCallAbandoned`（v2.4で追加、X-3対応。専用スレッドの期限超過は呼出が戻っていないので`EffectCallReturned`にならない）、`InternalFault`（v2.4で追加、4-3対応）、`ObservationReceived`、`PendingSatisfied`/`PendingTimedOut`、`ReplIntervention`、`ProbeRequested`、`EvidenceCaptured`。**揮発性リングバッファ＋Replay再構成で足りるもの**（都度永続化しない）：`PolicyPredicateEvaluated`、`RuleSelected`、`LayoutInvoked`、`PlanAccepted`/`PlanRejected`、`DesiredUpdated`、`EffectPlanned`、`ModelCandidateCreated`、`SimulationResult`。
 
-関連キーは`WindowId / RequestId / IntentEpoch / RuleId / LayoutId / EvidenceId / ScenarioId`。ログ文字列を唯一の情報源にしない。自由なF# Layout関数内部の全分岐は自動観測できないため、必要な算法のみ明示的な`LayoutDecisionTrace`を返す。
+**`EffectCallReturned`/`EffectBatchReturned`のPayloadは`NativeCallRecord`ベースの`Result<unit, NativeCallRecord>`そのもので、`EffectFailure`は含めない**（v2.4で追加、ADR-014/1-2・X-3対応）。`EffectFailure`は`classify`（7.1）がRaw記録から再計算する派生物であり、ADR-004「再計算できるものは永続化しない」の対象である。`classify`のバージョンは下記`normalizerSchemaVersion`に含める。
+
+**DTOのタグ付け規約（v2.4で追加、ADR-014/X-1対応）**：`NativeCallRecord`/`EffectFailure`/`ValidationError`等のDUをJSON/NDJSONへ落とす際、タグはF#のケース名をそのまま使わず、**明示的な安定文字列コード**（例：`"target-gone"`）を対応表で管理する。F#側でケース名をリネームしても過去のJournalとの互換性を壊さない。前方互換として、Readerは未知のタグを`Unrecognized of tag: string * raw: JsonElement`として保持し、Coreへの入力に落とす段階（`classify`）で`Unclassified`に変換する。`Result<'T,'E>`自体はDTOの型にせず、`{ "outcome": "ok" | "failed", "failure": {...} }`の形に固定する（5.2の「DUシリアライザーに暗黙依存しない」をEffectFailure/NativeCallRecord/ValidationErrorにも適用する）。
+
+関連キーは`WindowId / RequestId / BatchId / IntentEpoch / RuleId / LayoutId / EvidenceId / ScenarioId`。ログ文字列を唯一の情報源にしない。自由なF# Layout関数内部の全分岐は自動観測できないため、必要な算法のみ明示的な`LayoutDecisionTrace`を返す。
 ### 9.3 因果関係と時刻
 - SequenceはReducerへ投入した順序（Session内で単調）であり、OSでの物理的な発生順序ではない。
 - MonotonicTicksは同一Session中の相対時間計測に用い、`WallTimeUtc`は表示・外部相関に利用する。
@@ -562,8 +726,14 @@ Input accepted → Core decision → Effect planned
   → Dispatch attempt → Win32 call returned
   → Later observed state → Satisfied / Mismatch / Timeout
 クラッシュ時にDispatchされたか不明な操作は、再送を無条件に行わず、再起動後の全体Snapshot→再Reconciliationで扱う。冪等性が低いEffectは初期対象に含めない。記録の耐久性、バッファ、バックプレッシャー、クラッシュ時の最後の数イベントの欠落許容度はPhase Bで測定して決める。
+
+**JournalWriter異常はResultで呼び出し元に返さず、入力イベントにする（v2.4で追加、ADR-014/3-4対応）**：書き込みI/O失敗を`Result`で返しても、Reducerループにできることは「劣化状態へ遷移する」ことだけである。JournalWriterは内部で例外を捕捉し、`JournalDegraded`という`InputEvent`（7.1）としてReducerへ渡す。これは3.1の「すべて入力キューに送る」と整合し、16.2の「記録劣化を可視化し、安全性上不可欠な操作は停止する方針を選択可能にする」をCoreの通常の状態遷移として扱える。
 ### 9.5 Snapshotと永続互換
 初期状態または低頻度Checkpoint + 増分Journalにより再生を可能にする。Snapshotには`SchemaVersion`、`LastSequence`、Core/Policy/Registry/Normalizerの成果物識別子を持たせる。フォーマット移行は古い記録を上書きせず、変換結果を新規Artifactに保存する。ログの編集を事実改ざんと混同しないよう、派生ビューと原記録を区別する。
+
+**Checkpointは`Desired`を信用しない（v2.4で追加、ADR-014/2-4対応）**：`ValidatedPlan`（6.2）等のsmart constructor型をそのままCheckpointへシリアライズすると、Validatorの規則を後から強化したバージョンで古いCheckpointを復元できなくなる。CheckpointにはDesiredを「生の`Placement list` DTO」として保存し、**復元時にはDesiredを信用せず**、16.2「保存状態をOSの真実とみなさず、全体再観測で再同期してから再開」と同じ方針で全体再観測の後に再Plan・再validateする。Fixed-log Replayのために正確な復元が必要な場合に限り、ピン留めしたCoreBuildIdと同じValidatorで再検証する（14章のPinnedPolicyと同じ「当時の版を固定」の原則）。13.1の`input-journal.ndjson`の説明にある「relevant decisions」は、「Replayで再計算した派生物であり原記録ではない」という注記を付ける（9.1のADR-004改訂と整合させる）。
+
+**smart constructor型を直接シリアライズしない（v2.4で追加、ADR-014/2-5対応）**：F#の`private`はアクセス制限であり、同一アセンブリ内の別ファイルから構築できてしまう可能性や、リフレクションベースのシリアライザー（F#拡張のJSONコンバーター等）が`allowAccessToPrivateRepresentation`等の設定次第で`ofDto`を経由せず直接構築してしまう経路を防げない。`ValidatedPlan`/`PinnedPolicy`/`DeployablePolicy`等のsmart constructor型は**必ずDTO経由でシリアライズする**（5.2の注意書きと同じ扱い）。17.1の共通ゲートに、これらの型がシリアライザーのコンバーター登録対象に入っていないことを検査するアーキテクチャテストを加える。
 ### 9.6 機密性と容量
 通常収集はID、矩形、属性フラグ、イベント、Rule、Effect等のメタデータを中心とする。窓タイトル、プロセスのパス、UIテキスト、スクリーンショット、ETW高頻度イベントは必要時に限定する。`Incident Bundle`出力時はサニタイズ、含有項目確認、削除・保持期間の設定を提供する。高頻度ノイズは保管層を分けるが、再現に必要な入力イベントは安易にサンプリングしない。
 ## 10. Live REPLと実稼働デバッグ
@@ -594,6 +764,18 @@ IPCはNamed Pipeを第一候補とし、セキュリティ記述子で利用ユ�
 **Forkの実行場所（v2.1で追加、F-6対応）**：Fork（10.4）やCounterfactual Simulationの計算は、クライアント側（REPLプロセス）で行う。Host側はSnapshotのコピーを渡すだけで、重い候補ポリシーの評価や探索（12.4）によってHostのCPU/GCが圧迫され常用中のWM応答が悪化することを避ける。これは「REPL側のF#式はクライアント側で実行される」という10.1の方針と同じである。
 
 **Probeの承認はHost側で判定する（v2.1で追加、F-1対応）**：11.1の`ProbeRequest.UserApproved`は、要求を送るクライアント自身が設定できるフィールドにしない。承認はHost側のUI、またはHostが期限付きで発行する能力トークンで行い、クライアントはそのトークンを提示する形にする（Intervene「ユーザー認可」も同じ構造にする）。
+
+**Deployは受信時に必ずHost側で再分析する（v2.4で追加、ADR-014/5-2対応）**：「検証済みPolicyArtifactを切り替える」の「検証済み」は、14章の`DeployablePolicy`を指す。クライアント側で`DeployablePolicy`を構築していても、ワイヤ上はDTOであり型の保証はプロセス境界を越えない。Host側のDeployハンドラは受信したDTOへ常に`PinnedPolicy.ofStored`→`DeployablePolicy.analyze`をHost自身のAnalyzerで実行し、クライアントの自己申告（「もう分析済みです」）を信用しない。一方、**Rollbackは既に採用履行済みの`PinnedPolicy`を読むだけであり再分析しない**（14章参照）。
+
+**REPLのエラー型は3層に分ける（v2.4で追加、ADR-014/X-2対応）**：`Result<_, string>`のような単一のエラー型にまとめると、「前提不成立（再試行に意味がある）」「権限不足（トークン再取得が必要）」「IPC切断（再接続が必要）」「受理されキュー投入済みだが成否はまだ不明」を区別できない。特に最後のケースを`Ok`にすると、「受理された」が「OSに反映された」と誤読され、ADR-003の受付/実現の区別がREPL APIで崩れる。
+```fsharp
+type TransportError = ConnectionLost | Timeout of waitedMs: int | PayloadTooLarge
+type AuthorizationError = TokenExpired | TokenInvalid | IntegrityMismatch
+type InterveneRejection = PreconditionFailed of WindowId * expected: string * actual: string
+
+type InterveneResult = Queued of Sequence: int64 // 受理された事実のみ。成否はこのSequence以降のJournalを購読して確認する
+```
+Intervene呼出しの戻り値は`Result<InterveneResult, TransportError>`のように層を分け、`InterveneRejection`はドメインの拒否として別に扱う。
 ### 10.3 APIの利用イメージ（概念的な非実装コード）
 task {
     let! wm = WmClient.connectLocalAsync ()
@@ -742,13 +924,33 @@ SimulationArtifact
   ├─ seed + eventOrderPolicy
   └─ evidenceSetHash
 canonical hashはJSONシリアライザの偶発的なプロパティ順や改行に依存しない規約で計算する。ビルド成果物・設定・スキーマ・モデルを関連付け、現在のコードを過去の成果物と同一だと偽らない。スナップショットやJournalには、再生に必要なArtifactIdを保存する。
+
+**PolicyArtifactの二分割（v2.4で追加、ADR-014/5-1・5-2対応）**：「Analyzerを通った場合のみPolicyArtifactを構築できる」という単一のsmart constructorにすると、Fixed-log Replay（12.2「ピン留めした当時のPolicy」）・Rollback（10.2「既知良好版へのRollback経路」）・起動時の最後の正常版の読込み（16.2）が、**今のAnalyzerが拒否する過去のPolicy**を読めなくなって壊れる。用途で型を分ける。
+
+```fsharp
+type PinnedPolicy = private { Ir: PolicyIR; Artifact: ArtifactIdentity }       // 構築条件：canonical hashの一致のみ
+type DeployablePolicy = private { Pinned: PinnedPolicy; Report: AnalyzerReport } // 構築条件：現行Analyzerで Error なし
+
+module PinnedPolicy =
+    val ofStored : PolicyDto -> ArtifactIdentity -> Result<PinnedPolicy, IntegrityError>
+module DeployablePolicy =
+    val analyze : RegistryManifest -> PinnedPolicy -> Result<DeployablePolicy, AnalyzerReport>
+```
+
+- Replay/Fork/Inspectは`PinnedPolicy`を要求する（当時のまま、再分析しない）。
+- 新規Deploy（REPL経由）・起動時の新規採用は`DeployablePolicy`を要求する。
+- **起動時・Rollback時に「以前にすでに承認済み」の`PinnedPolicy`を読む場合は、現行Analyzerで再分析しない**（`ArtifactIdentity.analyzerVersion`を信頼する）。Analyzerが後から厳しくなっても、既に採用済みの「最後の正常版」（16.2）がそれを理由に読めなくなることはない。
+- **型による保証はプロセス内に限る**：REPLクライアントが`DeployablePolicy`を構築してIPCで送っても、ワイヤ上はDTOであり、同一ユーザーの別プロセス（F-2）がAnalyzerを通していないDTOを直接送れる。**Host側のDeployハンドラは、受信したDTOに対して必ず`PinnedPolicy.ofStored`→`DeployablePolicy.analyze`をHost自身のRegistry/Analyzerで実行する**（F-1の「クライアントの自己申告を信用しない」と同じ原則）。
+- `analyze`はLayout Registryへの関数オブジェクト依存ではなく、`RegistryManifest`（`(LayoutId, ApiVersion, Digest) list`、Contractsの型）だけを受け取る。これによりWm.PolicyはWm.Layoutsに依存しないまま5.5の未登録検査ができる（17章の依存方向を保つ）。
+- Analyzerの`Warning`/`Unknown`/`EvidenceRequirement`は`DeployablePolicy.Report`として保持し、`canonicalPolicyIrHash`には含めない（Reportは派生物であり、9.5「派生ビューと原記録を区別する」と同じ扱い）。
 ## 15. テスト・検証・品質ゲート
 | レイヤ | 主な検証内容 |
 |---|---|
 | Policy DTO/IR | SchemaのRound-trip、ID一意、参照解決、決定的優先順位、三値論理 |
 | Static Analyzer | 不正設定の拒否、明白な矛盾、PotentialOverlapを不当に確定しない |
 | Layout | 0/1/多窓、比率・丸め、負座標、整数境界、対象重複、Monocleの重なり |
-| PlanValidator | 未知/破棄窓、範囲外矩形、不正Monitor、重複Plan、全Effect経路のガード |
+| PlanValidator | 未知/破棄窓、範囲外矩形、不正Monitor、重複Plan、全違反の蓄積(accumulate)、decideのRelayoutWithout/RejectWholePlan分岐、GatedEffectによる全Effect経路のガード |
+| EffectFailure分類 | `classify`の決定性（同じNativeCallRecordは同じEffectFailureを返す）、未知コードのUnclassified化、DTOタグの前方互換（v2.4追加） |
 | Core/Reconciler | 遅延、拒否、重複、古いTimer、Policy変更、ユーザー操作中の抑止、振動防止 |
 | Journal | Sequence・相関、欠損・クラッシュ、バージョン識別、機密情報サニタイズ |
 | REPL/IPC | 読取専用の不変性、権限制限、古いRevision拒否、監査、悪意ある入力の境界 |
@@ -762,14 +964,16 @@ canonical hashはJSONシリアライザの偶発的なプロパティ順や改�
 3. 古いTimerが新しいIntentを完了/失効させない。
 4. Core状態とEffect列は同じ入力で一致する。
 5. 破棄・再発見されたHWNDを同一の生きたWindowIdと誤認しない。
-6. Layout関数の出力はPlanValidatorを必ず経由する。
-7. 制御不能な窓に対して要求数が無制限に増殖しない。
+6. Layout関数の出力はPlanValidatorを必ず経由する（Desired構築の経路）。**加えて**、Shellへ渡されるEffectはGatedEffectを必ず経由する（v2.4で追加、ADR-014/2-1対応。6番は「どこかでPlanValidatorを通った」ことだけを保証し、「直前に再確認した」ことはGatedEffectが保証する）。
+7. 制御不能な窓に対して要求数が無制限に増殖しない（PlanValidatorのRelayoutWithoutも1回までの再計算に限る。v2.4でdecideの仕様と整合）。
 8. 指定された前提が成立すれば一定の操作列後に安定するか、明示的な停止状態に移る。
 9. Inspectと`Fork`は本物のWindowsを変更しない。
 10. Replayは指定ArtifactとSeedに対し同じEvent/Effect/Traceのハッシュを生成する（この性質が成立するには、Coreの内部状態がハッシュ非決定なコレクション型に依存しないことが前提になる。11参照）。
 11. Coreの判断がプロセス間で再現可能である（`string.GetHashCode`のランダム化に依存する`HashSet`/`Dictionary`の列挙順にCoreの判断が依存しない。v2.1で追加、B-7対応）。
-12. `ApplyBatch`は全窓の適用が完了するまで中間状態を外部へ見せない、または明示された失敗単位でのみ部分適用を許す（v2.1で追加、A-4対応）。
+12. `ApplyBatch`は窓ごとに結果（`EffectBatchReturned`）を返し、1窓の失敗が他の生きている窓の結果を汚染しない（v2.1で追加、A-4対応／v2.4でEffectBatchReturnedの窓単位設計により具体化）。
 13. ハングした対象へのEffect適用はCoreの入力処理・安全停止の受理を妨げない（v2.1で追加、E-1対応）。
+14. `classify`は決定的である：同じ`NativeCallRecord`からは常に同じ`EffectFailure`が得られる（v2.4で追加、ADR-014対応。Replay時の再計算に必須）。
+15. `ValidatedPlan`/`PinnedPolicy`/`DeployablePolicy`等のsmart constructor型は、`ofDto`を経由しない構築経路（直接のリフレクション/シリアライザー等）が存在しないことをアーキテクチャテストで検査する（v2.4で追加、ADR-014/2-5対応）。
 ### 15.2 テストアプローチ
 通常の単体テストに加え、FsCheck等の性質ベーステスト、有限長のイベント列探索、実機Journalを起点とする回帰シナリオ、Windows VMでの統合テストを組み合わせる。AIが仕様とSimulatorを同時に書き換えてテストを通すことを防ぐため、シミュレーターの意味論変更・不変条件の削除は独立したレビュー対象にする。
 ## 16. Live運用、障害時の動作、セキュリティ
@@ -825,6 +1029,10 @@ docs/
   adr/
   operations.md
 依存方向：Windows/Host/Simulation/DebugがCoreの契約を参照し、Core側からWindowsやIPC実装を参照しない。JournalWriterのI/OはShell側、Journalのイベント型は契約側に置く。
+
+**エラー型の配置（v2.4で追加、ADR-014対応）**：`NativeCallRecord`/`EffectFailure`/`classify`はWm.Contractsに置く（Windows固有の型をCoreが参照しないため、ADR-013のNormalizerと同じ理由）。`ValidationError`/`ValidatedPlan`/`Disposition`はWm.Layouts、`GatedEffect`はWm.Core、`PinnedPolicy`/`DeployablePolicy`はWm.Policyに置く。Wm.Windowsの`Native`モジュール（`callBool`/`callBoolNoCode`/`callHr`）はWm.Contractsの`NativeCallRecord`を構築するだけで、リッチな診断情報（APIパラメータ等）はWm.Windows内部にとどめ、Journalへは`NativeCallRecord`相当の小さい形だけを渡す。
+
+**依存の例外（3-3対応）**：Wm.Contracts/Wm.Policy/Wm.Layouts/Wm.Coreは外部パッケージ依存なしを維持する。Wm.ReplClientはCoreの決定性制約（3.1）の外にあるため、利便性のための外部パッケージ（`taskResult`相当、21章参照）を許容する。
 ### 17.1 開発・CI
 Linux：F# Core、Policy、Layout、PlanValidator、Journalの純粋部分、Simulation、Replay、FsCheck、CLIのビルドとテスト。
 Windows：Win32 Shellの動作テスト、DPI・WinEvent・フォーカス・トレイ停止・IPC・配布の統合試験。
@@ -890,13 +1098,16 @@ Gate：日常利用の回帰テスト群と、起動/停止/異常終了の手�
 第一の縦切り（Phase A）として次のファイル相当を優先実装する。
 WmState.fs（4.4のWorkspace/窓順序/フォーカス履歴、ADR-011）
 CoreCommand.fs
+ErrorTypes.fs（`NativeCallRecord`/`EffectFailure`/`classify`。ADR-014、v2.4追加。Shell/Simulation共用）
 PolicyTypes.fs
 PolicyEvaluator.fs
 PolicyAnalyzer.fs
+PolicyArtifact.fs（`PinnedPolicy`/`DeployablePolicy`のsmart constructor。ADR-014、v2.4追加）
 LayoutRegistry.fs
 MasterStack.fs
 Monocle.fs
-PlanValidator.fs（`ApplyBatch`/`RestoreBeforeMove`を含む）
+PlanValidator.fs（`ApplyBatch`/`RestoreBeforeMove`を含む、accumulateする`validate`と`decide`。v2.4で`ValidationInput`/`ValidatedPlan`に具体化）
+GatedEffect.fs（Shell直前の最終ゲート。ADR-014、v2.4追加）
 CoreState.fs
 Reducer.fs
 Reconciler.fs
@@ -909,7 +1120,7 @@ ScenarioRunner.fs
 Tests/ConstrainedWindowScenario.fs
 この段階でGUI、一般配布、完全なREPLプロトコルは不要。疑似OS上で不具合を再現し、判断と差分を説明できることが最優先。
 
-次の縦切り（Phase B）でWindowsの`EnumWindows`、`SetWinEventHook`、`GetWindowRect`、`SetWindowPos`とイベントキューをつなぐ。Effect適用は専用スレッド（ADR-012）とし、WindowEventNormalizer.fsをShell側からも呼ぶ。このPhaseで複数モニター・混在DPI・ホットキーによる最小限の常用を開始する（18章）。REPLはその後、既存のSnapshot/Journal/SimulationインターフェースをIPCへ公開するだけに留める。
+次の縦切り（Phase B）でWindowsの`EnumWindows`、`SetWinEventHook`、`GetWindowRect`、`SetWindowPos`とイベントキューをつなぐ。Effect適用は専用スレッド（ADR-012）とし、WindowEventNormalizer.fsをShell側からも呼ぶ。P/Invoke呼出しはNative.fs（`callBool`/`callBoolNoCode`/`callHr`。8.1、ADR-014）を経由し、ErrorTypes.fsのEffectFailure型をCore/Simulationと共有する。このPhaseで複数モニター・混在DPI・ホットキーによる最小限の常用を開始する（18章）。REPLはその後、既存のSnapshot/Journal/SimulationインターフェースをIPCへ公開するだけに留める。
 ## 20. 重大リスクと対策
 | リスク | 兆候 | 対策 |
 |---|---|---|
@@ -946,6 +1157,8 @@ Tests/ConstrainedWindowScenario.fs
 | 将来の独自DSL | IRだけでは不十分な具体的ユースケースの有無 | 常用後 |
 | Effect一括適用の実装方式（v2.1追加、v2.2でfeasibility.md §4により既定値決定） | `DeferWindowPos`系とSWP_ASYNCWINDOWPOSの選択、部分失敗時の扱い。既定は個別SetWindowPos+SWP_ASYNCWINDOWPOS（6.2参照）、ちらつき差をPhase 0で比較し再検討 | Phase A〜B |
 | ワークスペースの実装方式（v2.1追加） | 窓を隠す/画面外へ移動/最小化のいずれか、クラッシュ時の復元容易性 | Phase A |
+| ofDto用の`Result.traverse`/最小`result`ビルダー導入（v2.4追加、ADR-014/3-2対応） | `PolicyIR.ofDto`等が3段以上の`match Ok/Error`ネストを要した最初の時点で、Contractsに自作（20行未満、外部依存なし）を追加する。発動条件は「必要になってから」で、事前に作らない | ofDtoを書く時点（Phase A） |
+| ReplClientでの`taskResult`（または同等のCE）許可（v2.4追加、ADR-014/3-3対応） | 10.3の`task { }`は複数手順を連ねる際にResultとのネストが生まれる。Core/Policy/Layoutsは外部依存なしを維持するが、Wm.ReplClientは3.1の決定性制約の外にあるため、利便性優先で外部パッケージ（FsToolkit.ErrorHandling等）か自作`taskResult`の導入を許す | Phase C |
 
 
 方針：先に必要な能力を実装し、表現形式や追加ツールを目的化しない。F*や全面Deep Embedded DSLを最初の前提に戻さない。
@@ -953,7 +1166,7 @@ Tests/ConstrainedWindowScenario.fs
 1. Windows ShellとSimulation Shellで同じCoreの意思決定実装を使う。
 2. Policy IRが保存・分析・比較可能で、F#レイアウト実装を`LayoutId + Version + Digest`で識別する。
 3. Policy条件のUnknownをFalseとして扱わず、Analyzerが未知の検証範囲を明示する。
-4. 任意のLayout関数出力もPlanValidatorを通過しなければEffectを発行できない。
+4. 任意のLayout関数出力もPlanValidatorを通過しなければDesiredになれず、発行元を問わず全EffectはShell直前のGatedEffectを経由しなければ適用されない（v2.4でGatedEffect導入により明確化。ADR-014）。
 5. Desired/Observed/Pendingを分離し、OS呼出結果と観測上の実現を混同しない。
 6. JournalはRule→Layout→Effect→OS結果→Observationの追跡、復元、サニタイズを支える。
 7. Live REPLのInspect/Forkは現実のWMを変更せず、介入は認可・Revision検査・記録を伴う。
@@ -965,9 +1178,11 @@ Tests/ConstrainedWindowScenario.fs
 13. ワークスペース・窓順序・フォーカス履歴がCoreの第一級の状態として定義され、Policy IRより先に固定されている（v2.1追加、ADR-011）。
 14. ハングした対象アプリへのOS呼出がWM全体・安全停止の受理を止めない（v2.1追加、ADR-012）。
 15. 開発者自身がPhase Bの時点で複数モニター・混在DPI環境の日常利用を開始できる（v2.1追加、18章のPhase再構成）。
+16. 例外は3層（外部失敗→Result、ユーザーコード失敗→LayoutError、プログラムのバグ→InternalFault経由の安全停止）のいずれかで扱われ、Core/Policy/Layoutsへ生の例外が伝播しない（v2.4追加、ADR-014）。
+17. PolicyArtifactはPinnedPolicy（当時のまま再生・Rollback可能）とDeployablePolicy（現行Analyzer通過済み）に分離され、REPL経由のDeployはHost側で必ず再分析される（v2.4追加、ADR-014/F-5）。
 ## 23. AI開発エージェントへの引き継ぎ規則
-変更してよいもの：F# Layout関数、Policy IRの新Rule、Journalの診断投影、追加のScenario/Probe候補、テストケース。
-必ず独立レビューするもの：PlanValidatorの迂回・弱体化、Coreの決定性を崩すI/O、Journalの意味論、記録済みRaw入力（9.1/ADR-013、NormalizerのバグをReplayで再現・回帰テスト化するための一次証拠）、Simulatorの外部動作モデル、ポリシーのUnknown処理、IPC介入権限、安全停止、セキュリティ/プライバシー境界。
+変更してよいもの：F# Layout関数、Policy IRの新Rule、Journalの診断投影、追加のScenario/Probe候補、テストケース、`classify`の対応表への分類追加（1-6の意味でのエントリ追加）。
+必ず独立レビューするもの：PlanValidatorの迂回・弱体化、GatedEffectの迂回・弱体化、Coreの決定性を崩すI/O、Journalの意味論、記録済みRaw入力（9.1/ADR-013、NormalizerのバグをReplayで再現・回帰テスト化するための一次証拠）、`EffectFailure`のDUケース自体の追加・削除（1-8：原因ベースではなくCoreの反応軸で切る方針を崩さないか要検討）、`PinnedPolicy`/`DeployablePolicy`の構築条件、Simulatorの外部動作モデル、ポリシーのUnknown処理、IPC介入権限、安全停止、セキュリティ/プライバシー境界。
 
 AIがバグ修正時に期待結果、Simulator、検証条件を同時に都合よく書き換えることを禁止する。変更が必要な場合は、実機観測や形式的な契約に基づく理由をADR/Issueへ残す。新規の実装機能には少なくとも一つの具体的な再現シナリオ、期待されるJournal、失敗時の挙動を定義する。
 ## 24. 参考仕様（一次資料）
