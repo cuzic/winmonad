@@ -85,7 +85,21 @@ module Native =
     [<DllImport("user32.dll")>]
     extern void keybd_event(byte bVk, byte bScan, uint32 dwFlags, UIntPtr dwExtraInfo)
 
+    [<DllImport("kernel32.dll")>]
+    extern uint32 SetErrorMode(uint32 uMode)
+
 open Native
+
+/// Suppresses the "<app> has stopped working" / Windows Error Reporting UI.
+/// Without this, an unhandled native-level crash can pop a dialog that
+/// blocks the process (and thus our parent's `ReadLine`) forever on a
+/// headless CI runner with nobody to dismiss it. Must be called by both
+/// the parent and the --hang-child process (i.e. unconditionally, before
+/// branching on argv).
+let suppressCrashDialogs () =
+    let SEM_FAILCRITICALERRORS = 0x0001u
+    let SEM_NOGPFAULTERRORBOX = 0x0002u
+    SetErrorMode(SEM_FAILCRITICALERRORS ||| SEM_NOGPFAULTERRORBOX) |> ignore
 
 // ===== small shared infrastructure =====
 
@@ -131,14 +145,29 @@ let killProcessSafely (p: Process) =
 // Launched as a copy of this same exe with --hang-child. Creates a window,
 // pumps a few messages so it is fully created and visible, prints its HWND,
 // then stops pumping entirely (simulating an unresponsive app).
+// Must never throw past this function and must always print *something*
+// and flush, or the parent's bounded read (see readLineWithTimeout) is the
+// only thing standing between us and an indefinite wait.
 let runHangChild () =
-    let form =
-        new Form(Text = "CI_HUNG_WINDOW", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(50, 50, 300, 200))
-    form.Show()
-    pump 10
-    printfn "HWND=%d" (int64 form.Handle)
-    Console.Out.Flush()
-    Thread.Sleep(50000)
+    try
+        let form =
+            new Form(Text = "CI_HUNG_WINDOW", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(50, 50, 300, 200))
+        form.Show()
+        pump 10
+        printfn "HWND=%d" (int64 form.Handle)
+        Console.Out.Flush()
+        Thread.Sleep(50000)
+    with ex ->
+        printfn "ERROR=%s" (ex.Message.Replace("\n", " ").Replace("\r", ""))
+        Console.Out.Flush()
+        Environment.Exit(1)
+
+/// Reads one line from `reader` on a background thread, waiting at most
+/// `timeoutMs`. Returns None (instead of blocking forever) if the child
+/// never writes a line and never closes the stream.
+let readLineWithTimeout (reader: IO.StreamReader) (timeoutMs: int) : string option =
+    let task = Task.Run<string>(Func<string>(fun () -> reader.ReadLine()))
+    if task.Wait(timeoutMs) then Some task.Result else None
 
 let startHangChild (exePath: string) =
     let psi = ProcessStartInfo(exePath, "--hang-child")
@@ -146,13 +175,14 @@ let startHangChild (exePath: string) =
     psi.UseShellExecute <- false
     let p = Process.Start(psi)
     let mutable hwnd = IntPtr.Zero
-    let line = p.StandardOutput.ReadLine()
-    match line with
-    | null -> ()
-    | l when l.StartsWith("HWND=") ->
+    match readLineWithTimeout p.StandardOutput 8000 with
+    | Some l when l <> null && l.StartsWith("HWND=") ->
         let v = Int64.Parse(l.Substring(5))
         hwnd <- IntPtr(v)
-    | _ -> ()
+    | Some l when l <> null && l.StartsWith("ERROR=") ->
+        log (sprintf "- --hang-child reported an error: %s" (l.Substring(6)))
+    | Some _ -> ()
+    | None -> log "- --hang-child did not print anything within 8000ms (treating as unavailable, not as a true block)"
     (p, hwnd)
 
 // ===== spikes =====
@@ -439,6 +469,7 @@ let spikeS6_BatchApply (exePath: string) =
 [<STAThread>]
 [<EntryPoint>]
 let main argv =
+    suppressCrashDialogs ()
     if argv.Length > 0 && argv.[0] = "--hang-child" then
         runHangChild ()
         0
