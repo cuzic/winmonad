@@ -1,7 +1,7 @@
 # Phase 0 技術スパイク計画
 
 対象: [architecture.md](./architecture.md) 18章「Phase 0 — 捨てる前提の素朴なWMによる失敗カタログ収集」の具体化。
-関連: [feasibility.md](./feasibility.md)（各スパイクの前提となるWin32 APIの仕様・実務上の注意点のリサーチ結果）、[failure-catalog.md](./failure-catalog.md)（S1, S2, S3, S4, S5, S6, S9をGitHub Actions windows-latestランナー上で実際に実行した結果。各スパイクの見出しに反映済み）。
+関連: [feasibility.md](./feasibility.md)（各スパイクの前提となるWin32 APIの仕様・実務上の注意点のリサーチ結果）、[failure-catalog.md](./failure-catalog.md)（GitHub Actions windows-latestランナー、および実デスクトップ`dragonflyg4`（clipwire経由）での実行結果。各スパイクの見出しに反映済み）。
 
 ## 進め方
 
@@ -40,15 +40,15 @@ Phase 0は「要素技術の確認」ではなく、**捨てる前提の素朴�
 - **記録する内容**: キーごとの登録成否、`lwin`/`rwin`個別指定が必要だったキー、代替が必要なキーの一覧、`WH_KEYBOARD_LL`使用時のレスポンス（遅延が無いか）、フック自己検知の動作確認。
 - **判定**: 最終的なキーバインド一覧と、`RegisterHotKey`/`WH_KEYBOARD_LL`どちらで実装するかを確定する（「型に反映」：CoreCommandに割り当てるキーの確定）。
 
-### S4. フォーカス移動（SetForegroundWindow）の実現性（B-3対応）【CI実機検証済みだが結論保留：failure-catalog.md F04】
-**結果**：検証ハーネス自身が起動した別プロセスからのフォーカス奪取は、自己プライミングの有無にかかわらず成功した。ただし対象が自分の子プロセスであるため「フォアグラウンドプロセスが呼び出し元によって起動された」という許可条件が別途働いた可能性があり、無関係な第三者プロセス相手の結論ではない。自己プライミングは既定実装として維持し、Phase Bのdogfoodingで再検証する。
+### S4. フォーカス移動（SetForegroundWindow）の実現性（B-3対応）【実デスクトップ実機検証で確定：failure-catalog.md F04, F16】
+**結果**：CI実機検証では、検証ハーネス自身が起動した子プロセスからのフォーカス奪取が自己プライミングの有無にかかわらず成功してしまい（F04）、親子関係の影響を排除できなかった。**実デスクトップ（`dragonflyg4`）での再検証（S4r）で、自分が起動した子プロセス・無関係な第三者プロセスの両方に対し、plain `SetForegroundWindow`は明確に失敗し`mouse_event`自己プライミングは明確に成功することを確認し、限界は解消した（F16）**。自己プライミングは実機実証済みの既定実装として確定。
 - **検証する前提**: ホットキー受信 → キュー → Reducer相当の非同期処理を経た後でも、`SetForegroundWindow`の呼び出しが許可されるか。既存WM（komorebi/GlazeWM）が採用する「自分自身へ`SendInput`でダミー入力を送出後に`SetForegroundWindow`を呼ぶ」パターン（feasibility.md §2）で許可が確保できるか。
 - **方法**: `ThrowawayWm`で、ホットキー受信イベントを一度キューに入れ、数msの遅延（実際のCore処理時間を模する）を挟んでから、(a)素の`SetForegroundWindow`、(b)自己`SendInput`（ダミーのマウスイベント）後に`SetForegroundWindow`、をそれぞれ呼び、成功したかを前面ウィンドウの変化で確認する。遅延量を段階的に増やし、(a)がどこで失敗し始めるか、(b)がどこまで有効かを計測する。`AttachThreadInput`はデッドロック報告があるため採用しない。(b)でも不十分な場合のみ、`SPI_SETFOREGROUNDLOCKTIMEOUT`でシステム設定を変更する案（副作用が大きいため最終手段）を試す。
 - **記録する内容**: 遅延量ごとの(a)(b)それぞれの成功/失敗、(b)の副作用（意図しないメニュー表示・マウスカーソル移動等）の有無。
 - **判定**: (b)で十分な成功率が得られれば「Bで対処」（Shell実装のデフォルトパターンとして確定、既にarchitecture.md 8.1に反映済み）。それでも不十分な場合は`CoreCommand.FocusNext`の実現方法そのものを「型に反映」として見直す。
 
-### S5. 分類・正規化の難所（C-2対応）【CI実機検証を試みたが環境制約で不可：failure-catalog.md F02】
-**結果**：GitHub Actions windows-latestランナーには モダンUWP版Calculatorが無く、`calc.exe`はクラシック`win32calc`として起動された。ApplicationFrameHost仮説自体をこの環境では検証できない。実際のWindows 10/11デスクトップでの再検証が必要（Phase 0〜B）。
+### S5. 分類・正規化の難所（C-2対応）【CI・実デスクトップ双方で未確定：failure-catalog.md F02, F21】
+**結果**：GitHub Actions windows-latestランナーには モダンUWP版Calculatorが無く、`calc.exe`はクラシック`win32calc`として起動された（F02）。実デスクトップ（`dragonflyg4`）でも`calc.exe`は同様にトップレベル窓を取得できず、`ms-settings:`は`SystemSettings.exe`（WinUI）の起動は確認できたが2.5秒以内にウィンドウハンドルが得られなかった（F21、待機時間を延ばした再検証が必要）。ApplicationFrameHost仮説の直接確認はまだ取れていない。
 - **検証する前提**: UWP/WinUIアプリの最上位HWND所有関係（`ApplicationFrameHost.exe`）、Cloakされた別デスクトップの窓、表示直後にスタイル・所有関係が変わる窓が、どう観測されるか。UWPアプリの実アプリ特定について、(a)実行ファイル名、(b)`Windows.UI.Core.CoreWindow`クラス名を持つ子ウィンドウ探索、(c)AUMID/パッケージファミリ名、の3手法を比較する（feasibility.md §9）。
 - **方法**: `ThrowawayWm`に`WinEvent`のRaw観測をそのまま標準出力へ出すモードを足し、対象アプリ起動時のイベント列（`EVENT_OBJECT_SHOW`、`EVENT_OBJECT_CREATE`、スタイル変更等）と、その時点で取得できる属性（プロセス名、オーナー、Cloak状態）を記録する。UWPアプリについては(a)(b)(c)それぞれでAppId相当を導出し、通常表示時とフルスクリーン表示時（(b)が親子両方`ApplicationFrameHost.exe`を返す既知の例外がある）で結果を比較する。
 - **対象アプリ**: UWP設定アプリ、WinUI3アプリ（あれば）、IME候補窓が出るIME、トースト通知、ツールチップ、Teams/Slackの通話ポップアップ。
@@ -62,8 +62,8 @@ Phase 0は「要素技術の確認」ではなく、**捨てる前提の素朴�
 - **記録する内容**: (a)(b)それぞれのちらつきの有無、`SW_RESTORE`が必要なケースの一覧、(b)でハング窓を含めた場合の挙動。
 - **判定**: (a)で十分なら「Bで対処」で確定（既にarchitecture.md 6.2の既定方針）。(b)が明確に優れ、かつハング耐性を損なわないと確認できた場合のみ方針変更を検討する。「`RestoreBeforeMove`が必須なケースの判定条件」はCoreのPlanValidatorが持つ必要があれば「型に反映」。
 
-### S7. 昇格（管理者）ウィンドウへの操作の失敗様式【CI実機検証では非対称性を再現不可：failure-catalog.md F14】
-**結果**：GitHub Actions windows-latestランナーのプロセス自身がAdministratorsグループ所属・整合性レベル**High**で動作していた。CI実機検証ハーネスから見て「自分より高い整合性レベルの対象」が存在しないため、非昇格→昇格という非対称性そのものを安全にCIで作れない（UACの昇格承認プロンプトは無人環境でハングするため試せない）。この項目は実デスクトップでの検証に持ち越す。
+### S7. 昇格（管理者）ウィンドウへの操作の失敗様式【CI検証不可→実デスクトップで非対称性を確認：failure-catalog.md F14, F17, F18】
+**結果**：GitHub Actions windows-latestランナーのプロセス自身がAdministratorsグループ所属・整合性レベル**High**で動作しており、非対称性を観測できなかった（F14）。**実デスクトップ（`dragonflyg4`）の通常セッションはAdministrators非所属・整合性レベル**Medium**であり（F17）、非昇格↔昇格の非対称性は実在することを確認した**。ただし検証時に昇格済みウィンドウが開いていなかったため、実際の`ERROR_ACCESS_DENIED`はまだ観測できていない（F18）。昇格アプリを開いた状態でのS7r再実行が必要。
 - **検証する前提**: 管理者権限で実行されたウィンドウへ非特権プロセスから`SetWindowPos`等を呼ぶとどう失敗するか（サイレント失敗か、明示的なエラーか）。
 - **方法**: 管理者権限で起動したアプリ（例：管理者権限のコマンドプロンプト）を対象に`SetWindowPos`を呼び、戻り値・`GetLastError`・実際にウィンドウが動いたかを確認する。
 - **記録する内容**: 失敗の様式（戻り値、エラー、無反応）。
@@ -82,14 +82,15 @@ Phase 0は「要素技術の確認」ではなく、**捨てる前提の素朴�
 - **記録する内容**: 検出できたケース・できなかったケース。
 - **判定**: 「Bで対処」または「型に反映」（Excluded判定条件に属性を追加する必要があるか）。
 
-### S10. Explorer再起動時のTaskbarCreated・トレイ復旧（E-2対応）【CI実機検証済み：failure-catalog.md F15】
-**結果**：GitHub Actions windows-latestランナー上にも`explorer.exe`は実際に1プロセス存在し、`Process.Kill()`で終了させると**504ms後に自動再起動**した。再起動自体の存在と速さ（1秒未満）を実証。`TaskbarCreated`受信によるトレイアイコン再登録のロジック自体（最小実装）はまだCIで試していない（WinFormsのメッセージループ拡張が必要なため）。
+### S10. Explorer再起動時のTaskbarCreated・トレイ復旧（E-2対応）【CI・実デスクトップともにエンドツーエンドで確定：failure-catalog.md F15, F19】
+**結果**：GitHub Actions windows-latestランナー上で`explorer.exe`強制終了→504ms後の自動再起動を確認（F15）。**実デスクトップ（`dragonflyg4`）での拡張検証で、`RegisterWindowMessage("TaskbarCreated")`→`Shell_NotifyIcon(NIM_ADD)`→Explorer強制終了→381ms後の自動再起動→`TaskbarCreated`ブロードキャストの実際の受信→トレイアイコン再追加成功、という全ステップがエンドツーエンドで成立することを確認した（F19）**。8.4の復旧ロジックは実証済みの確定事項。
 - **検証する前提**: `taskkill /im explorer.exe`等でExplorerを再起動した際、通知領域アイコンが消え、`TaskbarCreated`メッセージで復旧できるか。
 - **方法**: `ThrowawayWm`に`TaskbarCreated`（`RegisterWindowMessage`で取得）を受けてトレイアイコンを再登録する最小実装を足し、Explorer再起動で実際に復旧するか確認する。
 - **記録する内容**: 復旧までの時間、WorkArea再取得が必要か。
 - **判定**: 「Bで対処」。
 
-### S11. 異なるDPIモニター間移動時の自己リサイズ（B-6対応）
+### S11. 異なるDPIモニター間移動時の自己リサイズ（B-6対応）【CI・実デスクトップ双方で未実施：failure-catalog.md F22】
+**結果**：GitHub Actions windows-latestランナーも実デスクトップ（`dragonflyg4`）も単一モニター（CIは1024x768、dragonflyg4は1920x1280、両方96 DPI相当）のため、複数DPIモニター間の移動は検証できなかった（F22）。複数DPI環境が用意できれば再検証する。
 - **検証する前提**: 異なるDPIのモニター間でウィンドウを移動した際、`WM_DPICHANGED`を受けたPer-Monitor-V2対応アプリが自身でサイズを変える挙動と、非対応アプリ（OSがビットマップ拡大縮小するだけで2段階目のSetWindowPosは発生しない）との違い（feasibility.md §7）。
 - **方法**: 100%と150%（または200%）のモニターを用意し（無ければ外部モニターかRDPで疑似的に作る）、複数アプリ（Per-Monitor-V2対応・非対応それぞれ1つ以上。`GetWindowDpiAwarenessContext`等でDPI Awarenessを事前に確認しておく）を移動させ、`SetWindowPos`後の実際のサイズ・Observedの時間的パターンを比較する。
 - **記録する内容**: Per-Monitor-V2対応アプリと非対応アプリでの挙動差、対応アプリで2段階目のSetWindowPosが実際に観測されるタイミング。
