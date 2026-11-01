@@ -1168,9 +1168,7 @@ let spikeS13b_CloakReasonBits () =
 // Win+Ctrl+D doesn't appear to create a real new desktop on this runner image, this reports
 // that as the finding and stops -- it does not retry with increasingly exotic workarounds.
 module private VirtualDesktopManagerInterop =
-    [<ComImport; Guid("AA509086-5CA9-4C25-8F95-589D3C07B48A")>]
-    type VirtualDesktopManagerComClass() =
-        class end
+    let private clsidVirtualDesktopManager = Guid("AA509086-5CA9-4C25-8F95-589D3C07B48A")
 
     [<ComImport; Guid("A5CD92FF-29BE-454C-8D04-D82879FB3F1B"); InterfaceType(ComInterfaceType.InterfaceIsIUnknown)>]
     type IVirtualDesktopManager =
@@ -1181,9 +1179,18 @@ module private VirtualDesktopManagerInterop =
         [<PreserveSig>]
         abstract MoveWindowToDesktop: topLevelWindow: IntPtr * desktopId: byref<Guid> -> int
 
+    // Deliberately does NOT declare a [<ComImport>] F# class for the coclass (e.g.
+    // `type X() = class end`): F# (unlike the C# compiler) does not special-case ComImport
+    // classes and emits a real constructor method body for the explicit `()` primary
+    // constructor, which violates the CLR's "every member of a ComImport type must have
+    // RVA=0" rule and throws `TypeLoadException: Method with non-zero RVA in an Import` at
+    // runtime (confirmed by an earlier failed run of this exact spike). `Type.GetTypeFromCLSID`
+    // is the BCL API for CoCreateInstance-by-GUID that sidesteps this entirely: no interop
+    // class declaration of any kind is needed.
     let tryCreate () : IVirtualDesktopManager option =
         try
-            Some(Activator.CreateInstance(typeof<VirtualDesktopManagerComClass>) :?> IVirtualDesktopManager)
+            let comType = System.Type.GetTypeFromCLSID(clsidVirtualDesktopManager)
+            Some(Activator.CreateInstance(comType) :?> IVirtualDesktopManager)
         with ex ->
             log (sprintf "- CoCreateInstance(CLSID_VirtualDesktopManager) failed: %s" ex.Message)
             None
