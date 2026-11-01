@@ -735,19 +735,31 @@ let spikeS7r_ElevationAsymmetry () =
     | None -> log "- could not determine own integrity level, skipping"
     | Some myRid ->
         log (sprintf "- own integrity level: %s" (integrityLabelOf myRid))
-        let PROCESS_QUERY_INFORMATION = 0x0400u
+        // PROCESS_QUERY_LIMITED_INFORMATION (not the full PROCESS_QUERY_INFORMATION) is the
+        // one Windows explicitly allows a Medium-integrity process to use against its own
+        // user's higher-integrity processes (this is how Task Manager shows elevated
+        // processes' details without itself being elevated); the full right can be denied.
+        let PROCESS_QUERY_LIMITED_INFORMATION = 0x1000u
         let TOKEN_QUERY = 0x0008u
         let candidates = ResizeArray<IntPtr * int * int>()
+        let mutable inspected = 0
+        let mutable openProcessFailures = 0
+        let mutable openTokenFailures = 0
         let cb =
             EnumChildProc(fun hwnd _ ->
                 if IsWindowVisible(hwnd) && GetWindowTextLength(hwnd) > 0 then
                     let mutable pid = 0
                     GetWindowThreadProcessId(hwnd, &pid) |> ignore
                     if pid <> 0 then
-                        let hProc = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid)
-                        if hProc <> IntPtr.Zero then
+                        inspected <- inspected + 1
+                        let hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+                        if hProc = IntPtr.Zero then
+                            openProcessFailures <- openProcessFailures + 1
+                        else
                             let mutable hTok = IntPtr.Zero
-                            if OpenProcessToken(hProc, TOKEN_QUERY, &hTok) then
+                            if not (OpenProcessToken(hProc, TOKEN_QUERY, &hTok)) then
+                                openTokenFailures <- openTokenFailures + 1
+                            else
                                 (match getIntegrityRid hTok with
                                  | Ok rid when rid > myRid -> candidates.Add(hwnd, pid, rid)
                                  | _ -> ())
@@ -755,6 +767,7 @@ let spikeS7r_ElevationAsymmetry () =
                             CloseHandle(hProc) |> ignore
                 true)
         EnumWindows(cb, IntPtr.Zero) |> ignore
+        log (sprintf "- inspected %d visible top-level windows (OpenProcess failures: %d, OpenProcessToken failures: %d)" inspected openProcessFailures openTokenFailures)
 
         if candidates.Count = 0 then
             log "- no visible top-level window owned by a higher-integrity process was found on this desktop right now (open an elevated app, e.g. an admin Command Prompt, to test this)"
