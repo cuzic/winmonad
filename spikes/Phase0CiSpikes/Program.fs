@@ -183,12 +183,15 @@ let killProcessSafely (p: Process) =
 // Must never throw past this function and must always print *something*
 // and flush, or the parent's bounded read (see readLineWithTimeout) is the
 // only thing standing between us and an indefinite wait.
-let runHangChild () =
+let runHangChild (maximized: bool) =
     try
         let form =
             new Form(Text = "CI_HUNG_WINDOW", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(50, 50, 300, 200))
         form.Show()
         pump 10
+        if maximized then
+            form.WindowState <- FormWindowState.Maximized
+            pump 10 // let the maximize actually take effect before we stop pumping
         printfn "HWND=%d" (int64 form.Handle)
         Console.Out.Flush()
         Thread.Sleep(50000)
@@ -204,8 +207,8 @@ let readLineWithTimeout (reader: IO.StreamReader) (timeoutMs: int) : string opti
     let task = Task.Run<string>(Func<string>(fun () -> reader.ReadLine()))
     if task.Wait(timeoutMs) then Some task.Result else None
 
-let startHangChild (exePath: string) =
-    let psi = ProcessStartInfo(exePath, "--hang-child")
+let private startHangChildWith (args: string) (exePath: string) =
+    let psi = ProcessStartInfo(exePath, args)
     psi.RedirectStandardOutput <- true
     psi.UseShellExecute <- false
     let p = Process.Start(psi)
@@ -215,10 +218,16 @@ let startHangChild (exePath: string) =
         let v = Int64.Parse(l.Substring(5))
         hwnd <- IntPtr(v)
     | Some l when l <> null && l.StartsWith("ERROR=") ->
-        log (sprintf "- --hang-child reported an error: %s" (l.Substring(6)))
+        log (sprintf "- %s reported an error: %s" args (l.Substring(6)))
     | Some _ -> ()
-    | None -> log "- --hang-child did not print anything within 8000ms (treating as unavailable, not as a true block)"
+    | None -> log (sprintf "- %s did not print anything within 8000ms (treating as unavailable, not as a true block)" args)
     (p, hwnd)
+
+let startHangChild (exePath: string) = startHangChildWith "--hang-child" exePath
+
+// v2.4で追加（R2-4の再検証）：最大化状態のまま応答停止する子窓。ShowWindow(SW_RESTORE)が
+// 実際に状態を変える操作としてブロックするかを見るため、通常状態のままの子窓とは別に用意する。
+let startHangChildMaximized (exePath: string) = startHangChildWith "--hang-child-maximized" exePath
 
 // ===== spikes =====
 
@@ -492,10 +501,13 @@ let spikeS2b_PreCheckTiming (exePath: string) =
 // S2c: RestoreBeforeMove (architecture.md 7.1) is specified as ShowWindowAsync(SW_RESTORE)
 // rather than the synchronous ShowWindow, on the same reasoning as SWP_ASYNCWINDOWPOS for
 // SetWindowPos (S2) -- this spike actually tests that assumption instead of just asserting it.
+// The child window is maximized before it stops responding, so SW_RESTORE is a real
+// state-changing operation and not a no-op (a no-op could return instantly regardless of
+// Async, which would not actually test anything).
 let spikeS2c_RestoreAsync (exePath: string) =
     let SW_RESTORE = 9
 
-    let (p, hwnd) = startHangChild exePath
+    let (p, hwnd) = startHangChildMaximized exePath
     try
         if hwnd = IntPtr.Zero then
             log "- failed to obtain hung child window handle"
@@ -504,14 +516,14 @@ let spikeS2c_RestoreAsync (exePath: string) =
             let (finished, ms) = measureWithTimeout 4000 (fun () -> ShowWindow(hwnd, SW_RESTORE))
             log (
                 sprintf
-                    "- ShowWindow(SW_RESTORE) WITHOUT Async, on hung window: %s (waited %dms)"
+                    "- ShowWindow(SW_RESTORE) WITHOUT Async, on MAXIMIZED hung window: %s (waited %dms)"
                     (if finished then "returned" else "did NOT return within the 4000ms measurement cap")
                     ms
             )
     finally
         killProcessSafely p
 
-    let (p2, hwnd2) = startHangChild exePath
+    let (p2, hwnd2) = startHangChildMaximized exePath
     try
         if hwnd2 = IntPtr.Zero then
             log "- failed to obtain hung child window handle (2nd trial)"
@@ -520,7 +532,7 @@ let spikeS2c_RestoreAsync (exePath: string) =
             let (finished2, ms2) = measureWithTimeout 4000 (fun () -> ShowWindowAsync(hwnd2, SW_RESTORE))
             log (
                 sprintf
-                    "- ShowWindowAsync(SW_RESTORE), on hung window: %s (waited %dms)"
+                    "- ShowWindowAsync(SW_RESTORE), on MAXIMIZED hung window: %s (waited %dms)"
                     (if finished2 then "returned" else "did NOT return within the 4000ms measurement cap")
                     ms2
             )
@@ -589,7 +601,10 @@ let spikeS6_BatchApply (exePath: string) =
 let main argv =
     suppressCrashDialogs ()
     if argv.Length > 0 && argv.[0] = "--hang-child" then
-        runHangChild ()
+        runHangChild false
+        0
+    elif argv.Length > 0 && argv.[0] = "--hang-child-maximized" then
+        runHangChild true
         0
     else
         let exePath = Process.GetCurrentProcess().MainModule.FileName
