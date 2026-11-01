@@ -83,7 +83,7 @@ module Native =
     extern bool EnumChildWindows(IntPtr hWndParent, EnumChildProc lpEnumFunc, IntPtr lParam)
 
     [<DllImport("user32.dll")>]
-    extern void keybd_event(byte bVk, byte bScan, uint32 dwFlags, UIntPtr dwExtraInfo)
+    extern void mouse_event(uint32 dwFlags, int dx, int dy, uint32 dwData, UIntPtr dwExtraInfo)
 
     [<DllImport("kernel32.dll")>]
     extern uint32 SetErrorMode(uint32 uMode)
@@ -103,12 +103,19 @@ let suppressCrashDialogs () =
 
 // ===== small shared infrastructure =====
 
+let resultsFile = "phase0-ci-results.md"
 let results = ResizeArray<string>()
+let mutable lastProgressTicks = DateTime.UtcNow.Ticks
 
 let log (s: string) =
     Console.Out.WriteLine(s: string)
     Console.Out.Flush()
     results.Add(s)
+    Volatile.Write(&lastProgressTicks, DateTime.UtcNow.Ticks)
+    // Flush to disk after every line so a later hang still leaves everything
+    // observed so far on disk for the "Show results"/upload-artifact steps,
+    // instead of losing the whole run's output (as happened the first time).
+    try File.WriteAllLines(resultsFile, results) with _ -> ()
 
 let heading (s: string) = log ("\n## " + s)
 
@@ -118,6 +125,25 @@ let tryRun (name: string) (f: unit -> unit) =
         f ()
     with ex ->
         log (sprintf "ERROR: %s" (ex.ToString()))
+
+/// Force-exits the whole process if no `log` call has happened for
+/// `stallSeconds`, after writing a diagnostic line. This is a backstop
+/// against a repeat of a spike hanging the *calling* (STA/UI) thread itself
+/// (e.g. inside Application.DoEvents()), which measureWithTimeout cannot
+/// protect against since there is nothing to Task.Run in that case.
+let startWatchdog (stallSeconds: int) =
+    let t =
+        Thread(fun () ->
+            while true do
+                Thread.Sleep(2000)
+                let idleMs = (DateTime.UtcNow.Ticks - Volatile.Read(&lastProgressTicks)) / TimeSpan.TicksPerMillisecond
+                if idleMs > int64 stallSeconds * 1000L then
+                    results.Add(sprintf "\nWATCHDOG: no progress for %dms, force-exiting the whole harness to avoid wasting the CI job timeout." idleMs)
+                    (try File.WriteAllLines(resultsFile, results) with _ -> ())
+                    Environment.Exit(2)
+        )
+    t.IsBackground <- true
+    t.Start()
 
 let pump (times: int) =
     for _ in 1 .. times do
@@ -325,43 +351,50 @@ let spikeS9_Fullscreen () =
     log (sprintf "- geometry heuristic (borderless AND rect == monitor rect) matches: %b" matchesScreen)
 
 // S4: SetForegroundWindow permission after a simulated async-queue delay, with and
-// without the komorebi/GlazeWM self-priming trick (here using keybd_event instead
-// of SendInput, since it needs no MOUSEINPUT/INPUT union marshaling).
-let spikeS4_ForegroundWindow () =
-    let VK_MENU = 0x12uy
-    let KEYEVENTF_KEYUP = 0x0002u
+// without the komorebi/GlazeWM self-priming trick (here using the simpler
+// single-purpose mouse_event instead of SendInput, since it needs no
+// MOUSEINPUT/INPUT union marshaling, but still posts a real mouse input
+// event like SendInput(INPUT_MOUSE) does).
+// NOTE: an earlier version of this spike used keybd_event(VK_MENU, ...) (Alt)
+// as the "self-priming" input and, on real CI hardware, hung for the rest of
+// the job: injecting a bare Alt keydown/keyup makes Windows enter menu-loop
+// handling (WM_SYSKEYDOWN / WM_ENTERMENULOOP) on the active window, and
+// Application.DoEvents() does not return out of that internal modal loop
+// with nothing (no Escape, no click) to dismiss it. komorebi/GlazeWM avoid
+// this entirely by using a *mouse* input event for the self-priming trick
+// (see docs/feasibility.md §2) -- this is why that choice matters in
+// practice, not just in theory.
+let spikeS4_ForegroundWindow (exePath: string) =
+    let MOUSEEVENTF_MOVE = 0x0001u
 
-    use formA = new Form(Text = "A", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(0, 0, 200, 150))
     use formB = new Form(Text = "B", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(250, 0, 200, 150))
-    formA.Show()
     formB.Show()
     pump 5
 
-    formA.Activate()
-    pump 5
-    Thread.Sleep(300) // simulate queue -> Reducer -> Effect latency before RequestForeground is applied
+    // Each trial gives the foreground to a genuinely different *process*
+    // first, so that "can we steal it back" is a real test and not trivially
+    // satisfied by formB belonging to the already-foreground process.
+    let runTrial (label: string) (prime: unit -> unit) =
+        let (p, hwndOther) = startHangChild exePath
+        try
+            if hwndOther = IntPtr.Zero then
+                log (sprintf "- %s: could not start the other-process window, skipping this trial" label)
+            else
+                SetForegroundWindow(hwndOther) |> ignore
+                pump 3
+                Thread.Sleep(300) // simulate queue -> Reducer -> Effect latency before RequestForeground is applied
+                prime ()
+                let ok = SetForegroundWindow(formB.Handle)
+                pump 3
+                let fg = GetForegroundWindow()
+                log (sprintf "- %s: API returned=%b, actually foreground=%b" label ok (fg = formB.Handle))
+        finally
+            killProcessSafely p
 
-    let ok1 = SetForegroundWindow(formB.Handle)
-    pump 3
-    let fg1 = GetForegroundWindow()
-    log (sprintf "- plain SetForegroundWindow after 300ms delay: API returned=%b, actually foreground=%b" ok1 (fg1 = formB.Handle))
-
-    formA.Activate()
-    pump 5
-    Thread.Sleep(300)
-
-    // self-priming: post a real input event to ourselves immediately before the call,
-    // so this process satisfies the "received the most recent input event" condition.
-    keybd_event(VK_MENU, 0uy, 0u, UIntPtr.Zero)
-    keybd_event(VK_MENU, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
-    let ok2 = SetForegroundWindow(formB.Handle)
-    pump 3
-    let fg2 = GetForegroundWindow()
-    log (
-        sprintf
-            "- keybd_event self-priming + SetForegroundWindow after 300ms delay: API returned=%b, actually foreground=%b"
-            ok2 (fg2 = formB.Handle)
-    )
+    runTrial "plain SetForegroundWindow, 300ms after another process took the foreground" (fun () -> ())
+    runTrial
+        "mouse_event self-priming + SetForegroundWindow, 300ms after another process took the foreground"
+        (fun () -> mouse_event (MOUSEEVENTF_MOVE, 0, 0, 0u, UIntPtr.Zero))
 
 // S2: hang detection -- does SetWindowPos block on an unresponsive window, does
 // SWP_ASYNCWINDOWPOS avoid that, and how do IsHungAppWindow / SendMessageTimeout behave.
@@ -475,6 +508,11 @@ let main argv =
         0
     else
         let exePath = Process.GetCurrentProcess().MainModule.FileName
+        // Backstop: if any single spike blocks the STA thread itself (not just
+        // a background Task we could time out), force-exit after 60s of no
+        // `log` progress instead of riding out the job's 15-minute timeout
+        // with nothing recorded, as happened the first time this was run.
+        startWatchdog 60
 
         log "# Phase 0 CI実機検証結果"
         log (sprintf "- OS: %s" (Environment.OSVersion.ToString()))
@@ -486,9 +524,9 @@ let main argv =
         tryRun "S1 可視フレームとウィンドウ矩形の差分" spikeS1_RectDiff
         tryRun "S5 UWP(calc.exe)のトップレベル窓・子窓" spikeS5_Uwp
         tryRun "S9 全画面相当ウィンドウの検出" spikeS9_Fullscreen
-        tryRun "S4 SetForegroundWindowの許可条件" spikeS4_ForegroundWindow
+        tryRun "S4 SetForegroundWindowの許可条件" (fun () -> spikeS4_ForegroundWindow exePath)
         tryRun "S2 ハング検知とEffect適用" (fun () -> spikeS2_Hang exePath)
         tryRun "S6 バッチ適用(DeferWindowPos vs 個別SetWindowPos+ASYNC)" (fun () -> spikeS6_BatchApply exePath)
 
-        File.WriteAllLines("phase0-ci-results.md", results)
+        log "\n(all spikes finished without the watchdog firing)"
         0
