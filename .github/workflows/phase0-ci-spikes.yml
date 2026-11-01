@@ -1,0 +1,48 @@
+name: Phase 0 CI Spikes (Windows real-machine verification)
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - "spikes/Phase0CiSpikes/**"
+      - ".github/workflows/phase0-ci-spikes.yml"
+
+jobs:
+  run-spikes:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Build
+        run: dotnet build spikes/Phase0CiSpikes/Phase0CiSpikes.fsproj -c Release
+
+      - name: Run spikes
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path spikes/Phase0CiSpikes/bin/Release -Recurse -Filter Phase0CiSpikes.exe | Select-Object -First 1
+          if (-not $exe) { throw "Phase0CiSpikes.exe not found after build" }
+          & $exe.FullName
+
+      - name: Show results
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path phase0-ci-results.md) {
+            Get-Content phase0-ci-results.md
+          } else {
+            Write-Output "phase0-ci-results.md was not produced (harness likely crashed before writing it)."
+          }
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase0-ci-results
+          path: phase0-ci-results.md
+          if-no-files-found: warn

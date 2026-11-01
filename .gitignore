@@ -1,0 +1,5 @@
+bin/
+obj/
+*.user
+.vs/
+phase0-ci-results.md

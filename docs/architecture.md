@@ -1,0 +1,982 @@
+# Windows プログラマブル・ウィンドウマネージャー 統合設計書
+
+Version: 2.2（Opus批判的レビューの指摘＋Phase 0実現性リサーチ[feasibility.md]の結果を反映）
+Date: 2026-11-01
+Status: 基本アーキテクチャ決定／個別APIと性能値はPoCで検証／中核状態モデルとPhase順序を本版で見直し／Win32 API挙動の一部をdocs/feasibility.mdの調査結果で具体化
+Implementation language: F# / .NET
+Target: Windows 11を初期検証対象とするWindowsデスクトップ。主なCore開発はLinux
+Audience: 開発者、設計レビュアー、AIコーディングエージェント
+設計の一文要約：Windowsの実ウィンドウを管理しながら、意思決定・命令・実観測をUnified Journalに蓄積し、稼働中のWMをF# REPLから調査・介入でき、実測に基づく疑似OSで障害を再現・修正・回帰テスト化できる、観測・実験可能なプログラマブルWMを構築する。
+
+本書は従来のv1.0〜v1.3を統合し、最新の採用方針で再編集した単独で読める基準設計書である。F*、全ポリシーのDeep Embedded DSL化は採用しない。設計中のF#コードは契約例であり、コンパイル済みの完成実装を意味しない。
+## 0. 意思決定と設計状態
+| ID | 判断 | 状態 |
+|---|---|---|
+| ADR-001 | F#純粋関数 + 宣言的Policy IRを採用。任意レイアウト計算とReconciliationはF#、構造解析が必要な分類・選択・優先順位はIR | 採用 |
+| ADR-002 | Functional Core / Imperative Shell。Windows Shellと疑似OSは同じCoreを実行 | 採用 |
+| ADR-003 | Desired・Observed・Pendingを分離し、OS要求の受付と実現を混同しない | 採用 |
+| ADR-004 | Unified Journalは「Coreの外から来た事実」（入力、OS呼出結果、Artifact識別子、Checkpoint）を永続化の中心とし、判断（Rule選択、Predicate評価等）はCoreの決定性を前提にReplayで再構成する。判断の全量を都度永続化しない | 採用（v2.1で改訂。旧ADR-004は判断ログの全量永続化を前提にしていたが、決定的Coreとの重複によりホットパス遅延とJournal容量を不必要に増やすため撤回） |
+| ADR-005 | Live REPLは別プロセス。Hostへの接続は型付きIPCに限定 | 採用 |
+| ADR-006 | Fixed-log ReplayとCounterfactual Simulationを別機能として設計 | 方向性採用（Phase Dで価値を実測してから本採用を判断。疑似モデルが実不具合をどれだけ再現できるかの実証が無い段階での全面採用は時期尚早） |
+| ADR-007 | Active Diagnosisで不足証拠を再収集し、疑似窓の振る舞いモデルを更新 | 方向性採用（選択アルゴリズム・モデル合成はPhase D以降に縮小スコープで評価。Phase A〜Cの型設計をこのADRに合わせて先行複雑化させない） |
+| ADR-008 | F*による証明・コード抽出は初期構成に採用しない。型検査・Analyzer・PlanValidator・性質ベーステストを組み合わせる | 採用 |
+| ADR-009 | 初期対象は同一ユーザーの対話デスクトップ上で動く、非特権のWindowsアプリ。OS合成・Explorerは置き換えない | 採用 |
+| ADR-010 | ビルトイン設定の更新方式、任意F#拡張コードのプロセス隔離、journal保存媒体はPoCで決定 | 未確定 |
+| ADR-011 | タイル型WMの中核状態（Workspace、窓順序/Stack、フォーカス履歴、CoreCommand）をCoreの第一級の状態として4章で定義する。Policy IRや診断機構より先にこれを固定する | 採用（v2.1で新設。旧版はこの状態がどこにも定義されておらず、WM本体が空白になっていた） |
+| ADR-012 | OS呼出（Effect適用）は専用スレッド・タイムアウト付きで行い、ハングした対象アプリがCoreの入力処理・安全停止経路をブロックしないようにする | 採用（v2.1で新設） |
+| ADR-013 | Windows Event Normalizerを純粋関数として切り出し、Raw観測（WinEvent種別＋その時点でShellが問い合わせた属性集合）をJournalの入力として記録する。疑似OSはRaw層から駆動できるようにする | 採用（v2.1で新設。旧版は疑似OSが正規化済みイベントより後段からしか駆動できず、分類・正規化起因の不具合を再現できなかった） |
+
+
+最優先で検証する仮説：実Windowsで観測した不具合を、同じCoreと取得した証拠に基づく疑似OS上に持ち込み、失敗する最小シナリオを作成して修正前後の挙動を比較できる。
+
+第二の優先仮説（v2.1で追加）：キーボード中心のタイル操作（ワークスペース、Master–Stack、フォーカス移動）が、ホットキー登録・フォーカス許可・ハング耐性を含めて実際のWindows環境で成立する。この仮説が崩れると診断機構の価値そのものが成立しないため、Phase 0〜Bで最優先に検証する。
+## 1. 背景、目的、製品価値
+### 1.1 解こうとしている課題
+Windowsアプリのウィンドウ制御は、WMが命令すれば必ず成功する同期処理ではない。対象アプリがリサイズを拒否・補正することがあり、通知は遅延・重複・逆転して見えることがある。DPI、所有ダイアログ、手動操作、OSのフォーカス制約、消滅したHWND、アプリ別の独特な挙動が実用性を左右する。
+
+一般的なWMでは、これらの不具合は「特定アプリで位置がずれる」「勝手に動き続ける」などの現象として現れ、再現とデバッグが難しい。本プロジェクトは管理機能に加え、実行中の判断を説明し、原因究明に必要な観測を増やし、再現可能なモデルとテストに変換することを製品上の価値とする。
+### 1.2 開発対象
+- キーボード中心のタイル型WM。Explorer/DWM、通常のデスクトップおよび既存アプリと共存する。
+- WM自身が持つ最小限のワークスペース・窓順序（master/stack）・フォーカス履歴のCore状態モデル（4章で定義。OSの仮想デスクトップ機能との連携ではなく、Core内の状態である）。
+- 宣言的なウィンドウ分類・レイアウト選択と、自由なF#製レイアウトアルゴリズム。
+- 構造化Journal、原因説明、時間方向の調査、REPL接続、疑似OSへのFork。
+- 複数の観測・振る舞い仮説を比較するActive Diagnosisとモデルベーステスト（スコープを縮小し、Phase D以降に評価しながら拡張する）。
+- LinuxでCoreとSimulationを高速に反復できる開発フロー。
+### 1.3 初期の非目標
+- DWM/Explorer/シェルの置換、独自コンポジタ、全プロセスへのフック注入。
+- 任意アプリの内部メモリやUI状態の完全な複製、汎用仮想Windows OS。
+- 任意F#コードの純粋性・停止性・安全性の自動証明。
+- 汎用プログラミング言語/新規パーサー、全ルールのDeep Embedded DSL化。
+- 管理者権限やUIAccessによる保護されたUIの操作、セキュアデスクトップへの介入。
+- 初期版の独自バー、アニメーション、ランチャー。OSの仮想デスクトップ機能との連携（切替・割当の同期）は非目標とするが、WM内部の最小限のワークスペース状態（1.2参照）はこれとは別に必要であり非目標から除く。
+- 外部アプリの任意動作への保証、クラッシュ前のOS操作の厳密なExactly-once保証。
+- 全画面アプリ・ゲーム・動画・枠なしウィンドウを自動タイル対象にすること（検出して除外する。20章のリスクE-4参照）。
+### 1.4 想定ユーザーとユースケース
+常用：複数アプリをキーボードで切り替え、レイアウトをプログラムで選び、アプリ固有の例外を適用する。
+不具合調査：ある窓のDesiredが500pxなのにObservedが700pxとなる理由をJournalから追う。
+Live診断：稼働中のWMにF# REPLで接続し、WindowId、適用Rule、未完了要求を調査する。
+安全な実験：現在のSnapshotをForkして、新しいPolicyを実窓に触らず評価する。
+知識の蓄積：実機で得た制約や遅延特性を振る舞いモデルと回帰シナリオに変換する。
+## 2. 要件と品質特性
+### 2.1 機能要件
+| ID | 要件 | 初期優先 |
+|---|---|---|
+| FR-01 | 管理候補ウィンドウの発見、識別、分類（Tiled/Floating/Excluded/Suspended） | P0 |
+| FR-02 | Master–Stack、Monocleの配置とキーボード操作 | P0 |
+| FR-03 | Policy IRの構築、参照検査、曖昧条件の可視化 | P0 |
+| FR-04 | Plan検証、Desired/Observed/Pendingの収束制御 | P0 |
+| FR-05 | イベント・判断・命令・観測を結び付けるJournal | P0 |
+| FR-06 | 同じCoreを用いた疑似窓の実行・シナリオテスト | P0 |
+| FR-07 | 実Windows Shellと安全停止・全体再観測 | P0 |
+| FR-08 | JournalからのExplainとIncident Bundle抽出 | P1 |
+| FR-09 | 別プロセスREPL、Inspect・Fork・比較実行 | P1 |
+| FR-10 | 安全に許可された追加ProbeとEvidenceGap管理 | P1 |
+| FR-11 | REPLによる監査付きIntervene・Policy Deploy | P2 |
+| FR-12 | 疑似窓モデル候補生成、反例縮小、回帰シナリオ化 | P2 |
+| FR-13 | 複数モニター・混在DPIの基本動作とホットキーによる最小限の常用 | P0〜P1（v2.1で前倒し。18章Phase B） |
+| FR-13' | 複数モニター・混在DPIの高度な協調（タスクバー位置変更、WorkArea変更連鎖等）、手動操作の高度な協調 | P2 |
+| FR-14 | ワークスペース・窓順序・フォーカス履歴というWM中核状態の管理（v2.1追加、ADR-011） | P0 |
+| FR-15 | ハングした対象アプリに対するEffect適用のタイムアウトと、安全停止経路の独立性（v2.1追加、ADR-012） | P0 |
+
+
+P0/P1/P2は開発段階を示す優先度であり、機能の恒久的な重要度ではない。
+### 2.2 非機能要件
+- 決定性：同一のCore/設定/Registry成果物/初期状態/正規化イベント列は同じ計算結果を返す。ただしOS側の挙動は非決定的。
+- 安全性：無効なPlanをShellへ渡さない。緊急停止を設定コードに依存させない。
+- 観測可能性：選択したルールだけでなく、要求の発行から実観測、収束不能まで追跡できる。
+- 再現性：Replayに必要なバージョン、Snapshot、時刻・乱数・順序を保持する。
+- 耐障害性：破損した設定・Journal・外部アプリ応答でも通常のWindows操作を妨げない。
+- プライバシー：ウィンドウタイトル、UIテキスト、パス等は不要なら収集しない。共有前に除去する。
+- 開発効率：通常のCore開発とSimulationの大半をLinux上で反復できる。
+性能・容量の目標値（例：入力イベントから配置要求までの遅延、Journalのデータ量）は、Phase A/Bでベースラインを測定したうえで固定する。現段階では測定していない数値をSLOとして宣言しない。
+
+**レイテンシ予算の事前宣言（v2.1で追加、G-1対応）**：測定値をSLOとして宣言しないことと、「ホットキーを押してから全窓のSetWindowPos発行完了までの目標時間」を製品要件として先に決めることは矛盾しない。後者は実測結果ではなく製品上の要求であり、Phase 0の失敗カタログを踏まえてPhase A開始時に暫定目標（例：数十ms台）を宣言し、判断ログの永続化（削除済み、B-1参照）・Journal同期書き込み・キュー越しの往復といったホットパス上の選択を、この目標に対して評価する。Phase A/Bの実測結果で目標自体を調整する。
+## 3. 全体アーキテクチャ
+                  F# Configuration Source
+               ┌────────────┴───────────────┐
+               ▼                            ▼
+     Declarative Policy IR        F# Layout Registry
+     ─ classification            ─ master-stack
+     ─ priorities                ─ monocle
+     ─ layout selection          ─ custom pure functions
+     ─ fallback/probe policy     ─ versioned artifacts
+               │                            │
+               ▼                            ▼
+      Policy Analyzer ─────────► PolicyArtifact
+                                             │
+  WinEvent / EnumWindows                     │
+  monitors / input / IPC                      │
+          │                                  │
+          ▼                                  ▼
+  Windows Event Normalizer  ─►  Functional Core ◄─ Simulation Events
+                                 │
+                  Policy Eval + F# Layout + PlanValidator
+                  Desired / Observed / Pending / Reconciliation
+                                 │
+                    ┌────────────┴─────────────┐
+                    ▼                          ▼
+             Typed Effect IR             DecisionTrace
+                    │                          │
+             ┌──────┴──────┐                   │
+             ▼             ▼                   ▼
+         Windows Shell   Simulated Shell   Unified Journal
+             │             │                   │
+             └── Observed ─┘          ┌────────┼──────────┐
+                                      ▼        ▼          ▼
+                                   Logs    Live REPL   Evidence/Model
+                                              │          │
+                                        Fork/Compare ◄──┘
+### 3.1 境界と依存方向
+1. Domain / Contracts：ID、座標、イベント、Effect、Journal上の共通型。Windows依存なし。
+2. Policy：シリアライズ可能なPolicy IR、三値条件評価、Analyzer、Registry解決。
+3. Layout：純粋F#関数と独立PlanValidator。Win32依存なし。
+4. Core：状態遷移、要求追跡、収束、操作の抑止・再試行、Trace生成。
+5. Windows Shell：OSの生の観測（Raw Event）の取得、純粋関数としてのWindows Event Normalizer（Raw Event → 正規化済みInputEvent）、Effect適用。ここに配置判断を実装しない（ADR-013、C-2対応：Normalizerを純粋関数として切り出すのは、Shellからの単純な実装都合ではなく、Raw Eventを記録してReplay・疑似OSの入力にできるようにするための構造上の要件である）。
+6. Simulation：疑似窓と仮想時間。Raw Event層とNormalizer（5.と同じ純粋関数）を経由して観測を生成し、Coreの判断は再実装しない。正規化済みイベントを直接生成する簡易モードも残すが、分類・正規化起因の不具合（UWPのゴーストフレーム、Cloak、表示直後のスタイル変更等）はRaw Event層からの駆動でなければ再現できない。
+7. Journal / Diagnostics：意思決定と外部観測を結ぶ型付き記録・閲覧・出力。
+8. Debug Host/REPL：公開した型付きコマンドを介して、状態参照・Fork・Probe・介入。
+Runtimeは単一のReducerイベント列を持つ。WinEventのコールバック、タイマー、REPLから状態を直接更新しない。すべて入力キューに送る。
+### 3.2 なぜ全面Deep DSLを採用しないか
+Deep DSLが有利なのは、設定の構造検査や静的な変換・保存である。いっぽう幾何計算やReconcilerまでASTにすると、演算子追加のたびにEvaluator/Analyzer/Serializer/Visualizerを更新する必要がある。JournalやReplayの成立条件は純粋なCore、構造化した入力/Effect、再現可能な成果物であり、全計算のAST化ではない。
+## 4. ドメインモデルと識別子
+### 4.1 IDの契約
+[<Struct>] type WindowId = WindowId of int64
+[<Struct>] type MonitorId = MonitorId of int64
+[<Struct>] type RequestId = RequestId of int64
+[<Struct>] type IntentEpoch = IntentEpoch of int64
+[<Struct>] type PolicyRuleId = PolicyRuleId of string
+[<Struct>] type LayoutId = LayoutId of string
+[<Struct>] type EvidenceId = EvidenceId of string
+[<Struct>] type ScenarioId = ScenarioId of string
+WindowIdはCore内の寿命管理済みIDであり、生の`HWND`ではない。Shellが`HWND → WindowId`を対応付け、破棄後は同じIDを再利用しない。HWNDの再利用・プロセス再起動・遅延イベントを考慮して、対象の同一性を再確認する。`RequestId`は発行要求の追跡、`IntentEpoch`は新しい意図で古いPendingを失効させるための識別子とする。
+### 4.2 座標と属性
+type PixelRect = {
+    X: int
+    Y: int
+    Width: int
+    Height: int
+}
+
+type Observation<'T> = {
+    Value: 'T
+    SampleSequence: int64
+    MonotonicTime: int64
+    Source: string
+}
+
+type WindowSnapshot = {
+    Id: WindowId
+    AppId: string option
+    Owner: WindowId option
+    IsDialog: bool option
+    NativeRect: Observation<PixelRect> option
+    VisibleFrameRect: Observation<PixelRect> option
+    IsVisible: bool option
+    IsMinimized: bool option
+    IsCloaked: bool option
+    Monitor: MonitorId option
+    MinWidthHint: int option
+    Title: string option // 設定上、必要時のみ取得する機密フィールド
+}
+X/Yは負値を許容し、`Width/Height`は正でなければならない。実装ではオーバーフローを検出する。`GetWindowRect`とDWM拡張フレーム境界は同一ではなく、DPI仮想化の扱いも異なる。Coreに渡すレイアウト座標系を明示し、Shellはソース座標・DPI・変換規則を保存できるようにする。
+
+**座標系の契約（v2.1で追加、A-3対応／v2.2でfeasibility.md §6により具体化）**：CoreとPolicy/LayoutがやりとりするPixelRectは「可視フレーム矩形（DWM拡張フレーム境界、`DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`で取得）」を指すと定義する。`SetRect` Effect（7.1参照）が渡す値もこの可視フレーム矩形であり、Shellは`SetWindowPos`に渡す実際のウィンドウ矩形（`GetWindowRect`）との差分（Windows 10標準で1辺あたり約7px、DPIにより変動）を自分で補正する。この補正無しでは、ほぼ全ての窓でDesiredとObservedが恒常的に数px食い違い、収束不能（Suspended化）が初日から多発する。実装パターンは、既存のWindows用タイル型WM（komorebi）の`window_rect`/`shadow_rect`関数が確立している：`DWMWA_EXTENDED_FRAME_BOUNDS`を優先的に取得し失敗時のみ`GetWindowRect`にフォールバックする（`window_rect`）、両者の差分を「シャドウ分」として別管理し`SetWindowPos`呼び出し時に加算する（`shadow_rect`）、という2関数構成をShell実装の指針とする。ただし、**ウィンドウがまだ一度も表示されていない生成直後は`DwmGetWindowAttribute`が`GetWindowRect`と同値を返す**という既知の注意点があり、初回配置のタイミング（最初の`ObserveWindow`の発行時点）に反映する。またkomorebi自身もDPIスケーリングが100%でない場合の差分計算を未完了（TODOコメントが残る）としており、本WMもこの点をPhase 0で未解決領域として明示的に扱う。Phase 0の完了条件（18章）に「対象アプリごとに可視フレームとウィンドウ矩形の差分を計測し、補正込みで一致判定できる」ことを含める。
+
+MinWidthHint等は観測・推定・設定の由来を区別する。単発の「500pxを要求して700pxを観測」を「OSが保証する最小幅700px」という確定事実に昇格させない。
+### 4.3 管理状態
+- Discovered：候補として見つかったが属性の調査中。
+- Managed：タイル配置の対象。
+- Floating：位置変更を原則自動管理しない／限定管理する。
+- Suspended：ユーザー操作や連続失敗により自動管理を一時停止。
+- Excluded：システム/特殊窓など対象外。
+- Destroyed：寿命終了。関連要求・Timerを失効させる。
+所有窓・モーダルダイアログ・ツール窓・タスクバー・保護UI・Cloaked等を、常に自動整列するものとして扱わない。分類不能時は破壊的に移動させるより、観測と保守的なフォールバックを優先する。
+### 4.4 WM中核状態：Workspace・窓順序・フォーカス履歴（v2.1で新設、ADR-011）
+旧版はPolicy IRやJournal/診断機構を先に詳細化し、タイル型WMとしての本体状態（xmonadで言う`StackSet`相当）がどこにも定義されていなかった。これを4章の時点で固定する。Policy IR・Journalスキーマ・Snapshot形式・Incident Bundleは、この状態モデルを前提に設計し直す。
+
+```fsharp
+[<Struct>] type WorkspaceId = WorkspaceId of int
+
+type StackSlot =
+    | Master
+    | Stack of index: int
+
+type WorkspaceState = {
+    Id: WorkspaceId
+    // Master が先頭。並び順そのものが配置の意味を持つ。
+    Order: WindowId list
+    FocusHistory: WindowId list // 直近フォーカスが先頭
+}
+
+type WmState = {
+    Workspaces: Map<WorkspaceId, WorkspaceState>
+    ActiveWorkspace: WorkspaceId
+    WindowWorkspace: Map<WindowId, WorkspaceId>
+}
+
+type CoreCommand =
+    | FocusNext
+    | FocusPrevious
+    | SwapWithMaster
+    | PromoteToMaster
+    | CloseFocused
+    | SwitchWorkspace of WorkspaceId
+    | MoveFocusedToWorkspace of WorkspaceId
+    | ChangeLayout of LayoutRef
+    | ToggleFloating of WindowId
+    | SetManagement of WindowId * Management
+```
+
+- `Order`は配置アルゴリズム（Master–Stack、Monocle等）が参照する唯一の並び順であり、`LayoutContext.TiledWindows`（6章参照）はここから導出する。
+- 新しい窓はOrderの末尾（Stackの末尾）に挿入する既定方針とし、分類がUnknownの間は挿入しない（5.4のUnknown暫定方針と整合させる）。
+- `WindowWorkspace`は窓が消滅・Excluded化した時点で除去する（4.3のDestroyed遷移と連動）。
+- WMプロセス自体のワークスペースは、OSの仮想デスクトップ機能とは独立したCore内の状態である（1.3参照）。実装方式（窓を隠す／画面外へ移動／最小化のいずれか）はPhase 0〜Aで確定する。いずれの方式でも「クラッシュ時に非アクティブワークスペースの窓が行方不明になる」リスクがあるため、8.4の安全停止・全体再観測で各窓の所属Workspaceを復元できることを要件とする。
+- フォーカス移動（FocusNext/Previous）が実際にOSへ反映できるかはB-3（8.1参照）のSetForegroundWindow許可の検証に依存する。この検証が通らない限り、CoreCommandとしては定義されていてもユーザー体感上は機能しない前提で扱う。
+## 5. F# + 宣言的Policy IR
+### 5.1 表現の選択
+| 対象 | 表現 | 理由 |
+|---|---|---|
+| ウィンドウ分類・優先順位 | 宣言的Policy IR | 衝突・到達性・選択理由を説明できる |
+| レイアウト選択・Fallback | 宣言的Policy IR | 保存・比較・事前検査できる |
+| 観測条件・Probe方針 | 宣言的Policy IR | 読む情報を明確化できる |
+| Master–Stack等の幾何計算 | F#純粋関数 | アルゴリズムを自由に記述できる |
+| Reconciliation、Timer、要求追跡 | F#純粋関数 | 時系列のイベント状態遷移を表現できる |
+| 外部操作 | 型付きEffect IR | OS APIの呼び出しと結果を分離できる |
+| 疑似窓の振る舞い設定 | Scenario/Behavior IR | 証拠に対応付けた再現モデルにする |
+| 診断手順 | 型付きCommand、必要に応じCE | 複数手順の実験を記述できる |
+
+
+### 5.2 IRの基本型（初期案）
+type WindowPredicate =
+    | AnyWindow
+    | AppIs of string
+    | TitleContains of string
+    | DialogIs of bool
+    | MinWidthAtLeast of int
+    | All of WindowPredicate list
+    | AnyOf of WindowPredicate list
+    | Not of WindowPredicate
+
+type Management = Tiled | Floating | Excluded
+
+type WindowRule = {
+    Id: PolicyRuleId
+    Priority: int
+    When: WindowPredicate
+    Apply: Management
+}
+
+type LayoutPredicate =
+    | Always
+    | TiledCountAtLeast of int
+    | MonitorWidthAtLeast of int
+    | Both of LayoutPredicate list
+
+type LayoutArgs =
+    | NoArgs
+    | MasterRatio of decimal
+    | ColumnCount of int
+
+type LayoutRef = {
+    Id: LayoutId
+    ApiVersion: int
+    Args: LayoutArgs
+}
+
+type LayoutRule = {
+    Id: PolicyRuleId
+    Priority: int
+    When: LayoutPredicate
+    Use: LayoutRef
+}
+
+type PolicyIR = {
+    SchemaVersion: int
+    WindowRules: WindowRule list
+    DefaultManagement: Management
+    LayoutRules: LayoutRule list
+    DefaultLayout: LayoutRef
+}
+これは互換契約の第一案。実際の永続フォーマットはF#のDUシリアライザーに暗黙依存せず、SchemaVersionを明示したDTOから変換する。`HWND`、任意の関数オブジェクト、任意のクロージャ、現在時刻、外部サービス参照はIRに埋め込まない。
+### 5.3 設定サンプル
+let policy = {
+    SchemaVersion = 1
+    WindowRules = [
+        { Id = PolicyRuleId "dialog"; Priority = 100
+          When = DialogIs true; Apply = Floating }
+        { Id = PolicyRuleId "terminal"; Priority = 50
+          When = AppIs "WindowsTerminal"; Apply = Tiled }
+    ]
+    DefaultManagement = Tiled
+    LayoutRules = [
+        { Id = PolicyRuleId "columns-many"; Priority = 20
+          When = TiledCountAtLeast 4
+          Use = { Id = LayoutId "columns"; ApiVersion = 1
+                  Args = ColumnCount 3 } }
+        { Id = PolicyRuleId "coding"; Priority = 10
+          When = TiledCountAtLeast 2
+          Use = { Id = LayoutId "master-stack"; ApiVersion = 1
+                  Args = MasterRatio 0.62m } }
+    ]
+    DefaultLayout = { Id = LayoutId "monocle"; ApiVersion = 1
+                      Args = NoArgs }
+}
+設定用の`rule "name" |> whenApp ...`等のコンビネーターは提供してよいが、結果は必ずこの保存可能なPolicy IRになる。QuotationsやComputation Expressionsは必要な部分だけの構文糖衣とし、初期必須基盤にしない。
+
+**述語の前提の明確化（v2.1で追加、A-6対応）**：
+- `AppIs`が参照する`AppId`の導出方法（実行ファイル名、AUMID、パッケージファミリ名のいずれか）をPhase 0で確定する。UWP/WinUIアプリの最上位HWNDは`ApplicationFrameHost.exe`が所有するため、実行ファイル名だけで判定するとサンプル設定（`AppIs "WindowsTerminal"`等）がアプリの種類によって機能しない場合がある（v2.2でfeasibility.md §9により具体化）。実アプリの特定には、クラス名`Windows.UI.Core.CoreWindow`を持つ子ウィンドウを探しそのプロセスIDを読む、という実装パターンがChromiumプロジェクトで使われている。ただし、この手法には既知の例外がある：フルスクリーン表示中のUWPアプリでは親・子の両方が`ApplicationFrameHost.exe`のPIDを返す場合があり、また子ウィンドウからの取得はアプリがアクティブな間だけ機能するという制約がある。AUMID/パッケージファミリ名による識別の方がこうした揺れに対して安定する可能性があるため、Phase 0のスパイクS5でこの3手法（実行ファイル名／CoreWindow子窓探索／AUMID）を比較する。
+- `TitleContains`を使うルールを1つでも有効にすると、常にウィンドウタイトルを取得することになり、9.6の「必要時のみ取得する機密フィールド」という方針と直接競合する。`TitleContains`を使う設定では、取得したタイトルをJournalへ記録しない（分類判定にのみ使い、保存しない）ことを既定動作とする。
+- ウィンドウタイトルはタブ切替等で頻繁に変わるため、分類の再評価タイミング（初回確定時に固定するか、変化ごとに再評価するか）を決める。再評価する場合はTiled⇔Floatingの往復を7.3の振動防止対象に含める。
+### 5.4 三値評価と優先順位
+AppId=None、Dialog判定不明、計測していないMinWidthはFalseではなくUnknownとして扱う。
+type Truth =
+    | Yes
+    | No
+    | Unknown of EvidenceGap list
+Not Unknown = Unknown。`All`は確定したNoがあればNo、なければUnknownを伝搬し、全てYesならYes。`AnyOf`は確定したYesがあればYes、なければUnknownを伝搬し、全てNoならNo。優先順位は`Priority`降順、同値は`PolicyRuleId`の安定昇順で評価する。`Unknown`の高優先ルールがある場合、低優先のTiledをすぐ適用すると危険なら保留 + 追加観測 + 安全な暫定方針へ進む。`Unknown`を暗黙にNoへ潰さない。
+
+**暫定方針の具体化（v2.1で追加、A-5対応）**：分類がUnknownの間、窓はOSが表示した既定位置・既定サイズのまま維持し、4.4の`WorkspaceState.Order`には挿入しない。`LayoutPredicate.TiledCountAtLeast`等の窓数カウントにもUnknownの窓を含めない。分類が確定した時点で初めてOrderへ挿入し配置を発行する。これにより新規窓は「既定位置で表示→分類確定→タイルへ移動」の2段階になることを許容し、2段階目を1回のバッチEffect（6章PlanValidator・7章Effect参照）にまとめてちらつきを抑える。分類確定後に再分類（タイトル変化等、A-6参照）で結果が変わる場合は、7.3の振動防止の対象に含める。
+
+全候補の判定結果は説明可能にし、`whyNot(ruleId)`で非選択理由を返せるようにする。
+### 5.5 静的Analyzer
+| 対象 | 初期の振る舞い |
+|---|---|
+| 重複RuleId / 未登録LayoutId / ApiVersion不一致 | Error |
+| 比率が0未満または1以上、列数0以下 | Error |
+| 既知の述語矛盾、明確な重複 | ErrorまたはWarning |
+| 同優先順位の潜在的な競合 | Warning / PotentialOverlap |
+| 不到達ルール・Alwaysによる遮蔽 | Warning |
+| 利用する属性が実機で取得できない可能性 | EvidenceRequirement |
+| 任意F#関数の停止性・副作用 | NotProven |
+
+
+Analyzerは`Error / Warning / Unknown / EvidenceRequirement`を返す。「検査に成功したので全実行が安全」とは扱わない。将来は限定ドメインのSAT/SMT、JournalのSnapshot集合による新旧Policyの差分評価を追加できるが、初期には義務化しない。
+
+**初期スコープの縮小（v2.1で追加、A-7対応）**：個人設定が数十ルール規模である前提では、矛盾検出・到達性検査・SAT/SMTは費用に対して価値が小さい。初期必須はこの表の上2行（重複RuleId/未登録LayoutId/ApiVersion不一致のError、比率・列数のError）のみとし、PotentialOverlap検出・不到達ルール検出・EvidenceRequirement推論は有用なら後から追加する「できればやる」項目に位置づける。
+### 5.6 Layout Registryと純粋関数
+type LayoutContext = {
+    WorkArea: PixelRect
+    TiledWindows: WindowSnapshot list
+    Focused: WindowId option
+}
+
+type Placement = { Window: WindowId; Target: PixelRect }
+
+type LayoutError =
+    | InvalidInput of string
+    | Unsatisfiable of string
+
+type LayoutFunction =
+    LayoutArgs -> LayoutContext -> Result<Placement list, LayoutError>
+
+type LayoutImplementation = {
+    Id: LayoutId
+    ApiVersion: int
+    ImplementationDigest: string
+    Calculate: LayoutFunction
+}
+PolicyIRは`LayoutId + ApiVersion + Args`のみを保存し、RegistryがF#関数を解決する。`ImplementationDigest`はビルド成果物と対応し、再現時に同じ実装であるか検証する。異なるアセンブリを同一バージョンとみなさない。
+
+F#の型だけでは`Calculate`の純粋性を証明できない。CoreからI/O依存を排除し、コードレビュー、依存ルール、繰り返し評価テスト、入力固定テストで管理する。自由なユーザーF#コードをHostへ無条件にロードすることは避け、初期は信頼済み拡張のみとする。
+## 6. 配置計画、検査、制約解決
+### 6.1 処理パイプライン
+Window Snapshot → Classify → Select LayoutRef → Resolve Registry
+    → F# LayoutFunction → Placement Proposal → PlanValidator
+    → Desired Update → Reconciler → Effect IR → Windows/Sim Shell
+    → Observation → Reconciliation (again)
+- LayoutFunctionは希望配置の提案を返すだけでOSへは触れない。
+- PlanValidatorは配置計算のコードと独立した共通経路に置き、全レイアウト出力を検証する。
+- Reconcilerは現在のObservedとPendingを参照し、必要な差分Effectだけを生成する。
+- ShellはEffectをOSに適用するが、レイアウトの妥当性判断は担当しない。
+### 6.2 PlanValidatorの契約
+以下を必須条件として検査する。
+1. 配置先WindowIdが現在管理対象かつ生存している。
+2. 同一Planに同一WindowIdが重複しない（同じ対象への複数命令を意図的に組み立てる場合は別Effectへ分離）。
+3. Width/Height > 0、座標演算で整数オーバーフローがない。
+4. モニター/WorkArea参照の整合性がある。
+5. 管理除外窓、保護UI、無効になったWindowIdへ移動命令が出ない。
+6. そのレイアウトに必要な対象の未配置を検出する（仕様で許す部分配置は別の明示契約を使用）。
+重なりを一律に禁止しない：Monocleは意図的に同位置へ重ねる。ギャップ、比率、推定最小サイズ等はソフト制約として扱い、要求を満たせない場合は調整・Floating・Suspended等へ劣化させる。OSの実際の反応は保証しない。
+
+**レイアウト切替の一括適用（v2.1で追加、A-4対応／v2.2でfeasibility.md §4により方針変更）**：複数窓を個別に`SetWindowPos`すると、適用途中の状態が見える（窓の重なり・ちらつき）。当初`BeginDeferWindowPos`/`DeferWindowPos`/`EndDeferWindowPos`を第一候補としていたが、調査の結果、既存のWindows用タイル型WM（komorebi、GlazeWM）は**いずれも`DeferWindowPos`系を使わず**、各ウィンドウへ個別に`SetWindowPos`を`SWP_ASYNCWINDOWPOS`付きで呼ぶ方式を採用していることが判明した。`SWP_ASYNCWINDOWPOS`は「呼び出し元スレッドと対象ウィンドウ所有スレッドが異なる入力キューに属する場合、要求を対象スレッドへポストし、呼び出し元スレッドをブロックしない」という公式の効果を持ち、ADR-012（ハング耐性）と直接合致する。一方`DeferWindowPos`は公式ドキュメントで「失敗時はバッチ全体を中止すべき」と明記されており、ハング耐性に関する公式な言及がない。**本WMはちらつき抑制よりハング耐性を優先し、Shell側の`ApplyBatch`実装は個別`SetWindowPos` + `SWP_ASYNCWINDOWPOS`を既定とする**（`DeferWindowPos`系はPhase 0のスパイクでちらつきの差を比較した上で、必要なら代替として採用を検討する）。7.1のEffectにこのバッチを表す型（`ApplyBatch`）を用意する。最大化・Aero Snap状態の窓は`SetWindowPos`だけでは意図した通りに動かないため、先に`ShowWindow(SW_RESTORE)`相当のEffectを発行してから配置する契約とする。バッチの一部だけが失敗した場合の扱い（残りを適用するか全体を中止するか）はPending追跡（7.2）と合わせて定義する。
+### 6.3 例外とフォールバック
+- レイアウトの計算エラー：前回の有効なDesired、または既定の安全レイアウトへ移行。
+- Validatorの失敗：Plan全体または明示された安全な単位を拒否し、診断Journalを残す。
+- 属性不明：原則、危険な移動を保留して追加観測を提案。
+- 無限に要求が収束しない：同種要求の再送を抑制、Backoff、Floating/Suspendedを選択。
+## 7. Functional Coreと実行意味論
+### 7.1 Reducer
+type Effect =
+    | SetRect of RequestId * WindowId * PixelRect
+    | RestoreBeforeMove of RequestId * WindowId // ShowWindow(SW_RESTORE)相当。最大化/Snap状態の窓をSetRectの前に解除する
+    | ApplyBatch of RequestId * Effect list // DeferWindowPos相当の一括適用。途中状態を見せない
+    | RequestForeground of RequestId * WindowId
+    | ObserveWindow of WindowId
+    | ObserveAll
+    | ArmTimer of timerId:int64 * deadlineTicks:int64
+    | CancelTimer of timerId:int64
+
+type InputEvent =
+    | WindowObserved of WindowSnapshot
+    | WindowRemoved of WindowId
+    | ForegroundObserved of WindowId option
+    | UserCommand of CoreCommand
+    | EffectSubmitted of RequestId
+    | EffectRejected of RequestId * string
+    | EffectTimedOut of RequestId // ハングした対象へのOS呼出がタイムアウトした（ADR-012）
+    | MoveSizeStarted of WindowId // ユーザーのドラッグ/リサイズ開始。自動整列を抑止する
+    | MoveSizeEnded of WindowId
+    | VisibilityChanged of WindowId * isVisible: bool
+    | MinimizedStateChanged of WindowId * isMinimized: bool
+    | CloakChanged of WindowId * isCloaked: bool
+    | StyleChanged of WindowId
+    | TimerElapsed of int64
+    | MonitorTopologyObserved of MonitorSnapshot list
+    | ScreenReconfigurationInProgress of bool // スリープ復帰/モニタ抜き差し/RDP接続中は再配置を抑止する（20章E-3）
+    | PolicyActivated of string
+
+type StepResult = {
+    Next: WmState
+    Effects: Effect list
+    Trace: DecisionTrace list
+}
+
+// 概念上の契約。WmState/CoreCommand等は対応モジュールで定義する。
+val step: RuntimePolicy -> WmState -> EventEnvelope<InputEvent> -> StepResult
+EventEnvelopeにはReducerへ投入したSequence、論理/単調時刻、入力の発生元、観測元時刻、SessionId等を含める。時刻、乱数、ID採番は状態やイベントの入力として明示し、Core内からOS時計を呼ばない。コレクションの暗黙の列挙順やバックグラウンドスレッドの状態に依存しない。.NET Core以降`string.GetHashCode`はプロセスごとにランダム化されるため、`HashSet<string>`/`Dictionary<string,_>`の列挙順にCoreの判断が依存するとReplayでプロセス間の再現性が崩れる。F#の`Map`/`Set`（順序付き）を用いるか、明示的にソートする。
+
+**実行スレッドモデルと耐ハング性（v2.1で追加、ADR-012対応、E-1対応／v2.2でfeasibility.md §5により補強）**：`SetWindowPos`等は対象窓を所有するスレッドへメッセージを送るため、対象アプリがハングしていると呼び出し側がブロックされる（公式ドキュメントに「`SetWindowPos`が内部で同期送信する」という直接の一文はないが、`SWP_ASYNCWINDOWPOS`フラグの説明「異なる入力キューに属する場合は要求をポストしブロックしない」が既定動作でのブロックを前提にしており、これを根拠とする）。Effect適用（Windows Shell側の実装）はWinEventコールバックや安全停止の制御経路（8.4）と同じスレッドで行わない。専用のEffect適用スレッドを設け、既定で各`SetWindowPos`に`SWP_ASYNCWINDOWPOS`を付ける（6.2参照）。`SendMessageTimeout(SMTO_ABORTIFHUNG, ...)`を主たるハング検知手段とし、`IsHungAppWindow`は補助的な事前チェックとしてのみ使う（公式ドキュメントが「一般利用を意図していない。将来のWindowsバージョンで変更・廃止される可能性がある」と明記しているため、これに依存した設計にしない）。タイムアウトした場合は`EffectTimedOut`をReducerへ投入し、対象窓をSuspendedへ劣化させる（6.3のフォールバックと同じ扱い）。WinEventフックのコールバック自体は、登録したスレッドのメッセージポンプ中に同期的に再入され得るため（24章「Guarding Against Reentrancy」参照）、コールバックからOS呼出APIを直接呼ばず、最小限の情報をキューへ渡すだけに留める（8.1と同じ方針をCore〜Shell間のスレッド境界として明文化する）。
+### 7.2 Desired / Observed / Pending
+| 状態 | 意味 | 注意 |
+|---|---|---|
+| Desired | 最新Policyと入力から意図した値 | まだ実現していない可能性 |
+| Observed | 取得時刻・取得元を伴う観測値 | 古い可能性がある。観測の欠落もある |
+| Pending | 発行済み要求と期限・試行回数・IntentEpoch | OS APIが戻っただけでは完了しない |
+
+
+PendingRequestは最低限、RequestId/WindowId/IntentEpoch/TargetRect/IssuedAt/Deadline/Attempts/Statusを持つ。対象が消えた、Policyが変更された、同じ窓へ新しい意図が生じた場合、古い要求を失効させる。
+Idle → Planned → Dispatched → AwaitingObservation
+                             ├─ Observed matches   → Satisfied
+                             ├─ Mismatch            → Reevaluate
+                             ├─ Timeout             → Retry/Backoff/Suspend
+                             ├─ EffectRejected      → Retry/Backoff/Suspend（OS呼出自体が失敗した場合。v2.1で追加）
+                             ├─ EffectTimedOut      → Suspend（ハングした対象。再試行しない。v2.1で追加）
+                             ├─ Window destroyed    → Cancelled
+                             └─ Superseded intent   → Superseded
+SetRectのネイティブAPI呼び出しが成功しても、目標矩形を観測するまでは`Satisfied`にしない。WinEvent通知そのものを特定Requestへの応答と断定せず、窓ID・epoch・観測の鮮度・矩形条件を照合する。最新Observedの選択では古い取得結果が新しいSnapshotを上書きしないよう、ソース・取得順・再観測の品質を考慮する。
+
+`IntentEpoch`は窓単位で発行する（グローバル単一値にはしない）。全体で単一のEpochにすると、1窓に新しい意図が生じただけで他の全窓のPendingが失効してしまう。
+
+`RequestForeground`はAPI呼出としては概ね冪等だが、副作用（フォーカスを奪う）は大きい。9.4のクラッシュ後再送方針（冪等性が低いEffectは再送しない）の対象に、副作用の大きいEffectとして`RequestForeground`も明示的に含める。
+### 7.3 収束と振動防止
+- 未完了の同一Targetへの重複要求を発行しない。
+- 期限切れと再試行を、Core上の明示された状態遷移とTimerイベントで表現する。
+- 最大試行数、Backoff、安定判定の許容差、ユーザー操作中の抑止をPolicyまたは既定設定として持つ。
+- 操作直後に窓が元へ戻るような往復運動は振動として検知し、制御を弱める。
+- 定期的な全体Snapshotでイベント欠落やジャーナル復旧後の状態差を解消する。
+収束保証は「対象アプリが移動を受け入れる」「外乱が収まる」等の前提付き。外界が無制限に再配置する場合は、成功ではなく安全な諦め方を定義する。
+
+**画面構成変化中の抑止（v2.1で追加、E-3対応）**：スリープ復帰、モニター抜き差し、RDP接続/切断時はOS自身が複数の窓を一斉に移動させ、WorkAreaとDPIも変わる。この間に自動整列を行うと外乱と衝突し、振動検知が全窓に発動して収束不能になる。`ScreenReconfigurationInProgress`イベント（7.1）がtrueの間は新規Effectの発行を抑止し、安定（一定時間イベントが来ない）を検知したあとに全体Snapshotを再観測してから再開する。
+### 7.4 手動操作
+ドラッグ中、サイズ変更中、明示的なユーザー操作の直後は自動整列を抑制できる。操作終了後は再整列、現配置の採用、Floating化等の方針をCoreが決定し、Shellでアドホックな再試行規則を実装しない。
+
+**起動・終了時の振る舞い（v2.1で追加、G-4対応）**：WM起動時に既存の全窓を即座にタイルし直すか、終了時に起動時の矩形へ戻すかは、Phase Aで明示的に決める（4.4のワークスペース実装方式の決定と合わせて検討する）。終了時に元の位置へ戻す方針を取る場合、起動時点の矩形をWmStateの一部として保持する。
+
+**窓を閉じた後のフォーカス（v2.1で追加、G-5対応）**：窓が閉じられた後、OSは何らかの窓へ任意にフォーカスを移す。WMが「同じWorkspaceの次の窓」（`FocusNext`相当）へフォーカスを移そうとする場合、8.1のB-3（非同期経路後の`SetForegroundWindow`許可）の検証結果に依存する。この検証が通らない限り、閉じた直後のフォーカス移動は保証できない前提で扱う。
+## 8. Windows Shell・ネイティブ境界
+### 8.1 初期方式
+- EnumWindows等で対象とする最上位ウィンドウを取得する。
+- SetWinEventHook(WINEVENT_OUTOFCONTEXT)等で変化を観測する。
+- WinEventを受けたコールバックは最小限の情報をキューにコピーして返る。そこでCoreを更新したり、重いCOM/UIA呼び出しをしたりしない。
+- メッセージループ、GC対象デリゲートの寿命、フックの解除、ネイティブ資源の解放をShellが管理する。
+- SetWindowPosなどで位置を要求し、必要に応じ`GetWindowRect`・DWM境界を再取得する。
+- SetForegroundWindowはOSの制限で拒否され得る。自動レイアウトで不要にフォーカスを奪わない。
+- RegisterHotKey等の標準経路から操作を入力し、グローバル低レベルキーボードフックは初期必須としない。
+初期対象は通常権限・同一ユーザーの対話Desktopで管理可能な窓。異なるIntegrity Level、保護されたUAC/ロック画面、Windows Shell特殊窓等には操作できない場合があり、そこを管理者権限で強行突破する設計にはしない。
+
+**ホットキー登録の実現性（v2.1で追加、B-2対応／v2.2でfeasibility.md §1・§3により補強）**：`Win+1..9`等の多くの組み合わせはExplorerが既に登録しており、`RegisterHotKey`は`ERROR_HOTKEY_ALREADY_REGISTERED`で失敗する（`Win+L`等は低レベルフックでも介入困難で原理的に奪えない）。`MOD_WIN`で`Win`キーを指定する場合、既存のWindows用タイル型WM（GlazeWM）のDiscussionで、`win`ではなく`lwin`/`rwin`（左右Winキー個別）指定が必要だったという報告がある。キーボード中心の操作体系（1.2）に必要なキーバインドが`RegisterHotKey`で確保できるかはPhase 0で実際に検証し、確保できない場合は低レベルキーボードフック（`WH_KEYBOARD_LL`）を使う方針へ切り替える。`WH_KEYBOARD_LL`を使う場合、フックスレッドがGCやI/Oで停止すると`LowLevelHooksTimeout`（Windows 10 1709以降は最大1000msにクランプされる）を超過してOSがフックを**黙って外し**（アプリケーションに通知する手段は無い）、フック処理はEffect適用スレッドやJournal I/Oと分離する。フックが無言で外れうる以上、WM側で自分が登録したはずのキー入力が一定時間観測できない場合に再登録する自己診断の仕組みをPhase Aで検討する。
+
+**フォーカス移動の実現性（v2.1で追加、B-3対応／v2.2でfeasibility.md §2により具体化）**：`SetForegroundWindow`は「直前に入力イベントを受け取ったプロセスか」等のOS側の判定で拒否され得る。公式ドキュメントは条件を満たしても拒否され得ると明記しており（「It is possible for a process to be denied the right to set the foreground window even if it meets these conditions」）、ホットキー受信から「キュー→Reducer→Journal→Effect」という非同期経路を経た後は許可が落ちることを前提にする。既存のWindows用タイル型WM（komorebi、GlazeWM）はいずれも、`RequestForeground`相当のEffect適用時に**自分自身のプロセスへ`SendInput`でダミー入力（マウスイベント）を送出してから`SetForegroundWindow`を呼ぶ**という同一のパターンで対処している（`AttachThreadInput`はデッドロック報告があり両WMとも採用していない）。Shellの`RequestForeground` Effect実装はこのパターンを既定とする。komorebiはさらに起動時に`SPI_SETFOREGROUNDLOCKTIMEOUT`でシステム全体の`ForegroundLockTimeout`を0に変更しているが、これはユーザー環境のシステム設定を書き換える副作用が大きい回避策であり、本WMでは既定で採用せず、Phase 0での実測で自己`SendInput`方式だけでは不十分と判明した場合にのみ設定可能なオプションとして検討する。
+
+**フルスクリーンアプリの除外（v2.1で追加、E-4対応）**：枠なし全画面のゲーム・プレゼン・動画プレイヤーを通常の窓として誤ってタイル化しないよう、`SHQueryUserNotificationState`や「モニター全体と同じ矩形かつ枠なし」の検出に基づき分類時にExcluded/Floating相当へ振り分ける。
+### 8.2 ウィンドウ分類の補助属性
+プロセスID/実行ファイル識別、トップレベル/所有関係、スタイル、可視性、最小化、DWM Cloak、モニター/WorkArea、フォーカス、DPIを検討する。Win32の通知がすべて揃うとは想定せず、時折全体再観測する。
+### 8.3 DPI・矩形
+- 初期からDPI Awarenessを明確化し、座標系を混在させない。
+- GetWindowRectはDPI仮想化や不可視リサイズ枠を含み得る。
+- DWMWA_EXTENDED_FRAME_BOUNDSは見えているフレームの境界として取得可能だが、GetWindowRectと単純に同じ座標/意味ではない。
+- 負のX/Y、モニター境界をまたぐウィンドウ、複数DPI、WorkArea変更、タスクバー位置変更を後期テストに含める。
+- F# Coreが扱う矩形の意味（初期は一貫した物理ピクセル座標。4.2の座標系契約も参照）を固定し、Shellの変換前後を診断可能にする。
+- **異なるDPIモニター間移動時の自己リサイズ（v2.1で追加、B-6対応／v2.2でfeasibility.md §7により修正）**：対象アプリを異なるDPIのモニターへ移動すると、OSは`WM_DPICHANGED`（`wParam`に新DPI、`lParam`に推奨矩形）を送り、Per-Monitor-V2対応アプリはこれを受けて自分で`SetWindowPos`を呼ぶことが期待される。この自己リサイズは、Journal上では`SelfRepositionAfterMs`（12.1）による自発的な挙動と見分けがつかない。**「DPIをまたぐ移動は2段階のSetWindowPosが必要になることが多い」という記述はPer-Monitor-V2対応アプリに限定される**：Per-Monitor-V2非対応（System DPI Aware/DPI Unaware）アプリは`WM_DPICHANGED`を実質的に処理せず、OSがビットマップとして拡大縮小するだけで2段階目のSetWindowPosは発生しない（公式ドキュメントも「それらのアプリでは安全に無視できる」と明記）。Shellは対象アプリのDPI Awareness（`GetWindowDpiAwarenessContext`等）を取得し、PMv2対応アプリのみ2段階目のObservedを待つ、非対応アプリは1段階目のObservedで完結すると判断する。「DPI変更起因の自己変化」を疑似OSの振る舞い部品として区別できるようにする。
+### 8.4 安全停止
+通常の設定・Rule評価・REPLとは独立した制御経路により、WMの移動・フォーカス操作を停止できるようにする。常駐状態の視認/停止に使うUI、OS標準の操作への回帰、異常終了検知、直前に隠した窓がある場合のベストエフォート復旧を実装する。障害時にはWindowsそのものを操作不能にしないことを優先する。
+
+初期版では窓を破壊・終了するEffectを提供しない。安全停止が発動したら新規Effectを遮断し、Pendingをキャンセル扱いにし、全体再観測の後にのみ再開する。
+
+**制御経路の実体（v2.1で追加、E-1/E-2対応）**：安全停止の「独立した制御経路」は、Effect適用スレッド（7.1のADR-012）やメインのメッセージループとは別のスレッド、できれば別プロセス（Wm.Host内の監視用の軽量コンポーネント）で動かす。ハングした対象アプリへの呼出でメインのメッセージループや通知領域アイコンが応答しなくなっても、停止用のホットキー・経路だけは生き続けることを要件とする。通知領域アイコンはExplorer再起動時に消えるため、`TaskbarCreated`メッセージを処理してアイコンを再登録する。
+
+**再開の条件（v2.1で追加、F-7対応）**：安全停止からの再開は既定でユーザー操作による手動再開のみとする。自動再開にすると、停止原因（例：ハングしたアプリ）が解消していない場合に停止と再開を繰り返すことになる。
+## 9. Unified Journalとログの統合
+### 9.1 目的
+Journalは後から見せる文字列ログの寄せ集めではない。状態遷移の入力、命令、呼出結果、外界の観測、診断操作、実験証拠を結ぶ永続的な因果記録である。
+
+**永続化する対象の方針（v2.1で改訂、ADR-004/B-1対応）**：Coreは決定的である（2.2, 7.1）。したがって「入力列 + EffectCallReturned等のOS呼出結果 + Artifact識別子 + Checkpoint」を永続化すれば、判断（どのRuleが選ばれたか、Predicateがどう評価されたか等のDecisionTrace）はCoreをReplayして再計算すれば常に再構成できる。判断そのものを都度永続化する必要はない。これにより、LOCATIONCHANGEが1秒間に数百回届くドラッグ中でも、永続化のI/O量は入力イベント数に比例するだけで、全窓×全ルールの述語評価量には比例しない。
+
+- Input Journal：Reducerへ投入した入力列とOS呼出結果（永続化の中心）。
+- DecisionTrace：直近の判断は実行中プロセス内のリングバッファ（直近N秒、揮発性）として保持し、即時のExplainに使う。それより古い時点の判断はReplayで再計算する。
+- Log View：人間向けのレベル別テキスト表示（Input Journal + 再計算したDecisionTraceの投影）。
+- Timeline View：順序・相関・遅延を視覚化。
+- Explain View：WindowIdからRule→Layout→Effect→Observationを追う（Replay再計算を利用する）。
+- Replay Input：Coreへ投入した入力列とSnapshot。
+- Incident Bundle：再現に必要な最小の証拠、モデル、バージョン情報。
+
+Log View・Timeline View・Explain Viewは独立の収集経路ではなく、Input Journal（+ 必要に応じたReplay再計算）を起点とした用途別の投影とする。
+### 9.2 Journal Envelope
+type JournalEntry = {
+    SchemaVersion: int
+    SessionId: string
+    Sequence: int64
+    MonotonicTicks: int64
+    WallTimeUtc: System.DateTimeOffset
+    CorrelationId: string option
+    CausationId: string option
+    PolicyArtifactHash: string
+    CoreBuildId: string
+    Kind: JournalKind
+    Payload: JournalPayload
+}
+型付きKind（抜粋）。**永続化するもの**（9.1参照）：`InputReceived`、`EffectDispatchStarted`、`EffectCallReturned`、`ObservationReceived`、`PendingSatisfied`/`PendingTimedOut`、`ReplIntervention`、`ProbeRequested`、`EvidenceCaptured`。**揮発性リングバッファ＋Replay再構成で足りるもの**（都度永続化しない）：`PolicyPredicateEvaluated`、`RuleSelected`、`LayoutInvoked`、`PlanAccepted`/`PlanRejected`、`DesiredUpdated`、`EffectPlanned`、`ModelCandidateCreated`、`SimulationResult`。
+
+関連キーは`WindowId / RequestId / IntentEpoch / RuleId / LayoutId / EvidenceId / ScenarioId`。ログ文字列を唯一の情報源にしない。自由なF# Layout関数内部の全分岐は自動観測できないため、必要な算法のみ明示的な`LayoutDecisionTrace`を返す。
+### 9.3 因果関係と時刻
+- SequenceはReducerへ投入した順序（Session内で単調）であり、OSでの物理的な発生順序ではない。
+- MonotonicTicksは同一Session中の相対時間計測に用い、`WallTimeUtc`は表示・外部相関に利用する。
+- CorrelationIdは同一の操作/Incidentに関係する記録を束ね、`CausationId`は確かなアプリ内因果関係のみを明示する。
+- WinEventの移動通知を、単に直前のSetRect要求への応答と断定しない。OS側の因果は推定として別扱い。
+- 外部ログ/ETW/画像等は主Journalに無制限格納せず、`EvidenceRef`と取得条件で参照する。
+### 9.4 書き込み・障害と再起動
+Coreは純粋に`NextState + Effect + DecisionTrace`を返し、JournalWriterが永続化する。OSの操作とファイルの書き込みを一つのトランザクションにすることはできない。次の事実を区別する。
+Input accepted → Core decision → Effect planned
+  → Dispatch attempt → Win32 call returned
+  → Later observed state → Satisfied / Mismatch / Timeout
+クラッシュ時にDispatchされたか不明な操作は、再送を無条件に行わず、再起動後の全体Snapshot→再Reconciliationで扱う。冪等性が低いEffectは初期対象に含めない。記録の耐久性、バッファ、バックプレッシャー、クラッシュ時の最後の数イベントの欠落許容度はPhase Bで測定して決める。
+### 9.5 Snapshotと永続互換
+初期状態または低頻度Checkpoint + 増分Journalにより再生を可能にする。Snapshotには`SchemaVersion`、`LastSequence`、Core/Policy/Registry/Normalizerの成果物識別子を持たせる。フォーマット移行は古い記録を上書きせず、変換結果を新規Artifactに保存する。ログの編集を事実改ざんと混同しないよう、派生ビューと原記録を区別する。
+### 9.6 機密性と容量
+通常収集はID、矩形、属性フラグ、イベント、Rule、Effect等のメタデータを中心とする。窓タイトル、プロセスのパス、UIテキスト、スクリーンショット、ETW高頻度イベントは必要時に限定する。`Incident Bundle`出力時はサニタイズ、含有項目確認、削除・保持期間の設定を提供する。高頻度ノイズは保管層を分けるが、再現に必要な入力イベントは安易にサンプリングしない。
+## 10. Live REPLと実稼働デバッグ
+### 10.1 基本方針
+F# Interactive（dotnet fsiを想定）をWM Hostと別プロセスで起動し、同一ユーザーのローカルIPCで接続する。REPL側のF#式はクライアント側で実行され、Hostで任意コードを評価しない。生のHWND/ポインターやHost内部の可変オブジェクト参照を渡さない。
+
+IPCはNamed Pipeを第一候補とし、セキュリティ記述子で利用ユーザーを制限し、可能ならリモート接続を拒否する。クライアントの接続先権限を、管轄ユーザー・セッション・実行インスタンス単位で検査する。ストリーム上のメッセージはスキーマとサイズ上限・タイムアウトを持つ。
+
+**パイプ名の乗っ取り対策（v2.1で追加、F-3対応／v2.2でfeasibility.md §8により補強）**：Hostより先に悪意あるプロセスが同名のパイプを作成すると、クライアントが偽のHostに接続してしまう可能性がある。Hostは`FILE_FLAG_FIRST_PIPE_INSTANCE`を付けてパイプを作成する（公式ドキュメント：このフラグ付きで複数インスタンスを作ろうとすると2つ目以降は`ERROR_ACCESS_DENIED`で失敗する）。クライアントは接続後に`GetNamedPipeServerProcessId`で接続先プロセスを検証する。ただしPIDのみの検証はプロセス終了後のPID再利用に弱いため、取得したPIDについて`QueryFullProcessImageName`等でイメージパスも併せて確認する。パイプ名にはセッションIDとランダム値を含める。パイプ名の乗っ取り対策と同じくらい重要なのが**セキュリティ記述子によるアクセス制御**である：Windowsの既定のパイプセキュリティ記述子は匿名リモートユーザーを含むEveryoneにアクセスを許可するため、Hostは「同一ユーザー・同等以上のインテグリティレベルのプロセスのみ許可」する明示的なセキュリティ記述子をパイプ作成時に設定する（既存アプリの実装例として、メディアプレイヤーmpvのWindows IPC実装が同種の対策を行っている）。
+
+**同一ユーザー境界の限界（v2.1で追加、F-2対応）**：「同一ユーザーなら許可」（16.1）はセキュリティ境界として弱い。同一ユーザーで動く任意のプロセス（ブラウザ拡張のネイティブヘルパー、npmのpostinstallスクリプト等）がパイプに接続できる。`SetWindowPos`自体は同一ユーザーなら誰でも呼べるためInterveneによる権限昇格そのものは小さいが、問題はInspectによる情報集約（9.6のタイトル等）とDeployによる永続的な振る舞い変更である。接続時にクライアントの整合性レベルを検査し、AppContainerまたは低整合性レベルのプロセスからの接続を拒否する。
+### 10.2 権限段階
+| モード | 許されること | 禁止・条件 |
+|---|---|---|
+| Inspect | Snapshot、Policy、Journal、Explain、Analyzerを見る | ホスト状態は変更不可 |
+| Fork | Snapshotを疑似OSにコピーしPolicyを比較する | 現実のOSには触れない |
+| Probe | 許可された観測を対象/予算/期限付きで要求する | UI本文や破壊的操作はデフォルト禁止 |
+| Intervene | ユーザー認可の上でCoreCommandをイベント投入する | Revisionチェック、Journal監査必須 |
+| Deploy | 検証済みPolicyArtifactを切り替える | 既知良好版へのRollback経路が必要 |
+
+
+読み取りAPIからHost内の任意コードを実行しない。変更操作は必ず型付きCoreCommandを経由してReducerのキューへ投入する。要求と結果をJournalに記録し、再現可能な介入とする。
+
+**窓単位の前提検査（v2.1で追加、F-4対応）**：Interveneの認可を単一の全体Revisionで行うと、LOCATIONCHANGEやフォーカス変化のたびにRevisionが進むため、REPLで人が入力している数秒の間にほぼ必ず不一致となり、介入が実質的に常に拒否される（結果として`force`オプションが追加され楽観的排他が骨抜きになる懸念がある）。Interveneの前提検査は、その命令が要求する具体的な条件（例：対象WindowIdが依然Managedである、対象のIntentEpochが指定した値のままである）に対する検査とし、無関係な全体Revisionの変化では拒否しない。
+
+**Deployが運べるものの限定（v2.1で追加、F-5対応）**：Deployは検証済みのPolicy IRと、既存Registry上のLayoutId参照のみを運ぶ。アセンブリやF#コードそのものをIPC経由でHostへ運ぶ経路としては使わない。21章のAssembly Load Context検討やPhase Eの Hot Reloadは、この制約を変更するものではない。
+
+**Forkの実行場所（v2.1で追加、F-6対応）**：Fork（10.4）やCounterfactual Simulationの計算は、クライアント側（REPLプロセス）で行う。Host側はSnapshotのコピーを渡すだけで、重い候補ポリシーの評価や探索（12.4）によってHostのCPU/GCが圧迫され常用中のWM応答が悪化することを避ける。これは「REPL側のF#式はクライアント側で実行される」という10.1の方針と同じである。
+
+**Probeの承認はHost側で判定する（v2.1で追加、F-1対応）**：11.1の`ProbeRequest.UserApproved`は、要求を送るクライアント自身が設定できるフィールドにしない。承認はHost側のUI、またはHostが期限付きで発行する能力トークンで行い、クライアントはそのトークンを提示する形にする（Intervene「ユーザー認可」も同じ構造にする）。
+### 10.3 APIの利用イメージ（概念的な非実装コード）
+task {
+    let! wm = WmClient.connectLocalAsync ()
+    let! snapshot = wm.SnapshotAsync()
+    let! why = wm.ExplainAsync(windowId)
+    let! rules = wm.PolicyAsync()
+    let! diagnostics = wm.AnalyzeAsync(rules)
+
+    // 実ウィンドウを変更しない
+    let! fork = wm.ForkAsync(snapshot.Id)
+    let! comparison = fork.TryPolicyAsync(candidatePolicyArtifact)
+
+    // 必要な証拠を追加観測
+    let! evidence = wm.ProbeAsync(windowId, probeRequest)
+
+    // 実ウィンドウへの介入は明示的、かつ楽観的排他制御つき
+    let! result = wm.InterveneAsync(
+        snapshot.Revision,
+        SuspendWindow windowId)
+    return why, diagnostics, comparison, evidence, result
+}
+実際のF#構文・Task型・引数の署名は実装時に確定する。REPLが得るSnapshotはコピーであり、内部の現在状態へ書込みアクセスできない。
+### 10.4 Time-Travel / Forkの意味
+Forkは「過去のWindows全体を実際に復元する」機能ではない。特定SnapshotのCore状態と必要な観測属性、選択した疑似モデルをコピーして、別の時間軸で試行する。過去の外部アプリ内部状態を複製したとは主張しない。古いSnapshotを基に現実へ介入する場合はRevision不一致を検出して拒否する。
+## 11. Active Diagnosisと情報収集
+### 11.1 EvidenceGap
+type EvidenceGap =
+    | MissingAppIdentity of WindowId
+    | MissingDialogRole of WindowId
+    | MissingVisibleBounds of WindowId
+    | MissingOwnershipGraph of WindowId
+    | UnknownMinSize of WindowId
+    | UnknownMoveDelay of WindowId
+    | UnknownSelfRepositionRule of WindowId
+
+type ProbeRequest = {
+    Window: WindowId
+    Fields: EvidenceGap list
+    TimeoutMs: int
+    MaxSamples: int
+    ApprovalToken: ApprovalToken option // Host側のUIが発行する期限付き能力トークン。クライアントの自己申告ではない（v2.1で変更、F-1対応）
+}
+EvidenceGapは「何をまだ知らないか」を機械可読に表す。各Gapについて、回答に必要な観測手段、権限・機密性、時間/容量のコスト、結果の信頼性を定義する。
+### 11.2 収集レベル
+| Level | 観測手段 | 標準方針 |
+|---|---|---|
+| L0 | ウィンドウ発見・標準イベント・矩形 | 常時、最小限 |
+| L1 | DPI、所有関係、DWM境界、追加Win32属性 | 対象窓に限定して要求 |
+| L2 | UI Automationの必要な属性 | 明示的に限定。テキスト本文は原則禁止 |
+| L3 | ETW等の高頻度計測 | 期間/容量/権限を制限し明示的に有効化 |
+| L4 | 実際のウィンドウを動かす実験 | ユーザー承認のあるテスト環境に限定 |
+
+
+Probeは既存Journalに新しい証拠を追加する操作であり、すでに発生した過去の未知属性をさかのぼって知る能力ではない。過去と同じ条件を再現できるようにするため、将来の監視条件変更も記録する。
+
+**L4の境界の明確化（v2.1で追加、D-3対応）**：WMは常用中、常に実際のウィンドウを動かしている（Effectの発行そのものが「実際のウィンドウを動かす」操作である）。「L4=ユーザー承認のあるテスト環境に限定」という区別が機能するのは、通常の配置Effectではなく「診断目的で、通常のPolicy判断から外れた一時的な操作（意図的な負荷・境界値試験等）を行う」場合に限ると定義する。通常のSetRect/RestoreBeforeMove等はL4ではなくL0〜L1相当の通常動作として扱う。
+### 11.3 Active Diagnosisの選択アルゴリズム
+1. Journalから失敗箇所と既知の観測・仮説を抽出する。
+2. 現象と整合する複数候補を列挙する（例：最小幅、DPI換算差、別処理の干渉、単純な遅延）。
+3. 各候補の判別に役立つ追加観測を列挙する。
+4. 観測コスト/機密性/安全性に基づきProbeを順位付けする。
+5. 承認・権限を確認して実行し、結果をEvidenceIdに紐付けてJournalへ記録する。
+6. 支持・反証された仮説を更新し、残る不確実性を再提示する。
+実測データから因果関係を無条件に推定しない。「要求後700pxになった」という時系列だけで「アプリの最小幅が700px」と決めない。
+
+**初期スコープの縮小（v2.1で追加、D-2対応）**：上記アルゴリズム（候補列挙→順位付け→自動実行）は費用（実装・検証コスト）が大きい一方、初期は候補の列挙と順位付けを人（REPL利用者）が行っても十分に価値が出る。Phase Dの初期実装では、1〜3の候補列挙・列挙された追加観測の提示までを機能とし、4の自動順位付けと5〜6の自動実行・仮説更新ループは、実際にProbeを何度も使う場面が出てから追加する。
+## 12. 疑似窓・疑似OS・モデル合成
+### 12.1 疑似OSの対象
+疑似OSは本物のWindows APIやGUIを完全実装するものではない。WMが外部環境に対して観測する契約に限定する。必要な状態は窓、モニター、フォーカス、仮想時計、予定イベント、疑似振る舞い、乱数Seedである。
+type WindowBehavior =
+    | Immediate
+    | DelayedByMs of int
+    | MinimumWidth of int
+    | IgnoreMove
+    | SelfRepositionAfterMs of int * PixelRect
+    | DisappearOnMove
+    | Compose of WindowBehavior list
+
+type VirtualWorld = {
+    Windows: Map<WindowId, VirtualWindow>
+    ClockMs: int64
+    Scheduled: ScheduledSimEvent list
+    Seed: int
+}
+
+// 具体的なVirtualWindow、ScheduledSimEvent、SimEventはSimulation側で定義
+val applyEffect: VirtualWorld -> Effect -> VirtualWorld * SimEvent list
+シミュレーションは決定的なイベントスケジューラーを持ち、同時刻イベントの順序も規約化する。`NoisyObservation`、通知重複・欠落、所有ダイアログ、無効ハンドル等はモデル部品として段階的に追加する。
+
+**Raw層からの駆動（v2.1で追加、ADR-013/C-2対応）**：`applyEffect`が生成する`SimEvent`は、Windows Shellと同じNormalizer（純粋関数）を通してから`InputEvent`になる。これにより、「どの窓を管理対象とみなすか」という分類・正規化段階の不具合（ツールチップ・IME候補窓・トースト通知・Cloakされた別デスクトップの窓・UWPのゴーストフレーム・表示直後のスタイル変更等）も疑似OS上で再現できる。`WindowBehavior`（振る舞い部品）は机上で考案するのではなく、Phase 0の失敗カタログ（18章）で実際に観測されたものから選ぶ。
+### 12.2 Fixed-log ReplayとCounterfactual Simulation
+Fixed-log Replay：保存した入力イベント列を、ピン留めした当時のCore/Policy/Registryへ流し、同一決定が再現されるか検査する。修正済みCoreが異なる命令を出した後のOS反応は予測しない。
+
+Counterfactual Simulation：保存したSnapshotからForkし、別のCore/Policy/Registryの命令を疑似OSが実行し、新しい観測を生成する。現実のOS挙動を完全に再現する保証はなく、モデル外の事象は`UnknownResponse`や`ModelGap`として扱う。
+
+**完了条件としての位置づけ（v2.1で追加、D-4対応）**：実際の不具合の多くはタイミングの絡み合い（表示とスタイル変更の競合、DPI変更による自己リサイズ、スリープ復帰時の外乱）であり、単一の`WindowBehavior`部品の組合せでは精度に限界がある。Counterfactual Simulationの結果は、修正方針を検討するための補助的な証拠として使い、「Counterfactual Simulationで再現したので修正完了」という完了条件には用いない。修正の完了条件は、実機での再確認（13章Step 6、18章Phase D）を必須とする。
+### 12.3 実測モデルの育成
+ObservedData → CandidateBehavior[] → DifferentialProbe → ModelFit → Scenario の流れを持つ。候補モデルには、`ModelId`、対象アプリ識別、適用OS/ビルド条件、EvidenceId一覧、評価に利用した実測ケース、未説明ケース、信頼度/不確実性を付ける。モデルの自動修正で不具合が隠れないよう、生の証拠をモデルとは別に保持する。
+### 12.4 有界探索・反例縮小
+変動させる軸は、ウィンドウ数、モニター数、操作列長、遅延、イベント順序、失敗注入、Seed、振る舞いプロファイル。探索は因果上不可能な順序を除外する。失敗列に対し、イベント削除、時間短縮、窓数削減、モデル部品削減によって最小再現ケースへShrinkする。全ケース網羅を主張せず、探索範囲をレポートする。
+## 13. 代表シナリオ：500px要求、700px観測
+以下が最初のend-to-end成功シナリオである。これは説明のために選んだ一例であり、実際にPhase Aで疑似OSに実装する振る舞いの網羅的な一覧ではない（12.1参照：`WindowBehavior`はPhase 0の失敗カタログから選ぶ）。特に、このシナリオは「疑似OSが正規化済みイベントより後段の不具合」を扱うため、分類・正規化層の不具合（C-2、ADR-013）や、不可視リサイズ枠による恒常的Mismatch（4.2の座標系契約）、ハングしたアプリによる停止（7.1のADR-012）といった別種の不具合に対する同種のシナリオも、Phase B以降で同じ形式で用意する。
+
+Step 1 — 実機で発見
+PolicyRuleId=codingが`master-stack`を選び、純粋F#関数がWindow Aへ幅500pxを提案。PlanValidatorが正当な計画と判定し、Coreが`SetRect(R31, A, width=500)`を生成する。
+
+Step 2 — 不一致
+ShellでSetWindowPos相当の要求を呼び出した後に、幅700pxを観測する。Journalには、Rule選択、入力/出力、RequestId、ネイティブ呼出結果、観測、IntentEpoch、Mismatchが記録される。Coreは同一命令を無制限に再送しない。
+
+Step 3 — Live REPL
+Explain(A)で判断根拠とPendingを調べる。`UnknownMinSize(A)`、`DpiConversionMismatch`等の候補を作る。`Probe`でDPI・DWM境界・オーナー等を追加収集する。
+
+Step 4 — モデル化
+証拠に基づいて`MinimumWidth(700)`等を仮説モデルとして定義し、他候補（遅延、DPI差）と比較する。単一現象だけで確定しない。
+
+Step 5 — 疑似OSで再現
+同じCore + 当時のPolicy/Registry + 仮想世界を実行し、500要求→700観測→収束不能の経路が再現するか確認する。
+
+Step 6 — 修正と再検証
+Layout計算またはConstraint/Fallback方針を修正し、静的Analyzer、PlanValidator、Counterfactual Simulation、Windows実機で検証する。Incident Bundleと回帰シナリオを保存し、次の変更で同じ現象が再発しないことを確認する。
+### 13.1 Incident Bundleの最小内容
+incident/
+  manifest.json          # schema, hashes, versions, privacy flags
+  checkpoint.json        # snapshot + initial Core state
+  input-journal.ndjson    # reducer inputs and relevant decisions
+  policy.json            # canonical Policy IR
+  registry-manifest.json # LayoutId / ApiVersion / digest
+  world-model.json       # selected behavior model + confidence/evidence
+  evidence-index.json    # provenance and optional attachment references
+  scenario.json          # events, expected assertions, model limitations
+生タイトル・UI本文・絶対パス等は出力前にフィルタする。Journalの全データを無選別にBundleへ詰めない。
+## 14. 成果物識別と再現可能性
+PolicyArtifact
+  ├─ policySchemaVersion
+  ├─ canonicalPolicyIrHash
+  ├─ layoutRegistryManifest [(LayoutId, ApiVersion, ImplementationDigest)]
+  ├─ coreBuildId
+  ├─ normalizerSchemaVersion
+  ├─ analyzerVersion
+  └─ artifactHash
+
+SimulationArtifact
+  ├─ scenarioSchemaVersion
+  ├─ worldModelHash
+  ├─ simulatorBuildId
+  ├─ seed + eventOrderPolicy
+  └─ evidenceSetHash
+canonical hashはJSONシリアライザの偶発的なプロパティ順や改行に依存しない規約で計算する。ビルド成果物・設定・スキーマ・モデルを関連付け、現在のコードを過去の成果物と同一だと偽らない。スナップショットやJournalには、再生に必要なArtifactIdを保存する。
+## 15. テスト・検証・品質ゲート
+| レイヤ | 主な検証内容 |
+|---|---|
+| Policy DTO/IR | SchemaのRound-trip、ID一意、参照解決、決定的優先順位、三値論理 |
+| Static Analyzer | 不正設定の拒否、明白な矛盾、PotentialOverlapを不当に確定しない |
+| Layout | 0/1/多窓、比率・丸め、負座標、整数境界、対象重複、Monocleの重なり |
+| PlanValidator | 未知/破棄窓、範囲外矩形、不正Monitor、重複Plan、全Effect経路のガード |
+| Core/Reconciler | 遅延、拒否、重複、古いTimer、Policy変更、ユーザー操作中の抑止、振動防止 |
+| Journal | Sequence・相関、欠損・クラッシュ、バージョン識別、機密情報サニタイズ |
+| REPL/IPC | 読取専用の不変性、権限制限、古いRevision拒否、監査、悪意ある入力の境界 |
+| Simulation | Fixed-logとCounterfactualの区別、Seed再現、Unknownモデル、Shrink |
+| Windows | WinEvent非同期/再入、DPI、所有ダイアログ、消滅窓、フォーカス拒否、安全停止 |
+
+
+### 15.1 優先したい性質（Property-based / Model-based）
+1. 生存していないWindowIdへ新しいSetRectを発行しない。
+2. 同一Intentで未完了の同一要求を重複発行しない。
+3. 古いTimerが新しいIntentを完了/失効させない。
+4. Core状態とEffect列は同じ入力で一致する。
+5. 破棄・再発見されたHWNDを同一の生きたWindowIdと誤認しない。
+6. Layout関数の出力はPlanValidatorを必ず経由する。
+7. 制御不能な窓に対して要求数が無制限に増殖しない。
+8. 指定された前提が成立すれば一定の操作列後に安定するか、明示的な停止状態に移る。
+9. Inspectと`Fork`は本物のWindowsを変更しない。
+10. Replayは指定ArtifactとSeedに対し同じEvent/Effect/Traceのハッシュを生成する（この性質が成立するには、Coreの内部状態がハッシュ非決定なコレクション型に依存しないことが前提になる。11参照）。
+11. Coreの判断がプロセス間で再現可能である（`string.GetHashCode`のランダム化に依存する`HashSet`/`Dictionary`の列挙順にCoreの判断が依存しない。v2.1で追加、B-7対応）。
+12. `ApplyBatch`は全窓の適用が完了するまで中間状態を外部へ見せない、または明示された失敗単位でのみ部分適用を許す（v2.1で追加、A-4対応）。
+13. ハングした対象へのEffect適用はCoreの入力処理・安全停止の受理を妨げない（v2.1で追加、E-1対応）。
+### 15.2 テストアプローチ
+通常の単体テストに加え、FsCheck等の性質ベーステスト、有限長のイベント列探索、実機Journalを起点とする回帰シナリオ、Windows VMでの統合テストを組み合わせる。AIが仕様とSimulatorを同時に書き換えてテストを通すことを防ぐため、シミュレーターの意味論変更・不変条件の削除は独立したレビュー対象にする。
+## 16. Live運用、障害時の動作、セキュリティ
+### 16.1 安全境界
+- REPLから任意コマンドでHostメモリを直接変更できない。
+- 本番Hostへ新しい任意F#コードをロードする場合は信頼済みのローカルコードに限定し、停止不能な関数によるハングを既知のリスクとして扱う。一般配布時には隔離Workerを検討する。
+- 全てのOS変更EffectはPlanValidatorや権限ゲートを通る。
+- ファイル/ネットワークへの任意アクセスを持つ「安全なDSL」と誤認させない。
+- Named Pipeは同一ユーザー許可、必要に応じインスタンス単位の認可、接続数/サイズ/時間制限を持つ。
+- Probeは対象・情報項目・取得回数・許可を明示する。
+### 16.2 フォールバック
+設定失敗：新Artifactを採用せず最後の正常版を維持。
+Core例外：自動操作を止めて記録し、安全な停止へ。
+Shell/対象アプリ異常：対象を保留またはFloating化、必要なら全体再観測。
+Journal Writer異常：記録劣化を可視化し、安全性上不可欠な操作は停止する方針を選択可能にする。
+異常終了後：保存状態をOSの真実とみなさず、全体再観測で再同期してから再開。
+
+外部アプリの終了・ユーザー操作・フォーカス拒否など、WMから巻き戻せない状態はある。完全復旧を保証しない。
+## 17. リポジトリ構成と開発環境
+src/
+  Wm.Contracts/           # OS非依存の識別子、座標、イベント、Effect
+  Wm.Policy/              # Policy IR, Evaluator, Analyzer, DTO
+  Wm.Layouts/             # F#純粋Layout Registry / PlanValidator
+  Wm.Core/                # reducer, reconciliation, state
+  Wm.Simulation/          # virtual world, behaviors, scheduler
+  Wm.Journal/             # writer, reader, checkpoint, projections
+  Wm.Diagnostics/         # explain, incident bundle, privacy
+  Wm.DebugProtocol/       # IPC contracts, permissions, revisions
+  Wm.Windows/             # Win32, event pump, DPI, HWND lifetime
+  Wm.Host/                # lifecycle, DI, safety and watchdog
+  Wm.ReplClient/          # F# client library
+  Wm.Cli/                 # inspect, replay, simulate, export
+
+tests/
+  Wm.Policy.Tests/
+  Wm.Layouts.Tests/
+  Wm.Core.Tests/
+  Wm.Simulation.Tests/
+  Wm.Journal.Tests/
+  Wm.DebugProtocol.Tests/
+  Wm.Windows.IntegrationTests/
+  Scenarios/
+
+artifacts/
+  policy/
+  registry-manifests/
+  models/
+  incidents/
+
+docs/
+  architecture.md
+  contracts.md
+  adr/
+  operations.md
+依存方向：Windows/Host/Simulation/DebugがCoreの契約を参照し、Core側からWindowsやIPC実装を参照しない。JournalWriterのI/OはShell側、Journalのイベント型は契約側に置く。
+### 17.1 開発・CI
+Linux：F# Core、Policy、Layout、PlanValidator、Journalの純粋部分、Simulation、Replay、FsCheck、CLIのビルドとテスト。
+Windows：Win32 Shellの動作テスト、DPI・WinEvent・フォーカス・トレイ停止・IPC・配布の統合試験。
+共通ゲート：Format/Lint、警告の選定、単体・性質ベース、回帰シナリオ、Schema互換性、artifact hash整合性。
+
+Windows専用APIが使えることと、Linuxで同一テストが完走できることは別。OS依存境界を分けてCIを維持する。
+## 18. 実装計画とフェーズゲート
+
+**v2.1での見直し（C-1/C-3/C-4対応）**：旧版はPhase 0が弱いスパイクに留まり、常用（複数モニター・混在DPI等）がPhase Eまで来ないため、Phase Dの前提である「実機不具合」の供給源（＝日常利用）がPhase Eまで存在せず、計画が循環していた。本版ではPhase 0を「捨てる前提の素朴なWMによる失敗カタログ収集」に変更し、Phase Bの時点で複数モニター・混在DPI・ホットキーを含む最小限の常用を開始できるようにする。Phase letterの呼称は変えず、各PhaseのスコープとGateを変更する。
+
+#### Phase 0 — 捨てる前提の素朴なWMによる失敗カタログ収集（独立・短期）
+旧版の「最小プロセスで要素技術を確認する」という弱いスパイクではなく、数百行程度の捨てる前提の素朴なWM（ホットキー + 固定のmaster-stack + `DeferWindowPos`による一括適用、Policy IRもJournalも無し）を作り、普段使う10〜15個の実アプリ（Chrome/Edge系、Electron系、Office、エクスプローラー、UWP/WinUI＝`ApplicationFrameHost`経由、Windows Terminal、VS Code、Teams/Slack、IME候補窓、ツールチップ等）相手に1〜2日実際に使い、次を具体的に検証・記録する：
+- 可視フレーム矩形とウィンドウ矩形（GetWindowRect）の差分（4.2の座標系契約。A-3）をアプリごとに計測する。
+- ハングしたアプリへの`SetWindowPos`/`SendMessage`相当の呼出が呼び出し側をどう止めるか、`SendMessageTimeout`/`IsHungAppWindow`での検知可否（7.1のADR-012、E-1）。
+- 実際に使いたいキーバインドが`RegisterHotKey`で確保できるか、できない場合の`WH_KEYBOARD_LL`の実現性（8.1、B-2）。
+- ホットキー起点でキュー経由の非同期処理を挟んだ後も`SetForegroundWindow`の許可が残るか（8.1、B-3）。
+- 表示直後に属性（スタイル・所有関係）が変わる窓、UWPのゴーストフレーム、Cloakされた窓の見え方（分類・正規化の難所、C-2）。
+- 最小化・最大化・Snapからの復元時の`SetWindowPos`の振る舞い（6.2のバッチ適用・`RestoreBeforeMove`、A-4）。
+- 昇格（管理者）窓への操作がどう失敗するか。
+- スリープ復帰・モニター抜き差し・RDP接続時にOS自身が窓を動かす様子（7.3のE-3対応）。
+- 全画面アプリ・ゲームの検出手段（E-4）。
+- Explorer再起動時の`TaskbarCreated`、WorkArea変更、トレイアイコン消失（8.4、E-2）。
+- DPIが異なるモニター間を移動した際の対象アプリの自己リサイズ（8.3、B-6）。
+Gate：上記の検証項目について実際の観測結果を記録した「失敗カタログ」を作成し、それぞれについて「無視してよい」「Phase Aの型に反映する」「Phase Bで対処する」のいずれかに分類する。Phase Aの`WindowBehavior`（12.1）はこのカタログから選ぶ（机上で考案しない）。
+
+#### Phase A — Core + 中核状態モデル + Policy IR + 最小Simulation
+- WmState（4.4、Workspace/窓順序/フォーカス履歴）、CoreCommand（ADR-011）を最初に固定する。Policy IRより先にこれを決める。
+- F# Policy IR、Evaluator（三値）、Analyzer（5.5のスコープ縮小版。A-7）。
+- Master–StackとMonocle、独立したPlanValidator（`ApplyBatch`/`RestoreBeforeMove`を含む、A-4）。
+- 単一ReducerとDesired/Observed/Pending、Phase 0の失敗カタログから選んだ疑似窓の振る舞い（Immediate/Constrained/Delayedに加え、分類・正規化層の振る舞いもRaw層経由で表現する、C-2/ADR-013）。
+- 最小JournalとCLI Explain（9.1の方針：判断は永続化せずReplay再構成、B-1）。
+Gate：（旧版の「500px→700pxの不一致を疑似OS再現」はWindowBehaviorにMinimumWidthを入れれば必ず成立するため検証として不十分、C-4）次の2点で確認する：(1) 性質ベーステスト（15.1 #1〜#8、#11〜#13）が通ること、(2) Phase 0の失敗カタログのうち「Phase Aの型に反映する」と分類した項目それぞれについて、対応する疑似窓シナリオが用意され、RuleId/RequestIdで追跡できること。
+
+#### Phase B — Windows Shell + 最小常用の開始
+- WinEvent/全体Snapshot/ハンドル寿命/Raw Event記録付きの正規化（純粋Normalizer、C-2/ADR-013）をCoreへ接続。
+- OS発行結果と観測結果をJournal上で区別する。Effect適用は専用スレッド＋タイムアウト（7.1のADR-012）。安全停止の制御経路を別スレッド/別プロセスで実装する（8.4、E-1/E-2）。
+- Incident Bundle、ログビュー、停止/復旧を組み込む。
+- （v2.1で前倒し）複数モニター・混在DPIの基本動作、Phase 0で確保したホットキーによる最小限のキーボード操作（FocusNext/SwapWithMaster/SwitchWorkspace等）を実機で動かす。旧版ではこれらをPhase Eに置いていたが、日常利用（dogfooding）を始めるために必要な最小集合として本Phaseに前倒しする（C-3対応）。
+Gate：実機の1件の不具合を、入力→判断→Effect→実観測として調査できる。かつ、開発者自身が複数モニター・混在DPI環境で日常的な作業にこのWMを使い始められる（Phase D以降の実機不具合の供給源をここで確立する）。
+
+#### Phase C — Live REPL + Fork/Replay
+- ローカルの型付きIPC、Inspect/Explain/Analyzer、Snapshot Fork（計算はクライアント側、F-6）。
+- Fixed-log ReplayとCounterfactual Simulation（12.2の完了条件としての位置づけ、D-4）、Policy差分比較。
+- Interveneは最小の安全なCoreCommandに限定。前提検査は窓単位（F-4）、承認はHost側トークン（F-1）、Deployが運べるのはPolicy IR+Registry参照のみ（F-5）。
+Gate：稼働中のWMをF# REPLから調査し、実窓を変えずに新PolicyをFork検証できる。
+
+#### Phase D — Active Diagnosis + モデル合成（縮小スコープ、D-2）
+- EvidenceGap、観測レベルとProbe予算、Privacy policy。承認はHost側トークン（F-1）。
+- 初期は候補列挙・提示までを自動化し、順位付け・実行は人（REPL利用者）が行う（11.3、D-2）。
+- Phase Bから続く日常利用で見つかった実機不具合を元に、候補Modelを構成し疑似OSとの不一致を示す。
+- シナリオShrink、回帰保存、実機再確認（Counterfactualの結果を完了条件にしない、D-4）。
+Gate：実機不具合→追加証拠→疑似OS再現→修正→回帰テストの閉ループを完走。
+
+#### Phase E — 常用の仕上げ・配布
+- Phase Bで開始した常用で見つかった、よく使うアプリの例外、手動リサイズ、Policy切替の仕上げ。Phase Bでは扱わなかった複数モニター・混在DPIの高度なケース（タスクバー位置変更、WorkArea変更の連鎖等）。
+- リカバリーUX、診断ビュー、性能計測、利用者向けSDK、配布・更新。
+- 設定コードのWorker分離と安全なHot Reloadを必要性に応じ検討（Deployはアセンブリを運ばない、F-5の制約を維持）。
+Gate：日常利用の回帰テスト群と、起動/停止/異常終了の手順が安定する。
+## 19. 最小PoCの具体的な実装単位
+
+**第0の縦切り（Phase 0、v2.1で追加）**：捨てる前提の素朴なWM。`ThrowawayWm.fsx`相当（ホットキー登録、固定master-stack、`DeferWindowPos`一括適用のみ）と、実際に使って記録する`FailureCatalog.md`。このコードはPhase A以降のCoreへそのまま持ち込まない。
+
+第一の縦切り（Phase A）として次のファイル相当を優先実装する。
+WmState.fs（4.4のWorkspace/窓順序/フォーカス履歴、ADR-011）
+CoreCommand.fs
+PolicyTypes.fs
+PolicyEvaluator.fs
+PolicyAnalyzer.fs
+LayoutRegistry.fs
+MasterStack.fs
+Monocle.fs
+PlanValidator.fs（`ApplyBatch`/`RestoreBeforeMove`を含む）
+CoreState.fs
+Reducer.fs
+Reconciler.fs
+JournalTypes.fs（永続化対象を入力・OS呼出結果・Artifactに限定し、判断は含めない。9.1参照）
+JournalWriter.fs
+WindowEventNormalizer.fs（純粋関数。Shell/Simulation両方から参照する、ADR-013）
+VirtualWorld.fs
+WindowBehaviors.fs（Phase 0のFailureCatalog.mdから選ぶ）
+ScenarioRunner.fs
+Tests/ConstrainedWindowScenario.fs
+この段階でGUI、一般配布、完全なREPLプロトコルは不要。疑似OS上で不具合を再現し、判断と差分を説明できることが最優先。
+
+次の縦切り（Phase B）でWindowsの`EnumWindows`、`SetWinEventHook`、`GetWindowRect`、`SetWindowPos`とイベントキューをつなぐ。Effect適用は専用スレッド（ADR-012）とし、WindowEventNormalizer.fsをShell側からも呼ぶ。このPhaseで複数モニター・混在DPI・ホットキーによる最小限の常用を開始する（18章）。REPLはその後、既存のSnapshot/Journal/SimulationインターフェースをIPCへ公開するだけに留める。
+## 20. 重大リスクと対策
+| リスク | 兆候 | 対策 |
+|---|---|---|
+| WinEventの再入・通知遅延 | 状態逆転、二重処理 | 薄いCallback→キュー、Sequenceと再観測 |
+| DPI・座標変換差 | 常に微妙にサイズがずれる | 物理/可視フレームの分離、変換根拠をJournal化 |
+| 異なるアプリ動作 | 配置が震える、無視される | Retry上限、Suspended/Floating、EvidenceGap |
+| 任意F#拡張がHostを止める | 動作停止、Hot Reload不能 | Trusted code限定、初期は限定的更新、将来Worker分離 |
+| Journalの増大・機密漏洩 | 容量増加、共有危険 | 層別保管、暗号化/アクセス制限、保持期間、サニタイズ |
+| Simulatorの誤った自信 | 実機で再現しない | UnknownResponse、証拠由来/モデル版、実機再確認 |
+| Analyzerの過大保証 | 「検証済みなのに失敗」 | 保証範囲を明記、Runtime PlanValidatorと統合テスト |
+| REPLからの不正操作 | 意図しない窓の移動 | Read-only default、IPC認可、Revisionチェック、監査 |
+| 開発が言語処理系へ逸脱 | DSL拡張だけが進む | IR最小化、通常F#関数、縦切りの成果で判断 |
+| Win32特殊窓・特権境界 | 取得/操作不可 | Excluded/Suspended、非特権の範囲を明示 |
+| ハングしたアプリへの同期的なOS呼出（v2.1追加、E-1） | WM全体が応答しなくなる、安全停止も効かない | 専用Effect適用スレッド、SendMessageTimeout/SWP_ASYNCWINDOWPOS、IsHungAppWindow事前確認（ADR-012） |
+| 安全停止の制御経路の実体が未定義（v2.1追加、E-2） | ハング時に停止手段ごと止まる、Explorer再起動でトレイアイコンが消える | 別スレッド/別プロセスでの実装、TaskbarCreated処理による再登録（8.4） |
+| 画面構成変化の嵐：スリープ/ロック/モニタ抜き差し/RDP（v2.1追加、E-3） | OS自身の一斉移動と衝突し全窓が振動検知対象になる | ScreenReconfigurationInProgress中は再配置を抑止、安定後に全体再観測（7.3） |
+| 全画面アプリ・ゲーム・動画（v2.1追加、E-4） | 意図せずタイル化される | 全画面検出（SHQueryUserNotificationState等）による除外（8.1） |
+| 他の配置機構との競合：Snap/FancyZones/アプリ自身の位置復元（v2.1追加、E-5） | アプリ別振る舞いモデルの偽陽性学習（12.3）、WMとの引っ張り合い | 既知の競合シグネチャの除外、振動検知の強化 |
+| Journalがタイトル履歴の集積所になる（v2.1追加、E-6） | メール件名・URL・ファイル名等の行動履歴が同一ユーザーの他プロセスから閲覧可能になる | Inspect既定でタイトル除外、TitleContains使用時も記録しない（5.3/9.6） |
+| .NETランタイムの特性（v2.1追加、E-7） | GC一時停止がフック/入力経路に重なる、起動時間、NativeAOT時のリフレクション制約、配布先に.NET SDKが必要（REPLクライアント） | 計測して予算化、フックとGC負荷の高い処理を分離 |
+| 診断基盤への開発逸脱（v2.1追加、E-8） | Phase A〜Dの間使えない状態が続き開発動機が尽きる | 18章のPhase再構成でPhase Bから常用を開始する |
+
+
+## 21. 未決事項と判断方法
+| 未決事項 | 比較軸 | 決めるタイミング |
+|---|---|---|
+| Journal永続形式（NDJSON/SQLite/組合せ） | 書込み耐久性、Replay速度、範囲検索、移行、容量 | Phase A〜B |
+| IPC（Named Pipeの具体実装） | 認可、復旧、Windows対応、診断しやすさ | Phase C |
+| Layout Registryのロード | 静的リンク、Assembly Load Context、隔離Worker | Phase Aと常用化 |
+| Policy切替の原子性 | Pending失効、状態Migration、Rollback | Phase C〜E |
+| Snapshot保存間隔 | 復元コスト、容量、クラッシュ整合性 | Phase B |
+| Probe対象の拡張 | UIA/ETW取得可能性、権限、個人情報 | Phase D |
+| Scriptable診断DSL（CE等） | 実験の再現性、F#表現力、AST化必要性 | Phase D以降 |
+| 将来の独自DSL | IRだけでは不十分な具体的ユースケースの有無 | 常用後 |
+| Effect一括適用の実装方式（v2.1追加、v2.2でfeasibility.md §4により既定値決定） | `DeferWindowPos`系とSWP_ASYNCWINDOWPOSの選択、部分失敗時の扱い。既定は個別SetWindowPos+SWP_ASYNCWINDOWPOS（6.2参照）、ちらつき差をPhase 0で比較し再検討 | Phase A〜B |
+| ワークスペースの実装方式（v2.1追加） | 窓を隠す/画面外へ移動/最小化のいずれか、クラッシュ時の復元容易性 | Phase A |
+
+
+方針：先に必要な能力を実装し、表現形式や追加ツールを目的化しない。F*や全面Deep Embedded DSLを最初の前提に戻さない。
+## 22. プロジェクト全体の受け入れ条件
+1. Windows ShellとSimulation Shellで同じCoreの意思決定実装を使う。
+2. Policy IRが保存・分析・比較可能で、F#レイアウト実装を`LayoutId + Version + Digest`で識別する。
+3. Policy条件のUnknownをFalseとして扱わず、Analyzerが未知の検証範囲を明示する。
+4. 任意のLayout関数出力もPlanValidatorを通過しなければEffectを発行できない。
+5. Desired/Observed/Pendingを分離し、OS呼出結果と観測上の実現を混同しない。
+6. JournalはRule→Layout→Effect→OS結果→Observationの追跡、復元、サニタイズを支える。
+7. Live REPLのInspect/Forkは現実のWMを変更せず、介入は認可・Revision検査・記録を伴う。
+8. 固定ログReplayとモデルを使ったCounterfactual Simulationの意味が区別されている。
+9. 代表的な実機不具合をEvidenceに基づき疑似OSで再現し、変更前後を比較できる。
+10. 不足証拠をEvidenceGapとして示し、安全に追加観測できる。
+11. 異常終了・設定エラー・観測欠落でも自動制御を停止してWindows操作へ戻れる。
+12. LinuxでCore/Policy/Simulationを日常開発し、Windowsでネイティブ統合テストできる。
+13. ワークスペース・窓順序・フォーカス履歴がCoreの第一級の状態として定義され、Policy IRより先に固定されている（v2.1追加、ADR-011）。
+14. ハングした対象アプリへのOS呼出がWM全体・安全停止の受理を止めない（v2.1追加、ADR-012）。
+15. 開発者自身がPhase Bの時点で複数モニター・混在DPI環境の日常利用を開始できる（v2.1追加、18章のPhase再構成）。
+## 23. AI開発エージェントへの引き継ぎ規則
+変更してよいもの：F# Layout関数、Policy IRの新Rule、Journalの診断投影、追加のScenario/Probe候補、テストケース。
+必ず独立レビューするもの：PlanValidatorの迂回・弱体化、Coreの決定性を崩すI/O、Journalの意味論、記録済みRaw入力（9.1/ADR-013、NormalizerのバグをReplayで再現・回帰テスト化するための一次証拠）、Simulatorの外部動作モデル、ポリシーのUnknown処理、IPC介入権限、安全停止、セキュリティ/プライバシー境界。
+
+AIがバグ修正時に期待結果、Simulator、検証条件を同時に都合よく書き換えることを禁止する。変更が必要な場合は、実機観測や形式的な契約に基づく理由をADR/Issueへ残す。新規の実装機能には少なくとも一つの具体的な再現シナリオ、期待されるJournal、失敗時の挙動を定義する。
+## 24. 参考仕様（一次資料）
+- Microsoft — SetWinEventHook: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setwineventhook
+- Microsoft — Guarding Against Reentrancy in Hook Functions: https://learn.microsoft.com/en-us/windows/win32/winauto/guarding-against-reentrancy-in-hook-functions
+- Microsoft — EnumWindows: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-enumwindows
+- Microsoft — GetWindowRect: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getwindowrect
+- Microsoft — DWM Window Attributes: https://learn.microsoft.com/en-us/windows/win32/api/dwmapi/ne-dwmapi-dwmwindowattribute
+- Microsoft — SetForegroundWindow: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-setforegroundwindow
+- Microsoft — DPI and device-independent pixels: https://learn.microsoft.com/en-us/windows/win32/learnwin32/dpi-and-device-independent-pixels
+- Microsoft — CreateNamedPipeW: https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-createnamedpipew
+- Microsoft — UI Automation Overview: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-uiautomationoverview
+## 最終原則
+本プロジェクトの中心は、「賢いDSLでウィンドウを並べること」ではない。現実のWindowsアプリの不確実性に対して、意図・判断・命令・結果を区別し、証拠を再現可能な知識へ変えていくことである。自由なF#関数と最小の宣言的Policy IRを組み合わせることで、言語処理系の開発負担を抑えつつ、Journal、Live REPL、Active Diagnosis、疑似OS、回帰テストを一つの閉ループに統合する。
