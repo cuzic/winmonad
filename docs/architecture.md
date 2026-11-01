@@ -1,8 +1,8 @@
 # Windows プログラマブル・ウィンドウマネージャー 統合設計書
 
-Version: 2.9（実デスクトップ`dragonflyg4`でADR-015最後の未検証ステップを解消（[failure-catalog.md]F35）：ユーザーが実際にUAC承認して開いた昇格プロセスに対し、Medium整合性の本ハーネスから`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`→`OpenProcessToken`→`GetTokenInformation(TokenIntegrityLevel)`が失敗0件で成功することを確認した。F24で確認済みだったのは`OpenProcess`単体の成功のみで、トークン読み取り自体は今回で初めて実機確認。付随して`SetWindowPos`のUIPI拒否（F23/F24）も再確認。v2.6〜v2.8の設計・ADRに変更は無く、21章の対応する論点を解決済みに更新しただけ。これでPhase 0のCI/実機スパイクは主要項目が完了し、Phase A実装に着手する)
+Version: 2.10（ADR-019でPhase Aの実装対象ファイル（§19）に§17のプロジェクトを割り当て、実際のF#コンパイル依存順に並べ直した（Opus批判的レビュー6ラウンドで収束。docs/adr-019-draft.md、docs/review-adr019-round1〜6.md）。新設：Wm.Runtime（Reducerループ、CheckpointファイルのI/O。Windows非依存）、Wm.Normalization（ADR-013のNormalizerをWm.WindowsとWm.Simulationで共有）。核心の結論：6ドメイン（Topology/Workspaces/Focus/Windows/Health/Placement）のモジュール同士は互いの型を一切参照しない——ドメイン横断で読まれるのは少数の小さな値型か、`step`がその場で組み立てる識別子レベルの射影のいずれかであると、7.1の8段の表を1段ずつ当たり直して確認した。副次的に見つかったarchitecture.md自身の不整合（4.4の`update`の戻り値に`DecisionTrace`の出口が無い）も本版で修正。v2.9まで：実デスクトップ`dragonflyg4`でADR-015最後の未検証ステップを解消（[failure-catalog.md]F35）：ユーザーが実際にUAC承認して開いた昇格プロセスに対し、Medium整合性の本ハーネスから`OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`→`OpenProcessToken`→`GetTokenInformation(TokenIntegrityLevel)`が失敗0件で成功することを確認した。F24で確認済みだったのは`OpenProcess`単体の成功のみで、トークン読み取り自体は今回で初めて実機確認。付随して`SetWindowPos`のUIPI拒否（F23/F24）も再確認。v2.6〜v2.8の設計・ADRに変更は無く、21章の対応する論点を解決済みに更新しただけ。これでPhase 0のCI/実機スパイクは主要項目が完了し、Phase A実装に着手する）
 Date: 2026-11-02
-Status: 基本アーキテクチャ決定／個別APIと性能値はPoCで検証／中核状態モデルとPhase順序を本版で見直し／Win32 API挙動の一部をdocs/feasibility.mdの調査結果で具体化／ADR-012・6.2のハング耐性方針はdocs/failure-catalog.mdで実機実証済み／例外・Result・EffectFailure・PlanValidator・PolicyArtifactのエラー表現をADR-014で整理／マルチモニター状態モデル・AppId・DenialKind等の未決事項をdocs/oss-wm-survey.mdの調査結果とADR-015で整理（v2.5）／観測・信念・決定の3層分離（ADR-016）と待ちのデータ表現（ADR-017）を新設し、v2.5レビューの指摘を反映（v2.6）／v2.6の新しい前提をCI実機検証し、ObservedPresenceの非表示方式別の判定要件を具体化。Cloak自己/他者判別（S12）とWH_KEYBOARD_LLタイムアウト（S14）は未解決・要再検証のまま（v2.7）／公開APIのみでCloak理由ビットAPIの動作を確認し、WH_KEYBOARD_LLタイムアウトの説明も得た。Cloakの自己/他者判別は依然未決だが代替案を1つ追記（v2.8）／ADR-015の整合性レベルAPI（Medium→High方向のトークン読み取り）を実機確認し解決済みに更新。Phase A着手（v2.9）
+Status: 基本アーキテクチャ決定／個別APIと性能値はPoCで検証／中核状態モデルとPhase順序を本版で見直し／Win32 API挙動の一部をdocs/feasibility.mdの調査結果で具体化／ADR-012・6.2のハング耐性方針はdocs/failure-catalog.mdで実機実証済み／例外・Result・EffectFailure・PlanValidator・PolicyArtifactのエラー表現をADR-014で整理／マルチモニター状態モデル・AppId・DenialKind等の未決事項をdocs/oss-wm-survey.mdの調査結果とADR-015で整理（v2.5）／観測・信念・決定の3層分離（ADR-016）と待ちのデータ表現（ADR-017）を新設し、v2.5レビューの指摘を反映（v2.6）／v2.6の新しい前提をCI実機検証し、ObservedPresenceの非表示方式別の判定要件を具体化。Cloak自己/他者判別（S12）とWH_KEYBOARD_LLタイムアウト（S14）は未解決・要再検証のまま（v2.7）／公開APIのみでCloak理由ビットAPIの動作を確認し、WH_KEYBOARD_LLタイムアウトの説明も得た。Cloakの自己/他者判別は依然未決だが代替案を1つ追記（v2.8）／ADR-015の整合性レベルAPI（Medium→High方向のトークン読み取り）を実機確認し解決済みに更新。Phase A着手（v2.9）／ADR-019でPhase Aのファイル→プロジェクト割当と実装順序を確定、Wm.Runtime・Wm.Normalizationを新設、4.4の`update`の戻り値に`DecisionTrace list`を補う（v2.10）
 Implementation language: F# / .NET
 Target: Windows 11を初期検証対象とするWindowsデスクトップ。主なCore開発はLinux
 Audience: 開発者、設計レビュアー、AIコーディングエージェント
@@ -10,7 +10,7 @@ Audience: 開発者、設計レビュアー、AIコーディングエージェ�
 
 本書は従来のv1.0〜v1.3を統合し、最新の採用方針で再編集した単独で読める基準設計書である。F*、全ポリシーのDeep Embedded DSL化は採用しない。設計中のF#コードは契約例であり、コンパイル済みの完成実装を意味しない。
 
-関連資料：[feasibility.md](./feasibility.md)（Win32 API挙動の文献調査、既存Windows用タイル型WMの実装調査）、[spikes.md](./spikes.md)（Phase 0技術スパイクの計画）、[failure-catalog.md](./failure-catalog.md)（GitHub Actions windows-latestランナーでの実機検証結果。特に7章ADR-012と6.2のハング耐性方針はここで実証済み）、[review-result-design.md](./review-result-design.md)（ADR-014のエラー表現設計に対するOpus批判的レビュー第1ラウンド全文）、[review-result-design-round2.md](./review-result-design-round2.md)（修正後の収束確認・第2ラウンド。GatedEffectの型不備、ハング分類の欠落、PolicyArtifactの信頼根拠の穴等、1ラウンドでは見つからなかった実装レベルの不整合を多数指摘）、[oss-wm-survey.md](./oss-wm-survey.md)（xmonad/i3/sway/bspwm/dwm/awesome/Hyprland/yabai/komorebi/GlazeWMのソースコード調査。状態モデル・失敗分類・DPI・IPC等のアーキテクチャ上の設計判断をfeasibility.mdより広い範囲で比較し、v2.5の変更点の根拠になっている）、[review-oss-survey.md](./review-oss-survey.md)（v2.5に対するOpus批判的レビュー全文。R3-1〜R3-13。v2.6で全件反映）、[review-belief-layer.md](./review-belief-layer.md)（v2.6のADR-016/ADR-017とR3反映に対する独立したOpus批判的レビューと収束確認）。
+関連資料：[feasibility.md](./feasibility.md)（Win32 API挙動の文献調査、既存Windows用タイル型WMの実装調査）、[spikes.md](./spikes.md)（Phase 0技術スパイクの計画）、[failure-catalog.md](./failure-catalog.md)（GitHub Actions windows-latestランナーでの実機検証結果。特に7章ADR-012と6.2のハング耐性方針はここで実証済み）、[review-result-design.md](./review-result-design.md)（ADR-014のエラー表現設計に対するOpus批判的レビュー第1ラウンド全文）、[review-result-design-round2.md](./review-result-design-round2.md)（修正後の収束確認・第2ラウンド。GatedEffectの型不備、ハング分類の欠落、PolicyArtifactの信頼根拠の穴等、1ラウンドでは見つからなかった実装レベルの不整合を多数指摘）、[oss-wm-survey.md](./oss-wm-survey.md)（xmonad/i3/sway/bspwm/dwm/awesome/Hyprland/yabai/komorebi/GlazeWMのソースコード調査。状態モデル・失敗分類・DPI・IPC等のアーキテクチャ上の設計判断をfeasibility.mdより広い範囲で比較し、v2.5の変更点の根拠になっている）、[review-oss-survey.md](./review-oss-survey.md)（v2.5に対するOpus批判的レビュー全文。R3-1〜R3-13。v2.6で全件反映）、[review-belief-layer.md](./review-belief-layer.md)（v2.6のADR-016/ADR-017とR3反映に対する独立したOpus批判的レビューと収束確認）、[adr-019-draft.md](./adr-019-draft.md)（ADR-019の全決定事項の詳細。本文の§0・§3.1・§3.4・§4.4・§17・§17.1・§19・21章への反映は本版で完了済み）、[review-adr019-round1.md](./review-adr019-round1.md)〜[round6.md](./review-adr019-round6.md)（ADR-019に対するOpus批判的レビュー全6ラウンド、収束確認）。
 ## 0. 意思決定と設計状態
 | ID | 判断 | 状態 |
 |---|---|---|
@@ -32,6 +32,7 @@ Audience: 開発者、設計レビュアー、AIコーディングエージェ�
 | ADR-016 | **観測（Observation）・信念（Belief）・決定（Decision）を3層に分離する**。観測（4.2の`Observation<'T>`）は1回のOS呼出の生の結果で、Journalに残る事実である。信念（4.5の`Belief<'T>`）は、観測の履歴から推定した窓の属性で、確度（`Confidence`）と最終修正時刻を持ち、新しい証拠で修正され得る。決定（Policy評価、Reconciler、CoreCommandの解釈）は信念だけを読み、生の観測を直接読まない。**信念の計算は、それまでの入力列の決定的な純粋関数でなければならない**（Journalに保存せず、Replayで再計算する。信念はPendingの解決も証拠に使うので、正確には「観測だけ」ではなく「入力列とそれに対するCoreの過去の決定」の関数である、4.5） | 採用（v2.6で新設。窓の内部状態の多くは直接観測できず推定であり、推定は誤り得て、証拠が増えれば修正されるべきだというプロジェクトオーナーの指摘による。v2.5までは整合性レベル・ハング判定・AppIdの解決・DPI対応状況を1回きりの`Observation`として扱っており、スナップショットの統合規則が無い（R3-6）、フォーカスの情報源が2つある（R3-3）、未検証APIに分類が依存する（R3-7）という3つの指摘は、どれも「推定を事実として扱った」ことに起因する。5.4の三値`Truth`はブール値の信念の特殊形として再定義する（4.5）。ADR-004との整合は「信念は入力列の決定的な関数」という不変条件で保つ：信念が後から修正されれば、Replayはそこから導かれた決定も自然に再計算する。ADR-007（Active Diagnosis）が方向性として述べていた「不足証拠を再収集し、モデルを更新する」に、窓属性の単位で操作できる具体的な型を与える） |
 | ADR-017 | **Coreの「待ち」はデータで表す**。何かを待っている状態を、継続を閉じ込めたクロージャ（F#の`async`/`task`の継続等）で表さず、「タグ（DUケース）＋再開に必要なデータ＋期限」というクロージャを含まない値で表す（defunctionalized continuation）。タイマーは`step`が直接呼ぶAPIではなく、`StepResult`が返す`TimerCommand`（開始／取消）というデータとし、Shell/Simulationのランタイムが実行して発火を入力イベントとして戻す（3.3）。F#の`async`と自作`SynchronizationContext`（メッセージ専用ウィンドウ＋`PostMessage`）は**Shell内**で、Win32呼出を正しいメッセージポンプのスレッドに順序付けるためにだけ使う | 採用（v2.6で新設。クロージャはシリアライズもExplain/Journalからの検査もできず、ADR-004のReplay決定性を壊す。ADR-003の`Pending`/`RequestId`/`IntentEpoch`は既にこの原則に従っており、これを明示的な規約にして、後からの追加がクロージャに退行しないようにする。タイマーの形は作者のRust crate `timed-fsm`（遷移が行動とタイマー指令を純粋なデータとして返す設計）をF#へ移植したもの。v2.5までの`ArmTimer`/`CancelTimer`（int64の匿名ID）と、Pending期限・Unknown分類期限・S8のgrace window・7.3の安定待ちがそれぞれ独自の待ち方を持ちかけていた状態を統一する。ADR-012のEffect適用タイムアウト（Shell内の`SendMessageTimeout`の10ms）はCoreの待ちではないので対象外。独立レビューR4-1により、`timed-fsm`の`Consumed: bool`は移植せず、1 stepの処理順序の固定と原因ラベルに置き換えた） |
 | ADR-018 | **Coreをドメインごとに分割する**（Topology、Workspaces、Focus、Windows、Health、Placement。4.4）。各ドメインは自分の状態の型・純粋な更新関数・型で表せる不変条件を持ち、単一の`step`の内側で固定順に合成する。合成はElm Architectureの「子のupdateと子のCmdを親の型へ持ち上げる」パターンに倣うが、`Elmish`ライブラリは使わない。信念もドメインごとに個別に持ち、1つの大きな信念オブジェクトに集めない | 採用（v2.6で新設。R3-2（モニター状態の不整合）とR3-3（フォーカスの二重の情報源）は、全ての関心事を1つのレコードに載せ、不変条件を後から検査する規約にしていたことから生じた。ドメインごとの型にすることで、`Displays`（xmonadの`StackSet`のcurrent/visibleと同形）・`WorkspaceSet`（private）・Workspace内のzipper（xmonadの`Stack`と同形）により、それらの不変条件の多くが「後から検査する性質」から「型で表現できない状態」に変わる。3.1の「単一のReducerイベント列」は変えない。ElmishのCmdはクロージャのリストで検査・Replayできないため、ADR-017と両立しない） |
+| ADR-019 | **Phase Aの実装対象ファイル（§19）に§17のプロジェクトを割り当て、実際のF#コンパイル依存順に並べ直す**。新設プロジェクト：Wm.Runtime（Reducerループ、CheckpointファイルのI/O。Windowsに依存しないので、Phase AのLinux専用Simulationビルドから使える）、Wm.Normalization（ADR-013のNormalizerをWm.WindowsとWm.Simulationの両方から共有するために独立させる）。ドメイン間の読み取り（4.4の`'Ctx`）の実体は、§7.1の8段すべてを1段ずつ当たり直すと、(i) 少数の小さな値型（`ScreenPhase`/`FocusTarget`等、Wm.Contracts）か、(ii) `step`がその場で組み立てる識別子レベルの射影のいずれかであり、**6ドメインのモジュール同士は互いの型を一切参照しない**。`Displays`はsmart constructorの不変条件（3.4、4.4）を持つのでこの(i)の対象から除外し、`private`なままWm.Coreに残して射影だけを渡す。DTOはそれが写す型と同じプロジェクトに置く（Checkpoint DTOの変換はWm.Core、ファイルI/OはWm.Runtime）。決定性ゲート（3.4/17.1）の対象をWm.ContractsとWm.Normalizationにも拡大する | 採用（Opus批判的レビュー6ラウンドで収束。docs/adr-019-draft.md、docs/review-adr019-round1.md〜round6.md。副次的に、4.4の`update`の戻り値に`DecisionTrace`の出口が無いというarchitecture.md自身の不整合を発見し、本版で修正した） |
 
 
 最優先で検証する仮説：実Windowsで観測した不具合を、同じCoreと取得した証拠に基づく疑似OS上に持ち込み、失敗する最小シナリオを作成して修正前後の挙動を比較できる。
@@ -143,6 +144,8 @@ P0/P1/P2は開発段階を示す優先度であり、機能の恒久的な重要
 7. Journal / Diagnostics：意思決定と外部観測を結ぶ型付き記録・閲覧・出力。
 8. Debug Host/REPL：公開した型付きコマンドを介して、状態参照・Fork・Probe・介入。
 Runtimeは単一のReducerイベント列を持つ。WinEventのコールバック、タイマー、REPLから状態を直接更新しない。すべて入力キューに送る。
+
+**Wm.RuntimeとWm.Normalization（v2.10追加、ADR-019）**：Reducerループの実行とCheckpointファイルの書込み・読込（I/O。DTOへの変換自体はCore側、17章参照）は、Windows Shell/Core本体の双方から分離した独立のプロジェクトWm.Runtimeに置く。Windowsに依存しないため、Phase AのLinux専用Simulationビルドがこれを使える（4.のCore本体はこのReducerループを直接含まない）。5.のWindows Event NormalizerはWindows Shell専属ではなく、Wm.Windows/Wm.Simulationの両方が共有する独立のプロジェクトWm.Normalizationとして切り出す（ADR-013の「純粋関数として切り出す」構造上の要件を、プロジェクト境界としても表す）。
 ### 3.2 なぜ全面Deep DSLを採用しないか
 Deep DSLが有利なのは、設定の構造検査や静的な変換・保存である。いっぽう幾何計算やReconcilerまでASTにすると、演算子追加のたびにEvaluator/Analyzer/Serializer/Visualizerを更新する必要がある。JournalやReplayの成立条件は純粋なCore、構造化した入力/Effect、再現可能な成果物であり、全計算のAST化ではない。
 ### 3.3 Coreの「待ち」をデータで表す（v2.6で新設、ADR-017）
@@ -212,7 +215,7 @@ type TimerId =
 - **Impureim Sandwich（Mark Seemann）**：ADR-002の「Functional Core / Imperative Shell」は、本WMでは具体的に「不純な読み取り（Shellの観測→`InputEvent`）→純粋な中身（`step`：信念の修正・分類・Layout・PlanValidator・Reconcile）→不純な書き込み（`GatedEffect`→Shell）」という**一直線のサンドイッチ**を意味する。純粋な中身の途中で不純な呼出を挟まない。OSへの要求とその結果を待つ必要がある場合も、1つの`step`の中で待つのではなく、要求をEffectとして返し、結果を次の入力として受ける（ADR-003のPending）。つまり、複数のサンドイッチが入力キューで連なるのであって、1つのサンドイッチの中身に不純な呼出が混ざることは無い。
 - **Sans-IO**：Pythonの`h11`、Rustの`quinn-proto`、OCamlの`httpaf`/`h2`等のプロトコル実装は、ソケット操作を一切持たない純粋な状態機械（バイト列やイベントを受け取り、送るべきデータを返す）として書かれ、I/Oはその外側に置かれる。ADR-013のNormalizerとCore（正規化済みイベントを受け取り、Effect IRを返す）は同じ型である。
 - **Actions / Calculations / Data（Eric Normand）**：「Actionを呼ぶ関数はそれ自身もActionになる」という伝染性が、I/OをShellの境界へ押し出す理由である。Core・Policy評価・Layout関数はCalculationでなければならず、1か所でもAction（時計を読む、ファイルを読む）を呼べば、そこから上の全てがReplay不能になる。
-- **決定的シミュレーションテスト（Deterministic Simulation Testing、DST）**：FoundationDB、TigerBeetle、Antithesisが広めた手法で、時刻・乱数・ネットワーク・ディスクを差し替え可能な入力として注入し、1つのSeedで障害シナリオ全体を決定的に再現する。本WMの疑似OS（12章）とFork/Replay（ADR-006）はこれと同じ型である。調査した12のOSS WMはいずれもこの仕組みを持たない（[oss-wm-survey.md]）が、それは「この分野では新しい」というだけで、「他分野で確立した型を持ち込む」ものとして位置づけられる。**規則として明記する：Core（Wm.Core、Wm.Policy、Wm.Layouts）は、環境の時刻（`DateTime.Now`/`UtcNow`、`Stopwatch`、`Environment.TickCount`）、乱数（`Random`、`Guid.NewGuid`）、その他の環境状態を決して読まない。時刻・乱数・ID採番は全て`EventEnvelope`や観測（`Observation<'T>.MonotonicTime`/`SampleSequence`）のデータとして入る**（7.1の既存の規則を、DSTの前提として独立の規則に格上げする）。17.1の共通ゲートで、これらのAPIへの参照がCoreのアセンブリに無いことをアーキテクチャテストで検査する。
+- **決定的シミュレーションテスト（Deterministic Simulation Testing、DST）**：FoundationDB、TigerBeetle、Antithesisが広めた手法で、時刻・乱数・ネットワーク・ディスクを差し替え可能な入力として注入し、1つのSeedで障害シナリオ全体を決定的に再現する。本WMの疑似OS（12章）とFork/Replay（ADR-006）はこれと同じ型である。調査した12のOSS WMはいずれもこの仕組みを持たない（[oss-wm-survey.md]）が、それは「この分野では新しい」というだけで、「他分野で確立した型を持ち込む」ものとして位置づけられる。**規則として明記する：Core（Wm.Core、Wm.Policy、Wm.Layouts、**Wm.Contracts、Wm.Normalization**。v2.10でADR-019により後二者を追加）は、環境の時刻（`DateTime.Now`/`UtcNow`、`Stopwatch`、`Environment.TickCount`）、乱数（`Random`、`Guid.NewGuid`）、その他の環境状態を決して読まない。時刻・乱数・ID採番は全て`EventEnvelope`や観測（`Observation<'T>.MonotonicTime`/`SampleSequence`）のデータとして入る**（7.1の既存の規則を、DSTの前提として独立の規則に格上げする）。17.1の共通ゲートで、これらのAPIへの参照がCoreのアセンブリに無いことをアーキテクチャテストで検査する。
 - **Parse, don't validate**：不変条件を構築後に検査するのではなく、それを満たす値しか作れない型（smart constructor）に変換する、という原則。`ValidatedPlan`（6.2）、`GatedEffect`（6.2）、`PinnedPolicy`/`DeployablePolicy`（14章）、`Displays`/`WorkspaceSet`/`Zipper`（4.4）は全てこの原則の適用である。型で表しきれない不変条件（ドメインをまたぐもの、4.4の(X1)〜(X3)）だけを、FsCheckによる性質ベーステスト（15章）で検査する。
 - **代数的データ型**：本書の型は全てF#の判別共用体とレコードで表し、v2.6で追加した型（`Belief`/`Confidence`、`TimerCommand`/`TimerId`、`Displays`、`Zipper`、`ScreenPhase`等）もこれに従う。関数値を含む型をCoreの状態に置かない（3.3規約1）。
 - **代数的エフェクト**：OCaml 5、Koka、Unisonのようなエフェクトハンドラの言語機能はF#に無く、高カインド型も無い。しかし本WMには欠けているものは無い：代数的エフェクトの本質（作用をデータとして記述し、別の場所で解釈し、中身を純粋に保つ）は、Effect IRをデータとして返しShellが解釈する既存の構成で既に得られている。
@@ -397,7 +400,11 @@ type ScreenPhase =                                      // 7.3（R4-15/R5-5）
     | Settling of latest: MonitorSnapshot list * deadline: int64 * hardDeadline: int64 // トポロジ変化のdebounce
     | Grace of deadline: int64
 // コンストラクタはprivate。Displaysを作り変える関数（view、モニターの追加・除去）は全て「同じWorkspaceを2画面に出さない」を保つ。
-// 保てない入力（例：既に表示中のWorkspaceを別モニターにも出す）は、型の上でその遷移を書けないようにする（下記view意味論）
+// 保てない入力（例：既に表示中のWorkspaceを別モニターにも出す）は、型の上でその遷移を書けないようにする（下記view意味論）。
+// v2.10（ADR-019）：この不変条件はWm.Contractsへ公開の値型として置くと保てない（どのプロジェクトからでも不正なDisplaysを作れてしまう）。
+// Displays・TopologyStateはCore.Topologyの中にprivateなまま置き、他ドメイン・他段が読む分（①のDPI、⑤のWorkspaces、⑦のPlacement）は、
+// Topology自身が公開する読み取り専用の射影（Screen = { Monitor: MonitorSnapshot; Workspace: WorkspaceId }と同じ情報を運ぶレコード。
+// 識別子とMonitorSnapshot、いずれもWm.Contractsの型だけでできている）をstepがその場で組み立てて渡す（17章参照）。
 type TopologyState = private {
     Displays: Displays
     Phase: ScreenPhase
@@ -510,8 +517,10 @@ type CoreCommand =
 ```fsharp
 // 概念上の契約。'Inputはそのドメインが受け取る入力（親がInputEventから振り分ける）、
 // 'Ctxは先に処理された他ドメインの状態の読み取り専用の値（関数ではない）、
-// DomainEventは後段のドメインへ伝える事実（例：WindowClassified、WorkspaceShown）
-val update : 'Input -> 'Ctx -> 'State -> 'State * Response<'Timer, Effect> * DomainEvent list
+// DomainEventは後段のドメインへ伝える事実（例：WindowClassified、WorkspaceShown）。
+// DecisionTrace list（v2.10追加、ADR-019 R5-04対応）：起こり得ない組合せに出会ったときに「導出不整合の疑い」を記録する出口（7.1）。
+// 旧版の戻り値にはこの出口が無く、7.1の規則（ドメインの更新関数がDecisionTraceに記録する）と食い違っていた
+val update : 'Input -> 'Ctx -> 'State -> 'State * Response<'Timer, Effect> * DomainEvent list * DecisionTrace list
 ```
 親の`step`は、入力を7.1の固定順序（ドメイン×段×読むもの×DomainEventの表）で各ドメインへ振り分け、各ドメインが返した`DomainEvent`を後段のドメインへ渡し、各ドメインの`Response`（3.3：Effectとタイマー指令の**データ**）を連結して`StepResult`にする。各ドメインのタイマーIDは自分の小さなDU（例：`PlacementTimer = PendingDeadline of RequestId | IntegrityReprobe of WindowId`）であり、親の`TimerId`はそれを包むDU（`TimerId = Placement of PlacementTimer | …`、3.3）である。`TimerElapsed`が届いたら、親はDUのケースで振り分けて該当ドメインへ返す。これはElmで子のMsg/Cmdを親の型へ包んで持ち上げ、親のupdateが子へ振り分ける合成パターンそのものであり、「1つのイベントループのまま、ドメインごとに境界を持つ」という目的に対する確立した先行例である。ただし`Elmish`パッケージは使わない：Elmishの`Cmd<'msg>`は`(Dispatch<'msg> -> unit) list`というクロージャのリストであり、実行はできても中身を検査・Journal化・Replayできないので、3.3の規約1（待ちはデータで表す）とADR-004に反する。本WMの「Cmd」は、既にEffect IRと`TimerCommand`という検査可能なデータである。またElmishの中心であるview（描画）の段はCoreに存在しない（Live REPLのFork比較UI（FR-09）のような本物の対話UIを作るときには、Elmish系のUIライブラリは正当な選択肢になり得るが、それはCoreとは無関係である）。
 
@@ -1597,9 +1606,11 @@ src/
   Wm.Contracts/           # OS非依存の識別子、座標、イベント、Effect
   Wm.Policy/              # Policy IR, Evaluator, Analyzer, DTO
   Wm.Layouts/             # F#純粋Layout Registry / PlanValidator
+  Wm.Normalization/       # Windows Event Normalizer（純粋関数、ADR-013）。Wm.WindowsとWm.Simulationが共有（v2.10追加、ADR-019）
   Wm.Core/                # reducer, reconciliation, state
+  Wm.Runtime/             # Reducerループ、CheckpointファイルのI/O。Windows非依存（v2.10追加、ADR-019）
   Wm.Simulation/          # virtual world, behaviors, scheduler
-  Wm.Journal/             # writer, reader, checkpoint, projections
+  Wm.Journal/             # writer, reader（永続化する一次事実の封筒のI/Oのみ。checkpointとprojectionsはWm.Runtime/Wm.Diagnostics側、v2.10）
   Wm.Diagnostics/         # explain, incident bundle, privacy
   Wm.DebugProtocol/       # IPC contracts, permissions, revisions
   Wm.Windows/             # Win32, event pump, DPI, HWND lifetime
@@ -1610,7 +1621,9 @@ src/
 tests/
   Wm.Policy.Tests/
   Wm.Layouts.Tests/
+  Wm.Normalization.Tests/ # v2.10追加、ADR-019
   Wm.Core.Tests/
+  Wm.Runtime.Tests/       # v2.10追加、ADR-019
   Wm.Simulation.Tests/
   Wm.Journal.Tests/
   Wm.DebugProtocol.Tests/
@@ -1628,17 +1641,19 @@ docs/
   contracts.md
   adr/
   operations.md
-依存方向：Windows/Host/Simulation/DebugがCoreの契約を参照し、Core側からWindowsやIPC実装を参照しない。JournalWriterのI/OはShell側、Journalのイベント型は契約側に置く。
+依存方向：Windows/Host/Simulation/DebugがCoreの契約を参照し、Core側からWindowsやIPC実装を参照しない。JournalWriterのI/OはShell側、Journalのイベント型は契約側に置く。**CheckpointのDTO変換はWm.Core（`private`な状態の変換はその状態を定義したモジュールでしか書けないため）、Checkpointファイルの書込み・読込（I/O）とReplay開始点としての利用はWm.Runtimeが持つ（v2.10追加、ADR-019）。** Phase Aの範囲でのプロジェクト間依存は次のとおり：Wm.Contracts（依存なし）← Wm.Policy・Wm.Layouts（Contractsのみ、PolicyとLayoutsは互いに依存しない）・Wm.Normalization（Contractsのみ）。Wm.Journal（Contractsのみ）。Wm.Core（Contracts・Policy・Layouts）。Wm.Runtime（Contracts・Core・Journal。Windowsには依存しない）。Wm.Simulation（Core・Runtime・Normalization）。Wm.Windows（Contracts・Normalization。Core/Policy/Layoutsには依存しない）。Wm.Host（Core・Runtime・Journal・Windows・Normalization）。Wm.Diagnostics（Core・Journal・Policy・Layouts）。Wm.Cli（Diagnostics・Runtime・Simulation）。
+
+**ドメイン横断で直接読まれる値型のContracts配置（v2.10追加、ADR-019）：** 下記「信念・タイマーの型の配置」の対象に加え、`ScreenPhase`/`FocusTarget`等、6ドメイン（Topology/Workspaces/Focus/Windows/Health/Placement）が互いの状態型を参照せずに読めるようにするための小さな値型も、例外としてWm.Contractsに置く。**`Displays`自身はこの例外に含めない**：`Displays`はsmart constructorで不変条件を守る型（4.4）なので`private`なままWm.Coreの`Core.Topology`に残り、他ドメインへは`step`が組み立てる読み取り専用の射影だけを渡す。
 
 **エラー型の配置（v2.4で追加、ADR-014対応／ラウンド2レビューR2-20で`GatedEffect`の配置を訂正）**：`NativeCallRecord`/`EffectFailure`/`classify`はWm.Contractsに置く（Windows固有の型をCoreが参照しないため、ADR-013のNormalizerと同じ理由）。`ValidationError`/`ValidatedPlan`/`Disposition`はWm.Layouts、`PinnedPolicy`/`DeployablePolicy`はWm.Policyに置く。**`GatedEffect`はWm.Contractsに型を置き、コンストラクタを`internal`にして`InternalsVisibleTo("Wm.Core")`でWm.Coreだけに構築を許す**（Wm.Coreに置くと、`GatedEffect`を消費するだけのWm.Windows/Wm.SimulationがWm.Coreのアセンブリ全体を参照することになり依存方向が曖昧になるため）。Wm.Windowsの`Native`モジュール（`callBool`/`callBoolNoCode`/`callHr`）はWm.Windows内部（internal）に置き、Wm.Contractsの`NativeCallRecord`を構築するだけで、リッチな診断情報（APIパラメータ等）はWm.Windows内部にとどめ、Journalへは`NativeCallRecord`相当の小さい形だけを渡す。外部から呼べる経路は「`GatedEffect`を受け取る通常のShell」と「8.4の安全停止用の限定API」の2つに絞る（R2-6対応）。
 
-**信念・タイマーの型の配置（v2.6で追加、ADR-016/ADR-017）**：`Belief`/`BeliefSlot`/`Confidence`/`EvidenceRef`/`BeliefKey`と各ドメインの信念の小さなレコード（`IdentityBeliefs`等）はWm.Contractsに置く（Explain・Checkpoint・IPCのDTOに出るため）。各ドメインの状態型・更新関数・信念の修正関数、`MonitorLifecycle.reconcile`はWm.Coreの中でドメインごとのモジュール（`Core.Topology`、`Core.Workspaces`、`Core.Focus`、`Core.Windows`、`Core.Health`、`Core.Placement`）に分けて置く（ADR-018。どれも`classify`と同じくCoreBuildIdでピン留めされる。ドメイン間の参照は親の`step`が渡す読み取り専用の値に限り、ドメインのモジュール同士は互いを直接呼ばない）（`classify`と同じくCoreBuildIdでピン留めされる）。`TimerCommand`/`Response`/`TimerId`/`RetryState`はWm.Contractsに置き、`TimerCommand`の実行器（同じIDの再始動・取消を処理する小さな表）はWindows版（Hostのタイマーサービス）とSimulation版（仮想時計）で共有する純粋なロジックとして書く（7.1の`executeEffectProtocol`と同じ「手順を共有し、手段だけ差し替える」方針）。Shell内のメッセージ専用ウィンドウ上の`SynchronizationContext`（3.3の規約3）はWm.Windows内部に置く。
+**信念・タイマーの型の配置（v2.6で追加、ADR-016/ADR-017）**：`Belief`/`BeliefSlot`/`Confidence`/`EvidenceRef`/`BeliefKey`と各ドメインの信念の小さなレコード（`IdentityBeliefs`等）はWm.Contractsに置く（Explain・Checkpoint・IPCのDTOに出るため）。各ドメインの状態型・更新関数・信念の修正関数、`MonitorLifecycle.reconcile`はWm.Coreの中でドメインごとのモジュール（`Core.Topology`、`Core.Workspaces`、`Core.Focus`、`Core.Windows`、`Core.Health`、`Core.Placement`）に分けて置く（ADR-018。どれも`classify`と同じくCoreBuildIdでピン留めされる。ドメイン間の参照は親の`step`が渡す読み取り専用の値に限り、ドメインのモジュール同士は互いを直接呼ばない）（`classify`と同じくCoreBuildIdでピン留めされる）。**ただし`ScreenPhase`/`FocusTarget`等、ドメイン横断で直接読まれる小さな値型は例外としてWm.Contractsに置く（`Displays`自身は`private`なままWm.Coreに残り、他ドメインへは射影だけを渡す。v2.10追加、ADR-019 R5-01対応）。**`TimerCommand`/`Response`/`TimerId`/`RetryState`はWm.Contractsに置き、`TimerCommand`の実行器（同じIDの再始動・取消を処理する小さな表）はWindows版（Hostのタイマーサービス）とSimulation版（仮想時計）で共有する純粋なロジックとして書く（7.1の`executeEffectProtocol`と同じ「手順を共有し、手段だけ差し替える」方針）。Shell内のメッセージ専用ウィンドウ上の`SynchronizationContext`（3.3の規約3）はWm.Windows内部に置く。
 
 **依存の例外（3-3対応）**：Wm.Contracts/Wm.Policy/Wm.Layouts/Wm.Coreは外部パッケージ依存なしを維持する。Wm.ReplClientはCoreの決定性制約（3.1）の外にあるため、利便性のための外部パッケージ（`taskResult`相当、21章参照）を許容する。
 ### 17.1 開発・CI
-Linux：F# Core、Policy、Layout、PlanValidator、Journalの純粋部分、Simulation、Replay、FsCheck、CLIのビルドとテスト。
+Linux：F# Core、Policy、Layout、PlanValidator、Journal、Runtime、Normalizationのビルドとテスト（v2.10でWm.Runtime・Wm.Normalizationを追加、ADR-019。「Journalの純粋部分」は「Journal」に簡略化：Wm.JournalはWindowsに依存しないが、I/Oを行うので厳密には純粋ではない）、Simulation、Replay、FsCheck、CLIのビルドとテスト。
 Windows：Win32 Shellの動作テスト、DPI・WinEvent・フォーカス・トレイ停止・IPC・配布の統合試験。
-共通ゲート：Format/Lint、警告の選定、単体・性質ベース、回帰シナリオ、Schema互換性、artifact hash整合性、Coreの状態型がクロージャ・`Async`/`Task`を含まないことのアーキテクチャテスト（v2.6追加、ADR-017・3.3）、Coreのアセンブリが環境の時刻・乱数のAPI（`DateTime.Now`/`UtcNow`、`Stopwatch`、`Environment.TickCount`、`Random`、`Guid.NewGuid`）を参照しないことのアーキテクチャテスト（v2.6追加、3.4のDST）、Coreのドメインのモジュール同士が直接参照し合わないことのアーキテクチャテスト（v2.6追加、ADR-018）。
+共通ゲート：Format/Lint、警告の選定、単体・性質ベース、回帰シナリオ、Schema互換性、artifact hash整合性、Coreの状態型がクロージャ・`Async`/`Task`を含まないことのアーキテクチャテスト（v2.6追加、ADR-017・3.3）、Coreのアセンブリ（v2.10でWm.Contracts・Wm.Normalizationにも拡大、ADR-019）が環境の時刻・乱数のAPI（`DateTime.Now`/`UtcNow`、`Stopwatch`、`Environment.TickCount`、`Random`、`Guid.NewGuid`）を参照しないことのアーキテクチャテスト（v2.6追加、3.4のDST）、Coreのドメインのモジュール同士が直接参照し合わないことのアーキテクチャテスト（v2.6追加、ADR-018）。
 
 Windows専用APIが使えることと、Linuxで同一テストが完走できることは別。OS依存境界を分けてCIを維持する。
 ## 18. 実装計画とフェーズゲート
@@ -1727,6 +1742,31 @@ ScenarioRunner.fs
 Tests/ConstrainedWindowScenario.fs
 この段階でGUI、一般配布、完全なREPLプロトコルは不要。疑似OS上で不具合を再現し、判断と差分を説明できることが最優先。
 
+**プロジェクト割当と実装順序（v2.10追加、ADR-019）**：上記のファイル優先順位（ADR-011が定める各ドメインの意味・不変条件を固定する優先順位）はこの版で変更しない。本節はこれに、実際にF#としてコンパイルできる順序とプロジェクト（§17）の割当を付録として与える。2ファイル（`Core/DomainEvents.fs`、`DecisionTrace`）は上記の優先順位の一覧に無かったので追加する。
+
+| 実装順 | ファイル | プロジェクト | 備考 |
+|---|---|---|---|
+| 1 | ErrorTypes.fs（`NativeCallRecord`/`EffectFailure`/`classify`） | Wm.Contracts | Observationより前に必要（決定6層2） |
+| 2 | Beliefs.fs（`Belief`/`BeliefSlot`/`Confidence`、各ドメインの信念の値の型・小レコード） | Wm.Contracts | 決定6層3〜4 |
+| 3 | （共有語彙：`ScreenPhase`/`FocusTarget`/`Management`/`LayoutRef`/`LayoutArgs`/`EffectiveManagement`/`RegistryManifest`/`WorkspaceId`。`Displays`は含めない） | Wm.Contracts | 決定6層5。個別ファイルを立てず、関連する既存ファイルへ振り分けてよい |
+| 4 | Timers.fs（`TimerId`/`TimerCommand`/`RetryState`とタイマー実行器） | Wm.Contracts | 決定6層6。実行器はShell/Simulationが共有する純粋ロジック（基準(4)） |
+| 5 | CoreCommand.fs | Wm.Contracts | `InputEvent`/`Effect`/`EventEnvelope`とともに決定6層7 |
+| 6 | GatedEffect.fs | Wm.Contracts | `internal`コンストラクタ＋`InternalsVisibleTo("Wm.Core")`。決定6層8 |
+| 7 | JournalTypes.fs | Wm.Contracts | Contractsの型だけで書ける永続化対象の種別のみ（決定6層9。`PolicyStaleAnalysis`等の扱いは21章の未決事項） |
+| 8 | PolicyTypes.fs / PolicyEvaluator.fs / PolicyAnalyzer.fs / PolicyArtifact.fs | Wm.Policy | |
+| 9 | LayoutRegistry.fs / MasterStack.fs / Monocle.fs / PlanValidator.fs | Wm.Layouts | |
+| 10 | WindowEventNormalizer.fs | Wm.Normalization | v2.10新設プロジェクト。Wm.WindowsとWm.Simulationが共有（ADR-013） |
+| 11 | JournalWriter.fs | Wm.Journal | 一次事実の封筒の書込み・読込（I/O）のみ |
+| 12 | **Core/DomainEvents.fs**（`DomainEvent`のDU。`MoveCause`/`ShownBy`/`PendingResolved`の結果DU） | Wm.Core | §19の一覧に無かった追加ファイル（決定7） |
+| 13 | **DecisionTrace.fs**（`StepResult.Trace`の要素。4.4の`update`の戻り値、7.1の「導出不整合の疑い」の記録先） | Wm.Core | §19の一覧に無かった追加ファイル（決定7） |
+| 14 | Topology.fs（`MonitorLifecycle.reconcile`を同梱） / Workspaces.fs（Zipperを含む） / Focus.fs / Windows.fs / Health.fs / Placement.fs | Wm.Core | `Core.Topology`等。6ファイル間に強制順序は無い（決定2・決定8） |
+| 15 | WmState.fs（`WmState`型 → `RuntimePolicy`型 → `StepResult`型 → `step`関数） | Wm.Core | 6ドメインの後。最初はTopologyのフィールドだけを持ち、ドメインを実装するたびにフィールドを追加する（決定8） |
+| 16 | Reducer.fs | Wm.Runtime | 入力キューの処理とJournalへの書込み順序。Windows非依存 |
+| 17 | VirtualWorld.fs / WindowBehaviors.fs / ScenarioRunner.fs | Wm.Simulation | |
+| 18 | Tests/ConstrainedWindowScenario.fs | Wm.Simulation.Tests | |
+
+最初の縦切り（決定8）は`Core.Topology`の`ScreenSettle`について性質ベーステスト#21を、Wm.Contracts全10層・Wm.Journal・Wm.Runtimeの最小のReducerとTimer実行器のSimulation版・`Core/DomainEvents.fs`・`DecisionTrace.fs`・`Core.Topology`・`WmState.fs`を揃えたうえで検証する。詳細はdocs/adr-019-draft.mdの決定8参照。
+
 次の縦切り（Phase B）でWindowsの`EnumWindows`、`SetWinEventHook`、`GetWindowRect`、`SetWindowPos`とイベントキューをつなぐ。Effect適用は専用スレッド（ADR-012）とし、WindowEventNormalizer.fsをShell側からも呼ぶ。P/Invoke呼出しはNative.fs（`callBool`/`callBoolNoCode`/`callHr`。8.1、ADR-014）を経由し、ErrorTypes.fsのEffectFailure型をCore/Simulationと共有する。このPhaseで複数モニター・混在DPI・ホットキーによる最小限の常用を開始する（18章）。REPLはその後、既存のSnapshot/Journal/SimulationインターフェースをIPCへ公開するだけに留める。
 ## 20. 重大リスクと対策
 | リスク | 兆候 | 対策 |
@@ -1774,6 +1814,8 @@ Tests/ConstrainedWindowScenario.fs
 | ~~Workspace内のzipperをコマンド（意図）で回すか観測でだけ回すか~~ → **v2.6でプロジェクトオーナー確認済み：(A)を採用**（v2.6追加、R6-6） | (A) コマンドで回し、観測でも上書きする（v2.6の既定。キーの連打に強く、`ForegroundDenied`でも次のキーが期待どおりに進む）／(B) 観測でだけ回す（ADR-003に忠実で、zipperが常に実際のフォーカスと一致するが、観測が届く前の2回目のキーが同じ窓を起点に回る） | 確定（v2.6） |
 | ~~Unknown分類の期限超過時の既定~~ → **v2.6でプロジェクトオーナー確認済み：(A)を採用**（v2.6追加、R4-19） | (A) Floating（v2.5からの既定。遅いprobeの窓も見える位置に出て操作できる）／(B) 管理しない（Discoveredのまま。誤ってフォーカス巡回に入る事故が無いが、遅いprobeの窓はユーザーの操作待ちになる）。v2.6で期限の対象を候補条件を満たす窓に限ったので、(A)の主な弊害（不可視窓の大量Floating化）は既に除いてある | 確定（v2.6） |
 | 信念の修正規則の具体的な閾値（v2.6追加、ADR-016） | `MinWidth`を配置に反映するまでの観測回数、`Responsiveness`の再probeのバックオフ、`TargetIntegrity`の再probe上限、`ScreenSettle`/`ScreenGrace`の長さ。規則の**種類**（4.5の表）は本版で確定し、数値だけを実測で決める | Phase A（Simulation）→Phase B（実機Journal） |
+| `PolicyStaleAnalysis`（永続化はするがPolicy側の型`AnalyzerReport`を運ぶJournalエントリ）のペイロードの具体的な表現（v2.10追加、ADR-019） | Contractsの型だけで書ける他のJournalエントリ（決定6層9）と違い、`AnalyzerReport`はWm.Policyの型なので、そのままでは「Contractsの型だけで書ける」という層9の基準を満たさない。Contracts側に写し（DTO相当）を置くか、Policy側の型への参照を許すレイヤー違反を認めるかの選択 | Phase A |
+| Windows Event Normalizerの「候補条件」判定とCoreの状態（`ClassificationState`）の関係（v2.10追加、ADR-019。第1ラウンドレビューR3-2で指摘） | Normalizerは純粋関数としてWm.Normalizationに置くが（4.4の`NotCandidate`判定が参照する「可視・非ツール窓・非Cloak等」の候補条件は）、Windows側の生の属性だけで判定できるのか、Core（`ClassificationState`）の状態を読む必要があるのか未確定。後者ならNormalizerをCore非依存の純粋関数に保てない | Phase A（WindowEventNormalizer.fs着手時） |
 
 
 方針：先に必要な能力を実装し、表現形式や追加ツールを目的化しない。F*や全面Deep Embedded DSLを最初の前提に戻さない。
