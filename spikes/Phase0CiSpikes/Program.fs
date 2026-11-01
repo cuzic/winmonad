@@ -965,6 +965,14 @@ let main argv =
     elif argv.Length > 0 && argv.[0] = "--hang-child-maximized" then
         runHangChild true
         0
+    elif argv.Length > 0 && argv.[0] = "--s7r-only" then
+        // Re-run just S7r (no Explorer kill, no focus stealing) after the user has
+        // manually opened an elevated window and approved its UAC prompt.
+        startWatchdog 60
+        log "# Phase 0 実機再検証: S7r単独"
+        log (sprintf "- 実行日時(UTC): %s" (DateTime.UtcNow.ToString("o")))
+        tryRun "S7r 昇格ウィンドウの非対称性(実デスクトップ限定、単独再実行)" spikeS7r_ElevationAsymmetry
+        0
     else
         let exePath = Process.GetCurrentProcess().MainModule.FileName
         // Backstop: if any single spike blocks the STA thread itself (not just
