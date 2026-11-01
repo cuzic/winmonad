@@ -61,7 +61,7 @@ module Native =
     [<DllImport("dwmapi.dll")>]
     extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, RECT& pvAttribute, int cbAttribute)
 
-    [<DllImport("user32.dll")>]
+    [<DllImport("user32.dll", SetLastError = true)>]
     extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint32 uFlags)
 
     [<DllImport("user32.dll")>]
