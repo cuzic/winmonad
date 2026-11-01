@@ -1,8 +1,8 @@
 # Failure Catalog（Phase 0 実機検証）
 
-対象: [spikes.md](./spikes.md) のS1〜S11のうち、GitHub Actions `windows-latest` ランナー上でCI実機検証できたS1, S2, S2b, S2c, S3, S4, S5, S6, S7, S9, S10。S2b/S2cはADR-014（Result型によるエラー耐性設計）のレビュー収束後に、テキストでの推測（事前確認タイムアウト値「50ms」、`RestoreBeforeMove`の`ShowWindowAsync`化）を実機データに置き換えるために追加した。S7/S10はPhase 0計画のうち未着手だった項目（昇格窓・Explorer再起動）を、UACプロンプト等の危険を避けつつ安全に検証できる形に落として追加した。さらにarchitecture.md v2.6（ADR-015〜018、Belief層・ドメイン分割Core・waiting-as-data）の新しい前提をCIで検証できる範囲に絞ったS12（部分）/S13/S13b/S14〜S19を追加した（F25〜F32）。
+対象: [spikes.md](./spikes.md) のS1〜S11のうち、GitHub Actions `windows-latest` ランナー上でCI実機検証できたS1, S2, S2b, S2c, S3, S4, S5, S6, S7, S9, S10。S2b/S2cはADR-014（Result型によるエラー耐性設計）のレビュー収束後に、テキストでの推測（事前確認タイムアウト値「50ms」、`RestoreBeforeMove`の`ShowWindowAsync`化）を実機データに置き換えるために追加した。S7/S10はPhase 0計画のうち未着手だった項目（昇格窓・Explorer再起動）を、UACプロンプト等の危険を避けつつ安全に検証できる形に落として追加した。さらにarchitecture.md v2.6（ADR-015〜018、Belief層・ドメイン分割Core・waiting-as-data）の新しい前提をCIで検証できる範囲に絞ったS12（部分）/S13/S13b/S14〜S19を追加した（F25〜F32）。S12（Cloak自己/他者判別）とS14（WH_KEYBOARD_LLタイムアウト）は未解決のまま残ったため、公開APIだけで組める方法に切り替えて再検証した（F33/F34）。
 検証に使ったコード: [spikes/Phase0CiSpikes](../spikes/Phase0CiSpikes)（捨てる前提の検証ハーネス。Phase A以降のCoreへは持ち込まない）。
-実行結果: [run #41275322319](https://github.com/cuzic/winmonad/actions/runs/41275322319)（S1〜S9、1分24秒）、[run #41285111988](https://github.com/cuzic/winmonad/actions/runs/41285111988)（S2b/S2c含む、1分43秒）、[run #41285769219](https://github.com/cuzic/winmonad/actions/runs/41285769219)（S7/S10含む全11スパイク、1分47秒、2026-11-01T07:42 UTC）、[run #41304977018](https://github.com/cuzic/winmonad/actions/runs/41304977018)（v2.6フォローアップのS13/S13b/S14〜S19、2分19秒、ハング無し、2026-11-01T12:09 UTC）。
+実行結果: [run #41275322319](https://github.com/cuzic/winmonad/actions/runs/41275322319)（S1〜S9、1分24秒）、[run #41285111988](https://github.com/cuzic/winmonad/actions/runs/41285111988)（S2b/S2c含む、1分43秒）、[run #41285769219](https://github.com/cuzic/winmonad/actions/runs/41285769219)（S7/S10含む全11スパイク、1分47秒、2026-11-01T07:42 UTC）、[run #41304977018](https://github.com/cuzic/winmonad/actions/runs/41304977018)（v2.6フォローアップのS13/S13b/S14〜S19、2分19秒、ハング無し、2026-11-01T12:09 UTC）、[run #41307500718](https://github.com/cuzic/winmonad/actions/runs/41307500718)（S12a/S14再検証、`TypeLoadException`で一部失敗）、[run #41307738227](https://github.com/cuzic/winmonad/actions/runs/41307738227)（同じ回の修正後の再実行、2分10秒、ハング無し）。
 
 環境: `Microsoft Windows NT 10.0.26100.0`（64bit）、画面 1024x768（CI仮想ディスプレイ）。
 
@@ -44,6 +44,8 @@
 | F30 | S17 | `WM_CLOSE`を無視する窓（`DestroyWindow`を呼ばないWndProc）へ`PostMessage(WM_CLOSE)`を送ると、呼出自体は`posted=true`で0ms（非ブロッキング）。送信後も窓は生存（WndProcは`WM_CLOSE`を1回受信）。通常の窓（`WM_CLOSE`で`DestroyWindow`する）は実際に閉じた | Bで対処（確定。`RequestClose`Effectが非ブロッキングかつ拒否可能な丁寧な要求として機能することを実証） | 7.1 `Effect.RequestClose`／R6-2 |
 | F31 | S18 | `SendInput`ではなく投稿メッセージによる`WM_ENTERSIZEMOVE`/`WM_EXITSIZEMOVE`のシミュレーションで、ドロップ時点の矩形`(400,250,700,450)`（意図した移動先と一致）と`MonitorFromWindow`のハンドル`65537`（非null）を正しく捕捉した。単一モニタでの捕捉機構のみの検証であり、クロスモニタでの実際の転送（R3-4の本来の動機）はS11と同じ理由で未検証のまま | Bで対処（単一モニタの捕捉機構は確定。クロスモニタ部分は実機のマルチモニタ環境が必要） | 4.4 `MoveCause`/`UserDrag`／R4-7 |
 | F32 | S19 | `GetWindowDpiAwarenessContext`は自作/子WinFormsウィンドウで`0x6010`、`notepad.exe`で`0x22`という、プロセスの種類によって異なる値を返した（APIの呼出経路自体は機能している）。ただしスパイクのラベル関数が`-1`〜`-5`の既知sentinel値しか判定しておらず、両方とも`unknown(...)`と表示された | 無視してよい（スパイク実装の手抜き。`GetAwarenessFromDpiAwarenessContext`を呼べば直る。実際のマルチDPI問題はS11と同じく未解決のまま） | （architecture.mdへの反映は不要。実装上のTODOのみ） |
+| F33 | S14（再検証、F27を補強） | `WH_KEYBOARD_LL`フックのコールバックを約1150ms停止させ、**完全に戻ってくるのを待ってから**新しいキー入力を送るという正しい手順（これはF27の時点で既に実装されていた）で再確認：停止前`call count=2`、停止後の新しいキー入力後も`call count=2`（**脱落していない**）。今回新たに`HKCU\Control Panel\Desktop\LowLevelHooksTimeout`を読み取ったところ**値は未設定**だった。文書の「最大許容値1000ms」は設定可能な上限であって保証された既定値ではなく、未設定時の実効タイムアウトがこの環境で1150msを超えている可能性が高い、という説明が得られた | 型に反映（確定ではないが説明付き。F27の「文書と矛盾」という記述は本件で補強・訂正する） | 8.1 ホットキー登録の実現性（`WH_KEYBOARD_LL`フォールバック） |
+| F34 | S12a（部分、21章/R3-8対応） | 公開・文書化APIの`IVirtualDesktopManager`（`CLSID_VirtualDesktopManager`、`shobjidl_core.h`）で、`Win+Ctrl+D`で作成した別の仮想デスクトップへ**同一プロセスの**テスト窓を`MoveWindowToDesktop`で移すと`hr=0x00000000`（成功）。移動後その窓の`DWMWA_CLOAKED`を元のデスクトップから読むと`value=2`（`DWM_CLOAKED_SHELL`）が正しく返った。`Win+Ctrl+D`がこの環境（windows-latest/Server 2022）で実際に新しいデスクトップを作ること（GUIDが異なることで確認）も合わせて確定した | 型に反映（Cloak理由ビットAPI自体が機能することを確認。ただし21章(a)の本題——WM自身によるCloakと他要因によるCloakの判別——はまだ未検証。`MoveWindowToDesktop`は他プロセスの窓には使えないこと（`E_ACCESSDENIED`）も既知の制約のまま変わらず） | 21章 ワークスペースの実装方式／R3-8 |
 
 ## F04/F16（S4/S4r）：フォーカス移動の実現性は実デスクトップで解消済み
 
@@ -59,9 +61,12 @@ CI実機検証の時点では、S4で使った「他プロセス」が**この�
 
 考えられる原因は複数あり、どれが正しいかは今回の検証だけでは分からない：(a) このCI環境（GitHub Actions windows-latest）のレジストリの`LowLevelHooksTimeout`実効値が文書の記述と異なる、(b) 判定手段（1回のキー入力後の呼び出し回数比較）がフックの脱落を正しく検出できていない、(c) スレッドの状態（メッセージポンプの有無等）がこの検証では文書が想定する条件を満たしていない。再登録による自己回復ロジック（8.1で「検討する」と書かれている、まだ確定していない項目）は、脱落自体が起きなかったため一度も試せていない。**別の判定手段（例：フック登録直後に`GetLastError`を確認する、より長い停止時間を試す、実機デスクトップでも同条件を確認する）での再検証が必要**。
 
+**F33で補強・訂正**：(b)の「判定手段に欠陥がある」という推測は誤りだった——stall完全終了後に新しいキー入力を送る手順は、実はF27の時点で既にコード上正しく実装されていた（当時の報告の読み取りが不十分だった）。本当に効いていたのは(a)で、`LowLevelHooksTimeout`レジストリ値がこの環境では未設定であることが確認できた。文書の「最大1000ms」は設定可能な上限の記述であって、未設定時の既定の実効値を保証するものではない。F05〜F08（ハング耐性、`SendMessageTimeout`/`IsHungAppWindow`）とは別のAPI系列なので、この発見が7.1のハング耐性実証に影響することはない。
+
 ## CI実機検証で踏んだ地雷（それ自体が成果）
 
 - `Process.StandardOutput.ReadLine()`を無期限に待つと、子プロセス側で何らかの理由（ウィンドウステーション制約、クラッシュダイアログ等）が起きた場合に親プロセス側が無期限に止まる。タイムアウト付きの読み取りに変更した。
 - `keybd_event`でAltキー（`VK_MENU`）を送出すると、Windowsのメニューモード処理に入り`Application.DoEvents()`が戻らなくなることがある。komorebi/GlazeWMが`SendInput`で**マウス**イベントを使っている理由はまさにこれを避けるためだと、実機で初めて実感を伴って理解できた。
+- F#で`[<ComImport>]`を付けたクラス（`CLSID_VirtualDesktopManager`をCOM相互運用するためのS12a実装）は、C#と違いF#コンパイラが実際のコンストラクタ本体を生成してしまい、CLRの「ComImport型のメンバーはRVA=0でなければならない」という規則に反して`System.TypeLoadException: Method with non-zero RVA in an Import`が実行時に発生する。回避策は、インターフェース実装用のクラス宣言を一切作らず`Type.GetTypeFromCLSID(clsid)` + `Activator.CreateInstance`でCOMオブジェクトを取得すること。既存の`tryRun`ラッパーがこの例外を捕捉したため、ジョブ自体はクラッシュせず他のスパイクは正常に完走した——8.4の安全停止と同じ「1箇所の失敗が全体を止めない」という設計方針が、テストハーネス自身でも有効に機能した一例。
 - どちらの地雷も、6.2/7.1に書いた「ハング耐性」の設計方針そのものと同じ種類の問題（同期呼び出しが想定外に長時間ブロックする）であり、本プロジェクトが目指す「不確実性を観測・診断可能にする」という設計思想がテストハーネス自身にも適用できることを示している。
 - S2cの初回実行では、子窓を最大化せずに`SW_RESTORE`を送ったため、同期/非同期の両方が0msで返り「差が無い」という誤った結論になりかけた。実際には`SW_RESTORE`が状態を変えない操作（既に通常状態の窓への復元）であり、ターゲットスレッドと通信する必要が最初から無かっただけだった。**「ブロックしないこと」を実証するには、本当にブロックしうる状態変化を伴う操作で試す必要がある**という、スパイク設計そのものの教訓。
