@@ -9,6 +9,14 @@
 // NOT touch the undocumented IApplicationView::SetCloak/IVirtualDesktopManager
 // COM interfaces -- that half of the Cloak self/other-distinction question
 // (S12 in the survey that proposed these) is still open, see the write-up.
+// S12a was added in a follow-up round: it uses ONLY the public, documented
+// IVirtualDesktopManager COM interface (stable GUIDs, unlike the undocumented
+// Internal/ApplicationView interfaces) plus the standard Win+Ctrl+D/Left shell
+// shortcuts, to get one same-process self-induced-Cloak data point without
+// touching anything undocumented. S14 was also revisited to add a
+// LowLevelHooksTimeout registry read and fix a too-short intermediate sleep
+// that made a mid-test diagnostic line ambiguous (the actual removal verdict
+// always came from the post-stall probe, which was already correct).
 // S2b/S2c were added to ground two ADR-014 assumptions (the 50ms hang
 // pre-check timeout, and RestoreBeforeMove's ShowWindowAsync choice) in
 // a real CI run instead of a textual guess. S7/S10 probe this machine's
@@ -1142,6 +1150,130 @@ let spikeS13b_CloakReasonBits () =
             visible hr cloakAfter
     )
 
+// S12a: can self-induced (same-process) Cloak be produced and observed using ONLY the public,
+// documented IVirtualDesktopManager COM interface (CLSID_VirtualDesktopManager/
+// IID_IVirtualDesktopManager, shobjidl_core.h, min Windows Server 2016 -- confirmed via
+// learn.microsoft.com, and the GUIDs are a single stable pair unversioned across Windows
+// builds, unlike the undocumented IVirtualDesktopManagerInternal/IApplicationView interfaces,
+// whose shapes and GUIDs genuinely do vary per Windows build -- confirmed by inspecting
+// Grabacr07/VirtualDesktop's own source, which keys those off a per-OS-build GUID table with a
+// registry-name-lookup fallback) plus the standard Win+Ctrl+D / Win+Ctrl+Left shell keyboard
+// shortcuts for desktop creation/switching (there is no public API for creating or enumerating
+// desktops). MoveWindowToDesktop itself is public but documented/confirmed (Microsoft's own
+// archived Windows SDK blog, plus real-world reports e.g. MaxTo#704 on GitHub) to only work on
+// windows owned by the CALLING process -- E_ACCESSDENIED otherwise -- so this spike uses only
+// same-process test windows. This deliberately does NOT touch IApplicationView::SetCloak or
+// IVirtualDesktopManagerInternal (both undocumented, build-version-dependent; see S12b's
+// deferral note in the write-up for why porting that part was not attempted this round). If
+// Win+Ctrl+D doesn't appear to create a real new desktop on this runner image, this reports
+// that as the finding and stops -- it does not retry with increasingly exotic workarounds.
+module private VirtualDesktopManagerInterop =
+    [<ComImport; Guid("AA509086-5CA9-4C25-8F95-589D3C07B48A")>]
+    type VirtualDesktopManagerComClass() =
+        class end
+
+    [<ComImport; Guid("A5CD92FF-29BE-454C-8D04-D82879FB3F1B"); InterfaceType(ComInterfaceType.InterfaceIsIUnknown)>]
+    type IVirtualDesktopManager =
+        [<PreserveSig>]
+        abstract IsWindowOnCurrentVirtualDesktop: topLevelWindow: IntPtr * onCurrentDesktop: byref<bool> -> int
+        [<PreserveSig>]
+        abstract GetWindowDesktopId: topLevelWindow: IntPtr * desktopId: byref<Guid> -> int
+        [<PreserveSig>]
+        abstract MoveWindowToDesktop: topLevelWindow: IntPtr * desktopId: byref<Guid> -> int
+
+    let tryCreate () : IVirtualDesktopManager option =
+        try
+            Some(Activator.CreateInstance(typeof<VirtualDesktopManagerComClass>) :?> IVirtualDesktopManager)
+        with ex ->
+            log (sprintf "- CoCreateInstance(CLSID_VirtualDesktopManager) failed: %s" ex.Message)
+            None
+
+let private VK_LWIN = 0x5Buy
+let private VK_LCONTROL = 0xA2uy
+let private VK_D = 0x44uy
+let private VK_LEFT = 0x25uy
+let private KEYEVENTF_KEYUP = 2u
+
+/// Sends a modifier-chord keypress (all modifiers down, key down+up, all modifiers up in
+/// reverse order) via keybd_event. Deliberately never uses VK_MENU (Alt) -- see the S4 comment
+/// above on why that specific key is a known hang risk on this harness; Win+Ctrl+<key> does not
+/// involve Alt and is a different combination.
+let private pressChord (modifiers: byte list) (key: byte) =
+    for m in modifiers do
+        keybd_event (m, 0uy, 0u, UIntPtr.Zero)
+    keybd_event (key, 0uy, 0u, UIntPtr.Zero)
+    keybd_event (key, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
+    for m in List.rev modifiers do
+        keybd_event (m, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
+
+let spikeS12a_VirtualDesktopCloak () =
+    match VirtualDesktopManagerInterop.tryCreate () with
+    | None -> log "- could not create IVirtualDesktopManager; aborting S12a"
+    | Some vdm ->
+        use formA = new Form(Text = "S12a_A", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(100, 100, 250, 150))
+        formA.Show()
+        pump 5
+
+        let mutable guidA = Guid.Empty
+        let hrA = vdm.GetWindowDesktopId(formA.Handle, &guidA)
+        log (sprintf "- windowA initial desktop: hr=0x%08x guid=%O" hrA guidA)
+
+        // Win+Ctrl+D: create and switch to a new, empty virtual desktop. No public API for this step.
+        pressChord [ VK_LWIN; VK_LCONTROL ] VK_D
+        Thread.Sleep(800)
+        pump 5
+
+        use formB = new Form(Text = "S12a_B", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(100, 100, 250, 150))
+        formB.Show()
+        pump 5
+
+        let mutable guidB = Guid.Empty
+        let hrB = vdm.GetWindowDesktopId(formB.Handle, &guidB)
+        log (sprintf "- windowB (created right after Win+Ctrl+D) desktop: hr=0x%08x guid=%O" hrB guidB)
+
+        if hrB <> 0 || guidB = guidA then
+            log "- Win+Ctrl+D did not appear to create a genuinely new desktop on this runner image (windowB landed on the same desktop as windowA, or the query failed) -- stopping here; this is the finding, not retrying with workarounds"
+        else
+            // Win+Ctrl+Left: switch back to the desktop windowA lives on.
+            pressChord [ VK_LWIN; VK_LCONTROL ] VK_LEFT
+            Thread.Sleep(800)
+            pump 5
+
+            let mutable moveTarget = guidB
+            let hrMove = vdm.MoveWindowToDesktop(formA.Handle, &moveTarget)
+            log (sprintf "- MoveWindowToDesktop(windowA -> windowB's desktop), same-process window: hr=0x%08x" hrMove)
+            pump 5
+            Thread.Sleep(300)
+
+            let mutable cloakVal = 0
+            let hrCloak = DwmGetWindowAttributeInt(formA.Handle, DWMWA_CLOAKED, &cloakVal, 4)
+            log (
+                sprintf
+                    "- windowA DWMWA_CLOAKED after being moved to the now-non-visible desktop: hr=0x%08x value=%d (DWM_CLOAKED_SHELL=2 expected if this worked as intended)"
+                    hrCloak cloakVal
+            )
+
+            // Move windowA back so process exit doesn't abandon it on the desktop we're about to leave.
+            let mutable backTo = guidA
+            vdm.MoveWindowToDesktop(formA.Handle, &backTo) |> ignore
+            pump 3
+
+// S12b (deferred, see write-up): moving a SEPARATE PROCESS's window to another desktop needs
+// IApplicationView/IVirtualDesktopManagerInternal, which are undocumented AND build-version-
+// dependent. Inspecting Grabacr07/VirtualDesktop's own source (MIT-licensed, read for reference
+// only, no package dependency taken) shows this is not a simple interface-shape port: it keys
+// each interface's GUID off a per-Windows-build lookup table (see its Interop/IID.cs, with
+// separate Build10240/Build22000 interface-shape folders) with a registry-name-lookup fallback,
+// plus a runtime dynamic-proxy-assembly builder (ComInterfaceAssemblyBuilder) to construct a
+// matching interface at whatever shape the detected build needs. Replicating that is replicating
+// a meaningful slice of the library's own internal architecture, not porting one GUID and one
+// method signature -- this exceeds this round's bounded-effort budget. Deferred: either take the
+// NuGet dependency after all (with the TFM risk already flagged -- it wants
+// net5.0-windows10.0.19041.0+, this project is net8.0-windows) in a dedicated follow-up session
+// with room to resolve that, or attempt the registry-name-lookup/per-build approach from scratch
+// with its own dedicated time budget. S12a above (same-process, public API only) is unaffected
+// and does not depend on any of this.
+
 // S14: a WH_KEYBOARD_LL hook callback that deliberately stalls past the documented max
 // LowLevelHooksTimeout (1000ms on Win10 1709+) -- does Windows silently remove it as
 // documented, and does re-registering recover it? The test key event is swallowed inside the
@@ -1198,13 +1330,31 @@ let spikeS14_LowLevelHookTimeout () =
             Thread.Sleep(300)
             log (sprintf "- baseline: hook call count after 1 keypress (no stall) = %d" callCount.Value)
 
+            let llHooksTimeout =
+                try
+                    use key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Control Panel\Desktop")
+                    match key with
+                    | null -> "registry key not found"
+                    | k ->
+                        match k.GetValue("LowLevelHooksTimeout") with
+                        | null -> "value not set (Windows uses an undocumented default; the documented 1000ms figure is only a stated maximum, not a default)"
+                        | v -> sprintf "%O" v
+                with ex -> sprintf "error reading registry: %s" ex.Message
+            log (sprintf "- HKCU\\Control Panel\\Desktop\\LowLevelHooksTimeout on this runner: %s" llHooksTimeout)
+
             callCount.Value <- 0
             shouldStall.Value <- true
             keybd_event (VK_F15, 0uy, 0u, UIntPtr.Zero)
             keybd_event (VK_F15, 0uy, 2u, UIntPtr.Zero)
-            Thread.Sleep(2000) // long enough for the ~1150ms stall to finish either way
+            // Both the keydown and keyup each individually stall ~1150ms, dispatched serially
+            // through the same hook thread's message loop (up to ~2300ms total) -- 3000ms gives
+            // both a chance to actually finish before we read callCount.Value, avoiding a
+            // misleadingly low mid-test count that isn't actually evidence of anything (the real
+            // survived/removed verdict comes from the FRESH probe keypress below, sent only
+            // after this wait).
+            Thread.Sleep(3000)
             shouldStall.Value <- false
-            log (sprintf "- after a stalling keypress (callback slept ~1150ms, past the 1000ms max): call count during = %d" callCount.Value)
+            log (sprintf "- after a stalling keypress (each callback invocation slept ~1150ms, past the 1000ms documented max): call count during/after = %d (diagnostic only, not the removal verdict)" callCount.Value)
 
             callCount.Value <- 0
             keybd_event (VK_F15, 0uy, 0u, UIntPtr.Zero)
@@ -1500,6 +1650,7 @@ let main argv =
         tryRun "S11r 複数モニタのDPI検出(実デスクトップ限定)" spikeS11r_MonitorDpi
         tryRun "S13 ObservedPresenceの方式非依存性(4.5)" spikeS13_ObservedPresence
         tryRun "S13b Cloak理由ビットの一データ点(owner-minimize、21章/R3-8の部分検証)" spikeS13b_CloakReasonBits
+        tryRun "S12a 公開IVirtualDesktopManagerによる自己Cloak(同一プロセス限定、21章/R3-8)" spikeS12a_VirtualDesktopCloak
         tryRun "S14 WH_KEYBOARD_LLの無言脱落と再登録(8.1)" spikeS14_LowLevelHookTimeout
         tryRun "S15 ProcessKeyによるHWND再利用検知(4.5 Sticky)" (fun () -> spikeS15_ProcessKeyReuse exePath)
         tryRun "S16 Hung→Responding復帰(4.5 Responsiveness)" (fun () -> spikeS16_ResponsivenessRecovery exePath)
