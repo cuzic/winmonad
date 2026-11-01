@@ -1,8 +1,11 @@
 // Phase 0 feasibility spikes that CAN be verified on a GitHub Actions
 // windows-latest runner without a real interactive desktop session.
 // See /docs/spikes.md for the full spike plan this implements a subset of
-// (S1, S2, S3, S4, S5, S6, S9). Results are printed to stdout AND written
-// to phase0-ci-results.md for the "Upload results artifact" workflow step.
+// (S1, S2, S2b, S2c, S3, S4, S5, S6, S9). S2b/S2c were added to ground two
+// ADR-014 assumptions (the 50ms hang pre-check timeout, and
+// RestoreBeforeMove's ShowWindowAsync choice) in a real CI run instead of
+// a textual guess. Results are printed to stdout AND written to
+// phase0-ci-results.md for the "Upload results artifact" workflow step.
 //
 // This is throwaway verification code, not part of the eventual
 // ThrowawayWm (Phase 0 deliverable) or the real Core/Shell (Phase A/B).
@@ -58,6 +61,12 @@ module Native =
 
     [<DllImport("user32.dll")>]
     extern bool EndDeferWindowPos(IntPtr hWinPosInfo)
+
+    [<DllImport("user32.dll")>]
+    extern bool ShowWindow(IntPtr hWnd, int nCmdShow)
+
+    [<DllImport("user32.dll")>]
+    extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow)
 
     [<DllImport("user32.dll")>]
     extern bool IsHungAppWindow(IntPtr hwnd)
@@ -442,6 +451,82 @@ let spikeS2_Hang (exePath: string) =
     finally
         killProcessSafely p
 
+// S2b: how precisely does SendMessageTimeout honor short timeouts before vs after the
+// OS's internal ~5s "not responding" judgment? architecture.md ADR-014 currently assumes
+// a 50ms pre-check timeout without having measured it -- this spike measures real
+// behavior at several timeout values, before and after the OS's hang judgment, so the
+// design can use a real number instead of a guess.
+let spikeS2b_PreCheckTiming (exePath: string) =
+    let SMTO_ABORTIFHUNG = 0x0002u
+    let WM_NULL = 0x0000u
+
+    let probe (hwnd: IntPtr) (timeoutMs: uint32) (label: string) =
+        let mutable res = IntPtr.Zero
+        let sw = Stopwatch.StartNew()
+        let r = SendMessageTimeout(hwnd, WM_NULL, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, timeoutMs, &res)
+        sw.Stop()
+        log (sprintf "- %s, requested timeout=%dms: returned=%d elapsedMs=%d" label timeoutMs (int64 r) sw.ElapsedMilliseconds)
+
+    let (p, hwnd) = startHangChild exePath
+    try
+        if hwnd = IntPtr.Zero then
+            log "- failed to obtain hung child window handle"
+        else
+            Thread.Sleep(1000) // well under the OS's ~5s "not responding" threshold
+            for t in [ 10u; 50u; 100u; 500u ] do
+                probe hwnd t "BEFORE OS hang-judgment (~1s since last message pump)"
+    finally
+        killProcessSafely p
+
+    let (p2, hwnd2) = startHangChild exePath
+    try
+        if hwnd2 = IntPtr.Zero then
+            log "- failed to obtain hung child window handle (2nd trial)"
+        else
+            Thread.Sleep(6000) // past the OS's ~5s "not responding" threshold
+            for t in [ 10u; 50u; 100u; 500u ] do
+                probe hwnd2 t "AFTER OS hang-judgment (~6s since last message pump)"
+    finally
+        killProcessSafely p2
+
+// S2c: RestoreBeforeMove (architecture.md 7.1) is specified as ShowWindowAsync(SW_RESTORE)
+// rather than the synchronous ShowWindow, on the same reasoning as SWP_ASYNCWINDOWPOS for
+// SetWindowPos (S2) -- this spike actually tests that assumption instead of just asserting it.
+let spikeS2c_RestoreAsync (exePath: string) =
+    let SW_RESTORE = 9
+
+    let (p, hwnd) = startHangChild exePath
+    try
+        if hwnd = IntPtr.Zero then
+            log "- failed to obtain hung child window handle"
+        else
+            Thread.Sleep(6000)
+            let (finished, ms) = measureWithTimeout 4000 (fun () -> ShowWindow(hwnd, SW_RESTORE))
+            log (
+                sprintf
+                    "- ShowWindow(SW_RESTORE) WITHOUT Async, on hung window: %s (waited %dms)"
+                    (if finished then "returned" else "did NOT return within the 4000ms measurement cap")
+                    ms
+            )
+    finally
+        killProcessSafely p
+
+    let (p2, hwnd2) = startHangChild exePath
+    try
+        if hwnd2 = IntPtr.Zero then
+            log "- failed to obtain hung child window handle (2nd trial)"
+        else
+            Thread.Sleep(6000)
+            let (finished2, ms2) = measureWithTimeout 4000 (fun () -> ShowWindowAsync(hwnd2, SW_RESTORE))
+            log (
+                sprintf
+                    "- ShowWindowAsync(SW_RESTORE), on hung window: %s (waited %dms)"
+                    (if finished2 then "returned" else "did NOT return within the 4000ms measurement cap")
+                    ms2
+            )
+    finally
+        killProcessSafely p2
+
 // S6: DeferWindowPos batch vs individual SetWindowPos+SWP_ASYNCWINDOWPOS, with one
 // window in the batch being hung, to see whether the hung window stalls the others.
 let spikeS6_BatchApply (exePath: string) =
@@ -526,6 +611,8 @@ let main argv =
         tryRun "S9 全画面相当ウィンドウの検出" spikeS9_Fullscreen
         tryRun "S4 SetForegroundWindowの許可条件" (fun () -> spikeS4_ForegroundWindow exePath)
         tryRun "S2 ハング検知とEffect適用" (fun () -> spikeS2_Hang exePath)
+        tryRun "S2b 事前確認のタイムアウト値の実測(ADR-014)" (fun () -> spikeS2b_PreCheckTiming exePath)
+        tryRun "S2c RestoreBeforeMoveのShowWindowAsync化(ADR-014/R2-4)" (fun () -> spikeS2c_RestoreAsync exePath)
         tryRun "S6 バッチ適用(DeferWindowPos vs 個別SetWindowPos+ASYNC)" (fun () -> spikeS6_BatchApply exePath)
 
         log "\n(all spikes finished without the watchdog firing)"
