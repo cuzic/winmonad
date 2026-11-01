@@ -2,6 +2,13 @@
 // windows-latest runner without a real interactive desktop session.
 // See /docs/spikes.md for the full spike plan this implements a subset of
 // (S1, S2, S2b, S2c, S3, S4, S4r, S5, S5r, S6, S7, S7r, S9, S10, S11r).
+// S13/S13b/S14-S19 were added later as architecture.md v2.6 follow-up spikes
+// (ObservedPresence, cloak-reason bits, WH_KEYBOARD_LL self-healing,
+// ProcessKey/HWND-reuse, Hung->Responding recovery, RequestClose/WM_CLOSE,
+// MoveSizeEnded capture, DpiAwarenessContext sanity). S13b deliberately does
+// NOT touch the undocumented IApplicationView::SetCloak/IVirtualDesktopManager
+// COM interfaces -- that half of the Cloak self/other-distinction question
+// (S12 in the survey that proposed these) is still open, see the write-up.
 // S2b/S2c were added to ground two ADR-014 assumptions (the 50ms hang
 // pre-check timeout, and RestoreBeforeMove's ShowWindowAsync choice) in
 // a real CI run instead of a textual guess. S7/S10 probe this machine's
@@ -161,6 +168,75 @@ module Native =
     [<DllImport("user32.dll", CharSet = CharSet.Unicode)>]
     extern uint32 RegisterWindowMessage(string lpString)
 
+    // ===== S13/S13b/S14/S15/S16/S17/S18/S19 (added for architecture.md v2.6 follow-up:
+    // Belief layer / ObservedPresence / waiting-as-data / domain-split Core) =====
+    [<DllImport("user32.dll")>]
+    extern bool IsIconic(IntPtr hWnd)
+
+    [<DllImport("user32.dll")>]
+    extern bool IsWindow(IntPtr hWnd)
+
+    [<DllImport("user32.dll")>]
+    extern bool PostMessage(IntPtr hWnd, uint32 Msg, IntPtr wParam, IntPtr lParam)
+
+    [<DllImport("user32.dll")>]
+    extern IntPtr SendMessage(IntPtr hWnd, uint32 Msg, IntPtr wParam, IntPtr lParam)
+
+    [<DllImport("user32.dll")>]
+    extern IntPtr MonitorFromWindow(IntPtr hWnd, uint32 dwFlags)
+
+    [<DllImport("user32.dll")>]
+    extern IntPtr GetWindowDpiAwarenessContext(IntPtr hwnd)
+
+    // Separate extern binding to the same native function as DwmGetWindowAttribute (above) but
+    // with a 4-byte DWORD output instead of a RECT, for DWMWA_CLOAKED (14).
+    [<DllImport("dwmapi.dll", EntryPoint = "DwmGetWindowAttribute")>]
+    extern int DwmGetWindowAttributeInt(IntPtr hwnd, int dwAttribute, int& pvAttribute, int cbAttribute)
+
+    [<DllImport("user32.dll")>]
+    extern void keybd_event(byte bVk, byte bScan, uint32 dwFlags, UIntPtr dwExtraInfo)
+
+    type LowLevelKeyboardProc = delegate of int * IntPtr * IntPtr -> IntPtr
+
+    [<DllImport("user32.dll", SetLastError = true)>]
+    extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint32 dwThreadId)
+
+    [<DllImport("user32.dll", SetLastError = true)>]
+    extern bool UnhookWindowsHookEx(IntPtr hhk)
+
+    [<DllImport("kernel32.dll")>]
+    extern uint32 GetCurrentThreadId()
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type POINT =
+        struct
+            val mutable X: int
+            val mutable Y: int
+        end
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type MSG =
+        struct
+            val mutable hwnd: IntPtr
+            val mutable message: uint32
+            val mutable wParam: IntPtr
+            val mutable lParam: IntPtr
+            val mutable time: uint32
+            val mutable pt: POINT
+        end
+
+    [<DllImport("user32.dll")>]
+    extern bool GetMessage(MSG& lpMsg, IntPtr hWnd, uint32 wMsgFilterMin, uint32 wMsgFilterMax)
+
+    [<DllImport("user32.dll")>]
+    extern bool TranslateMessage(MSG& lpMsg)
+
+    [<DllImport("user32.dll")>]
+    extern IntPtr DispatchMessage(MSG& lpMsg)
+
+    [<DllImport("user32.dll")>]
+    extern bool PostThreadMessage(uint32 idThread, uint32 Msg, IntPtr wParam, IntPtr lParam)
+
 open Native
 
 /// Suppresses the "<app> has stopped working" / Windows Error Reporting UI.
@@ -292,6 +368,29 @@ let startHangChild (exePath: string) = startHangChildWith "--hang-child" exePath
 // v2.4で追加（R2-4の再検証）：最大化状態のまま応答停止する子窓。ShowWindow(SW_RESTORE)が
 // 実際に状態を変える操作としてブロックするかを見るため、通常状態のままの子窓とは別に用意する。
 let startHangChildMaximized (exePath: string) = startHangChildWith "--hang-child-maximized" exePath
+
+// S16で追加：メッセージポンプを止めてハング状態になった後、自分で再開して応答を取り戻す子窓。
+// 既存のrunHangChildは「ハングに入る」側しか試せず、「ハングから復帰する」側（4.5のResponsiveness
+// 信念のHung→Responding修正規則）は未検証だったため追加する。
+let runHangChildRecoverable () =
+    try
+        let form =
+            new Form(Text = "CI_RECOVERABLE_HUNG_WINDOW", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(50, 50, 300, 200))
+        form.Show()
+        pump 10
+        printfn "HWND=%d" (int64 form.Handle)
+        Console.Out.Flush()
+        Thread.Sleep(7000) // stop pumping: long enough to cross the OS's ~5s "not responding" threshold
+        // Resume pumping -- this is the recovery half S16 actually tests.
+        let sw = Stopwatch.StartNew()
+        while sw.ElapsedMilliseconds < 30000L do
+            pump 1
+    with ex ->
+        printfn "ERROR=%s" (ex.Message.Replace("\n", " ").Replace("\r", ""))
+        Console.Out.Flush()
+        Environment.Exit(1)
+
+let startHangChildRecoverable (exePath: string) = startHangChildWith "--hang-child-recoverable" exePath
 
 // ===== spikes =====
 
@@ -968,6 +1067,387 @@ let spikeS4r_ThirdPartyFocus () =
             // Courtesy: put the user's original foreground window back.
             SetForegroundWindow(before) |> ignore
 
+// Shared observation helper for S13/S13b: the (IsVisible, IsMinimized, DWMWA_CLOAKED) tuple
+// architecture.md 4.5's method-independent ObservedPresence is computed from.
+let private DWMWA_CLOAKED = 14
+let private observePresence (hwnd: IntPtr) (label: string) =
+    let visible = IsWindowVisible(hwnd)
+    let minimized = IsIconic(hwnd)
+    let mutable cloakVal = 0
+    let hr = DwmGetWindowAttributeInt(hwnd, DWMWA_CLOAKED, &cloakVal, 4)
+    log (sprintf "- %s: IsVisible=%b IsMinimized=%b DWMWA_CLOAKED hr=0x%08x value=%d" label visible minimized hr cloakVal)
+
+// S13: does (IsVisible, IsMinimized, DWMWA_CLOAKED) uniquely distinguish the 4 states
+// architecture.md 4.5's ObservedPresence needs to tell apart: normally shown, SW_HIDE'd,
+// SW_MINIMIZE'd, and moved off-screen?
+let spikeS13_ObservedPresence () =
+    let SW_HIDE = 0
+    let SW_SHOWNORMAL = 1
+    let SW_MINIMIZE = 6
+    let SW_RESTORE = 9
+    let SWP_NOZORDER = 0x0004u
+
+    use form = new Form(Text = "S13", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(100, 100, 300, 200))
+    form.Show()
+    pump 5
+    observePresence form.Handle "normally shown"
+
+    ShowWindow(form.Handle, SW_HIDE) |> ignore
+    pump 3
+    observePresence form.Handle "SW_HIDE"
+    ShowWindow(form.Handle, SW_SHOWNORMAL) |> ignore
+    pump 3
+
+    ShowWindow(form.Handle, SW_MINIMIZE) |> ignore
+    pump 3
+    observePresence form.Handle "SW_MINIMIZE"
+    ShowWindow(form.Handle, SW_RESTORE) |> ignore
+    pump 3
+
+    SetWindowPos(form.Handle, IntPtr.Zero, -5000, -5000, 300, 200, SWP_NOZORDER) |> ignore
+    pump 3
+    observePresence form.Handle "moved off-screen (X=-5000)"
+    SetWindowPos(form.Handle, IntPtr.Zero, 100, 100, 300, 200, SWP_NOZORDER) |> ignore
+
+// S13b (partial S12 -- see docs/spikes.md for the undocumented-COM self-cloak half, which this
+// deliberately does NOT attempt): does DWM report DWM_CLOAKED_INHERITED (value 4) when a
+// window's OWNER is minimized? This is one real data point for whether the documented
+// cloak-reason bits report anything meaningful at all, without touching
+// IApplicationView::SetCloak/IVirtualDesktopManager. It does NOT resolve whether the WM can
+// tell a Cloak it caused itself apart from one caused by something else.
+let spikeS13b_CloakReasonBits () =
+    use ownerForm = new Form(Text = "S13b_Owner", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(100, 100, 250, 150))
+    ownerForm.Show()
+    pump 3
+    use ownedForm =
+        new Form(Text = "S13b_Owned", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(400, 100, 250, 150), Owner = ownerForm)
+    ownedForm.Show()
+    pump 5
+
+    let mutable cloakBefore = 0
+    DwmGetWindowAttributeInt(ownedForm.Handle, DWMWA_CLOAKED, &cloakBefore, 4) |> ignore
+    log (sprintf "- owned window DWMWA_CLOAKED before owner is minimized: %d" cloakBefore)
+
+    ownerForm.WindowState <- FormWindowState.Minimized
+    pump 10
+    Thread.Sleep(200)
+    pump 5
+
+    let mutable cloakAfter = 0
+    let hr = DwmGetWindowAttributeInt(ownedForm.Handle, DWMWA_CLOAKED, &cloakAfter, 4)
+    let visible = IsWindowVisible(ownedForm.Handle)
+    log (
+        sprintf
+            "- owned window after owner minimized: IsVisible=%b DWMWA_CLOAKED hr=0x%08x value=%d (DWM_CLOAKED_INHERITED=4)"
+            visible hr cloakAfter
+    )
+
+// S14: a WH_KEYBOARD_LL hook callback that deliberately stalls past the documented max
+// LowLevelHooksTimeout (1000ms on Win10 1709+) -- does Windows silently remove it as
+// documented, and does re-registering recover it? The test key event is swallowed inside the
+// hook itself (never calls CallNextHookEx) so it can never reach any application or trigger a
+// system gesture -- see the S4 comment above on why a stray synthetic keypress is risky on
+// this harness (the VK_MENU/menu-mode hang). hMod=IntPtr.Zero/dwThreadId=0u is the documented
+// combination for WH_KEYBOARD_LL specifically (it does not need to live in a DLL).
+let spikeS14_LowLevelHookTimeout () =
+    let WM_QUIT = 0x0012u
+    let WH_KEYBOARD_LL = 13
+    let VK_F15 = 0x7Euy
+
+    let hookHandle = ref IntPtr.Zero
+    let loopThreadId = ref 0u
+    let callCount = ref 0
+    let shouldStall = ref false
+    let callback =
+        LowLevelKeyboardProc(fun nCode wParam lParam ->
+            callCount.Value <- callCount.Value + 1
+            if nCode >= 0 && shouldStall.Value then
+                Thread.Sleep(1150) // past the documented 1000ms max LowLevelHooksTimeout
+            IntPtr(1) // swallow: never calls CallNextHookEx, so this can never reach any window
+        )
+
+    let ready = new ManualResetEventSlim(false)
+    let loopThread =
+        Thread(fun () ->
+            loopThreadId.Value <- GetCurrentThreadId()
+            hookHandle.Value <- SetWindowsHookEx(WH_KEYBOARD_LL, callback, IntPtr.Zero, 0u)
+            ready.Set()
+            if hookHandle.Value <> IntPtr.Zero then
+                let mutable msg = MSG()
+                let mutable keepGoing = true
+                while keepGoing && GetMessage(&msg, IntPtr.Zero, 0u, 0u) do
+                    if msg.message = WM_QUIT then
+                        keepGoing <- false
+                    else
+                        TranslateMessage(&msg) |> ignore
+                        DispatchMessage(&msg) |> ignore
+        )
+    loopThread.IsBackground <- true
+    loopThread.Start()
+
+    if not (ready.Wait(2000)) then
+        log "- hook thread did not start within 2000ms"
+    elif hookHandle.Value = IntPtr.Zero then
+        log (sprintf "- SetWindowsHookEx(WH_KEYBOARD_LL) failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+    else
+        log "- hook installed successfully"
+        try
+            callCount.Value <- 0
+            keybd_event (VK_F15, 0uy, 0u, UIntPtr.Zero)
+            keybd_event (VK_F15, 0uy, 2u, UIntPtr.Zero) // KEYEVENTF_KEYUP
+            Thread.Sleep(300)
+            log (sprintf "- baseline: hook call count after 1 keypress (no stall) = %d" callCount.Value)
+
+            callCount.Value <- 0
+            shouldStall.Value <- true
+            keybd_event (VK_F15, 0uy, 0u, UIntPtr.Zero)
+            keybd_event (VK_F15, 0uy, 2u, UIntPtr.Zero)
+            Thread.Sleep(2000) // long enough for the ~1150ms stall to finish either way
+            shouldStall.Value <- false
+            log (sprintf "- after a stalling keypress (callback slept ~1150ms, past the 1000ms max): call count during = %d" callCount.Value)
+
+            callCount.Value <- 0
+            keybd_event (VK_F15, 0uy, 0u, UIntPtr.Zero)
+            keybd_event (VK_F15, 0uy, 2u, UIntPtr.Zero)
+            Thread.Sleep(300)
+            let stillActive = callCount.Value > 0
+            log (sprintf "- probe after the stall: hook call count = %d (hook %s silently removed)" callCount.Value (if stillActive then "was NOT" else "WAS"))
+
+            if not stillActive then
+                let rehooked = SetWindowsHookEx(WH_KEYBOARD_LL, callback, IntPtr.Zero, 0u)
+                if rehooked = IntPtr.Zero then
+                    log (sprintf "- re-registration attempt failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+                else
+                    hookHandle.Value <- rehooked
+                    callCount.Value <- 0
+                    keybd_event (VK_F15, 0uy, 0u, UIntPtr.Zero)
+                    keybd_event (VK_F15, 0uy, 2u, UIntPtr.Zero)
+                    Thread.Sleep(300)
+                    log (
+                        sprintf
+                            "- re-registered after removal; hook call count after re-registration = %d (%s)"
+                            callCount.Value
+                            (if callCount.Value > 0 then "RECOVERED the hook" else "did NOT recover (still 0)")
+                    )
+        finally
+            (try UnhookWindowsHookEx(hookHandle.Value) |> ignore with _ -> ())
+            (try PostThreadMessage(loopThreadId.Value, WM_QUIT, IntPtr.Zero, IntPtr.Zero) |> ignore with _ -> ())
+            loopThread.Join(2000) |> ignore
+
+// S15: does a (Pid, ProcessStartTime) key reliably distinguish two sequential child
+// processes, as architecture.md 4.5's Sticky-belief HWND-reuse detection assumes? Doesn't
+// force PID reuse (not controllable from here), just records real values from two real
+// sequential launches.
+let spikeS15_ProcessKeyReuse (exePath: string) =
+    let (p1, hwnd1) = startHangChild exePath
+    if hwnd1 = IntPtr.Zero then
+        log "- failed to obtain first child window handle"
+        killProcessSafely p1
+    else
+        let pid1 = p1.Id
+        let created1 = p1.StartTime
+        log (sprintf "- first child: pid=%d createdUtc=%s" pid1 (created1.ToUniversalTime().ToString("o")))
+        killProcessSafely p1
+        p1.WaitForExit(2000) |> ignore
+
+        let (p2, hwnd2) = startHangChild exePath
+        try
+            if hwnd2 = IntPtr.Zero then
+                log "- failed to obtain second child window handle"
+            else
+                let pid2 = p2.Id
+                let created2 = p2.StartTime
+                log (sprintf "- second child: pid=%d createdUtc=%s" pid2 (created2.ToUniversalTime().ToString("o")))
+                log (
+                    sprintf
+                        "- same pid reused: %b; same (pid,createdUtc) key would collide: %b"
+                        (pid1 = pid2)
+                        (pid1 = pid2 && created1 = created2)
+                )
+        finally
+            killProcessSafely p2
+
+// S16: after a window's message pump stops (hung) and later resumes, does
+// SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG) flip back from hung to responding? F05-F08
+// only tested entering the hung state, never recovering -- this underlies architecture.md
+// 4.5's "Hung -> Respondingへ修正されたら復帰" belief-revision rule.
+let spikeS16_ResponsivenessRecovery (exePath: string) =
+    let SMTO_ABORTIFHUNG = 0x0002u
+    let WM_NULL = 0x0000u
+    let probe (hwnd: IntPtr) (label: string) =
+        let mutable res = IntPtr.Zero
+        let sw = Stopwatch.StartNew()
+        let r = SendMessageTimeout(hwnd, WM_NULL, IntPtr.Zero, IntPtr.Zero, SMTO_ABORTIFHUNG, 2000u, &res)
+        sw.Stop()
+        log (sprintf "- %s: SendMessageTimeout returned=%d elapsedMs=%d (0=hung/timed out, nonzero=responded)" label (int64 r) sw.ElapsedMilliseconds)
+        r
+
+    let (p, hwnd) = startHangChildRecoverable exePath
+    try
+        if hwnd = IntPtr.Zero then
+            log "- failed to obtain recoverable child window handle"
+        else
+            Thread.Sleep(6000) // past the OS's ~5s "not responding" threshold; child resumes pumping at ~7s
+            probe hwnd "while still hung (~6s since last pump)" |> ignore
+            Thread.Sleep(3000) // let the resumed pump actually take effect
+            let r2 = probe hwnd "after the child resumed pumping (~9s)"
+            log (sprintf "- recovered to responding: %b" (r2 <> IntPtr.Zero))
+    finally
+        killProcessSafely p
+
+// S17: does PostMessage(WM_CLOSE) behave as a non-blocking "polite" request a window can
+// simply refuse (never calling DestroyWindow), and still work normally against a window that
+// honors it? Underlies architecture.md 7.1's new RequestClose Effect (R6-2): a refusable
+// request, not a forceful termination.
+type private RefusingCloseForm() as this =
+    inherit Form()
+    let mutable closeAttempts = 0
+    do
+        this.Text <- "S17_Refuses"
+        this.StartPosition <- FormStartPosition.Manual
+        this.Bounds <- Rectangle(50, 50, 200, 150)
+    member _.CloseAttempts = closeAttempts
+    override this.WndProc(m: Message byref) =
+        let WM_CLOSE = 0x0010
+        if m.Msg = WM_CLOSE then
+            closeAttempts <- closeAttempts + 1
+        // Deliberately do not call base.WndProc for WM_CLOSE: never destroys the window,
+        // simulating an app that shows a blocking "save changes?" dialog.
+        else
+            base.WndProc(&m)
+
+let spikeS17_RequestClose () =
+    let WM_CLOSE = 0x0010u
+
+    use refusing = new RefusingCloseForm()
+    refusing.Show()
+    pump 5
+    let sw = Stopwatch.StartNew()
+    let posted = PostMessage(refusing.Handle, WM_CLOSE, IntPtr.Zero, IntPtr.Zero)
+    sw.Stop()
+    log (sprintf "- PostMessage(WM_CLOSE) to a refusing window: posted=%b, call itself took %dms (non-blocking)" posted sw.ElapsedMilliseconds)
+    pump 10
+    Thread.Sleep(200)
+    pump 5
+    log (
+        sprintf
+            "- refusing window still alive after WM_CLOSE: %b (its WndProc saw %d WM_CLOSE message(s))"
+            (IsWindow(refusing.Handle))
+            refusing.CloseAttempts
+    )
+
+    use obedient = new Form(Text = "S17_Obeys", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(300, 50, 200, 150))
+    obedient.Show()
+    pump 5
+    let hwndObedient = obedient.Handle
+    PostMessage(hwndObedient, WM_CLOSE, IntPtr.Zero, IntPtr.Zero) |> ignore
+    pump 10
+    Thread.Sleep(200)
+    pump 5
+    log (sprintf "- normal window closed after WM_CLOSE: %b" (not (IsWindow(hwndObedient))))
+
+// S18 (single-monitor subset only -- this runner has exactly one monitor, so this exercises
+// only the rect/monitor CAPTURE mechanism at WM_EXITSIZEMOVE, not an actual cross-monitor
+// transfer; that half of architecture.md R4-7's MoveSizeEnded payload design remains
+// unverified and needs real multi-monitor hardware, see S11/S11r). To avoid the risk this
+// harness already hit once with synthetic input (the Alt-key WM_ENTERMENULOOP hang in S4's
+// history above), this does NOT drive a real OS title-bar drag via synthetic mouse input
+// (which enters DefWindowProc's internal modal move loop and could hang the message pump the
+// same way) -- it posts WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE directly and moves the window with
+// SetWindowPos in between, testing only whether the capture code reads the right values when
+// those messages arrive, not whether a real drag reliably produces them.
+type private MoveCaptureForm() as this =
+    inherit Form()
+    let mutable capturedRect: RECT option = None
+    let mutable capturedMonitor = IntPtr.Zero
+    do
+        this.Text <- "S18"
+        this.StartPosition <- FormStartPosition.Manual
+        this.Bounds <- Rectangle(100, 100, 300, 200)
+    member _.CapturedRect = capturedRect
+    member _.CapturedMonitor = capturedMonitor
+    override this.WndProc(m: Message byref) =
+        let WM_EXITSIZEMOVE = 0x0232
+        if m.Msg = WM_EXITSIZEMOVE then
+            let mutable r = RECT()
+            GetWindowRect(this.Handle, &r) |> ignore
+            capturedRect <- Some r
+            capturedMonitor <- MonitorFromWindow(this.Handle, 2u (* MONITOR_DEFAULTTONEAREST *))
+        base.WndProc(&m)
+
+let spikeS18_MoveSizeCapture () =
+    let WM_ENTERSIZEMOVE = 0x0231u
+    let WM_EXITSIZEMOVE = 0x0232u
+    let SWP_NOZORDER = 0x0004u
+
+    use form = new MoveCaptureForm()
+    form.Show()
+    pump 5
+
+    SendMessage(form.Handle, WM_ENTERSIZEMOVE, IntPtr.Zero, IntPtr.Zero) |> ignore
+    pump 2
+    let targetX, targetY = 400, 250
+    SetWindowPos(form.Handle, IntPtr.Zero, targetX, targetY, 300, 200, SWP_NOZORDER) |> ignore
+    pump 2
+    SendMessage(form.Handle, WM_EXITSIZEMOVE, IntPtr.Zero, IntPtr.Zero) |> ignore
+    pump 3
+
+    match form.CapturedRect with
+    | None -> log "- WM_EXITSIZEMOVE handler never captured a rect"
+    | Some r ->
+        log (
+            sprintf
+                "- captured rect at WM_EXITSIZEMOVE=(%d,%d,%d,%d), expected top-left=(%d,%d); monitor handle=%d"
+                r.Left r.Top r.Right r.Bottom targetX targetY (int64 form.CapturedMonitor)
+        )
+        log (sprintf "- captured rect matches the position moved to: %b" (r.Left = targetX && r.Top = targetY))
+
+// S19 (cheap, low priority -- does NOT resolve the real multi-DPI question, which needs real
+// hardware, see S11/S11r). Confirms the DPI-awareness-context query path itself works on this
+// runner and returns distinguishable values across a couple of windows.
+let private dpiAwarenessContextLabel (ctx: IntPtr) =
+    match ctx.ToInt64() with
+    | -1L -> "UNAWARE"
+    | -2L -> "SYSTEM_AWARE"
+    | -3L -> "PER_MONITOR_AWARE (v1)"
+    | -4L -> "PER_MONITOR_AWARE_V2"
+    | -5L -> "UNAWARE_GDISCALED"
+    | v -> sprintf "unknown(0x%x)" v
+
+let spikeS19_DpiAwarenessQuery (exePath: string) =
+    use form = new Form(Text = "S19", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(100, 100, 200, 150))
+    form.Show()
+    pump 5
+    log (sprintf "- own WinForms window: DPI_AWARENESS_CONTEXT=%s" (dpiAwarenessContextLabel (GetWindowDpiAwarenessContext(form.Handle))))
+
+    let (p, hwndChild) = startHangChild exePath
+    try
+        if hwndChild = IntPtr.Zero then
+            log "- failed to obtain child window handle"
+        else
+            log (
+                sprintf
+                    "- spawned child WinForms window: DPI_AWARENESS_CONTEXT=%s"
+                    (dpiAwarenessContextLabel (GetWindowDpiAwarenessContext(hwndChild)))
+            )
+    finally
+        killProcessSafely p
+
+    try
+        let np = Process.Start("notepad.exe")
+        Thread.Sleep(1500)
+        np.Refresh()
+        if np.MainWindowHandle <> IntPtr.Zero then
+            log (
+                sprintf
+                    "- notepad.exe: DPI_AWARENESS_CONTEXT=%s"
+                    (dpiAwarenessContextLabel (GetWindowDpiAwarenessContext(np.MainWindowHandle)))
+            )
+        killProcessSafely np
+    with ex ->
+        log (sprintf "- notepad.exe: ERROR %s" ex.Message)
+    log "- NOTE: this only confirms the query path works; it does NOT test real cross-monitor WM_DPICHANGED behavior (needs real multi-DPI hardware, see S11/S11r)"
+
 [<STAThread>]
 [<EntryPoint>]
 let main argv =
@@ -977,6 +1457,9 @@ let main argv =
         0
     elif argv.Length > 0 && argv.[0] = "--hang-child-maximized" then
         runHangChild true
+        0
+    elif argv.Length > 0 && argv.[0] = "--hang-child-recoverable" then
+        runHangChildRecoverable ()
         0
     elif argv.Length > 0 && argv.[0] = "--s7r-only" then
         // Re-run just S7r (no Explorer kill, no focus stealing) after the user has
@@ -1015,6 +1498,14 @@ let main argv =
         tryRun "S5r 実際のUWPアプリ判定(実デスクトップ限定)" spikeS5r_RealUwp
         tryRun "S7r 昇格ウィンドウの非対称性(実デスクトップ限定)" spikeS7r_ElevationAsymmetry
         tryRun "S11r 複数モニタのDPI検出(実デスクトップ限定)" spikeS11r_MonitorDpi
+        tryRun "S13 ObservedPresenceの方式非依存性(4.5)" spikeS13_ObservedPresence
+        tryRun "S13b Cloak理由ビットの一データ点(owner-minimize、21章/R3-8の部分検証)" spikeS13b_CloakReasonBits
+        tryRun "S14 WH_KEYBOARD_LLの無言脱落と再登録(8.1)" spikeS14_LowLevelHookTimeout
+        tryRun "S15 ProcessKeyによるHWND再利用検知(4.5 Sticky)" (fun () -> spikeS15_ProcessKeyReuse exePath)
+        tryRun "S16 Hung→Responding復帰(4.5 Responsiveness)" (fun () -> spikeS16_ResponsivenessRecovery exePath)
+        tryRun "S17 RequestClose/WM_CLOSEの丁寧な拒否(7.1 R6-2)" spikeS17_RequestClose
+        tryRun "S18 MoveSizeEnded矩形/モニタ捕捉(単一モニタのみ、R4-7)" spikeS18_MoveSizeCapture
+        tryRun "S19 DpiAwareness問い合わせの健全性確認(低優先、実多DPI問題は未解決)" (fun () -> spikeS19_DpiAwarenessQuery exePath)
 
         log "\n(all spikes finished without the watchdog firing)"
         0
