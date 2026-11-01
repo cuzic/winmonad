@@ -1,6 +1,6 @@
 # Windows プログラマブル・ウィンドウマネージャー 統合設計書
 
-Version: 2.4.1（Result型によるエラー耐性設計を追加し、Opus批判的レビューの第2ラウンド収束確認で見つかった実装レベルの不整合を修正。Phase 0実現性リサーチ[feasibility.md]＋GitHub Actions windows-latestでのPhase 0実機検証[failure-catalog.md]の結果を反映）
+Version: 2.4.2（Result型によるエラー耐性設計を追加し、Opus批判的レビューの第2ラウンド収束確認で見つかった実装レベルの不整合を修正。ADR-014の2つの未実測仮定（ハング事前確認のタイムアウト値、RestoreBeforeMoveのShowWindowAsync化）をGitHub Actions windows-latest実機検証で裏付け。Phase 0実現性リサーチ[feasibility.md]＋Phase 0実機検証[failure-catalog.md]の結果を反映）
 Date: 2026-11-01
 Status: 基本アーキテクチャ決定／個別APIと性能値はPoCで検証／中核状態モデルとPhase順序を本版で見直し／Win32 API挙動の一部をdocs/feasibility.mdの調査結果で具体化／ADR-012・6.2のハング耐性方針はdocs/failure-catalog.mdで実機実証済み／例外・Result・EffectFailure・PlanValidator・PolicyArtifactのエラー表現をADR-014で整理
 Implementation language: F# / .NET
@@ -519,7 +519,7 @@ module GatedEffect =
 ### 7.1 Reducer
 type Effect =
     | SetRect of RequestId * WindowId * PixelRect
-    | RestoreBeforeMove of RequestId * WindowId // v2.4でShowWindowAsync(SW_RESTORE)相当に確定（ADR-014/R2-4対応）。同期版ShowWindowはハング窓でブロックするため使わない
+    | RestoreBeforeMove of RequestId * WindowId // v2.4でShowWindowAsync(SW_RESTORE)相当に確定（ADR-014/R2-4対応）。同期版ShowWindowはハング窓でブロックするため使わない。GitHub Actions windows-latest実機検証で実証済み：最大化状態のまま応答停止した窓への同期ShowWindow(SW_RESTORE)は4000ms超ブロックし、ShowWindowAsyncは0msで返った（failure-catalog.md F13）
     | ApplyBatch of BatchId * Effect list // v2.4でRequestId→BatchIdに変更（ADR-014/1-5対応）。子Effectは自分のRequestIdを保ち、結果は窓ごとに返る
     | RequestForeground of RequestId * WindowId
     | ObserveWindow of WindowId
@@ -581,7 +581,7 @@ EventEnvelopeにはReducerへ投入したSequence、論理/単調時刻、入力
 
 **実行スレッドモデルと耐ハング性（v2.1で追加、ADR-012対応、E-1対応／v2.2でfeasibility.md §5により補強／v2.3でGitHub Actions windows-latest実機検証により実証：failure-catalog.md F05-F08。メッセージポンプを止めた窓への`SetWindowPos`は`SWP_ASYNCWINDOWPOS`なしで4000ms超ブロックし、付きでは0msで返った。`IsHungAppWindow`は6秒後に正しく`true`を返し、`SendMessageTimeout(SMTO_ABORTIFHUNG)`はハング窓に対し即時[0ms]に中断した／v2.4でADR-014により実測値に厳密に整合させた）**：`SetWindowPos`等は対象窓を所有するスレッドへメッセージを送るため、対象アプリがハングしていると呼び出し側がブロックされる（公式ドキュメントに「`SetWindowPos`が内部で同期送信する」という直接の一文はないが、`SWP_ASYNCWINDOWPOS`フラグの説明「異なる入力キューに属する場合は要求をポストしブロックしない」が既定動作でのブロックを前提にしており、これを根拠とする）。Effect適用（Windows Shell側の実装）はWinEventコールバックや安全停止の制御経路（8.4）と同じスレッドで行わない。専用のEffect適用スレッドを設け、既定で各`SetWindowPos`に`SWP_ASYNCWINDOWPOS`を付ける（6.2参照）。
 
-**ハング事前確認は毎回行うが、タイムアウト値はレイテンシ予算から決める（v2.4で確定、ラウンド2レビューR2-1/R2-2対応で修正）**：`SWP_ASYNCWINDOWPOS`が既定である以上、`SetRect`の呼出自体はハング窓に対しても即時に返る（F08/F10実証）ため、**「タイムアウトした」という事象はSetRectからは発生しない**。代わりにShellは`SetRect`を発行する**前**に毎回`SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG, timeoutMs)`で対象を事前確認する。F06が実証したのは「OSが既にハング判定済み（メッセージポンプ停止から5秒以上）の窓」への即時中断（0ms）だけであり、**判定前（停止から5秒未満）の窓は指定したタイムアウトの満了まで待つ**。「毎回確認してもコスト無視できる」はハング判定済みの窓にしか成り立たないため、`timeoutMs`は2.2のレイテンシ予算から逆算した小さい値（既定50ms）に固定する。戻り値が0で`ElapsedUs`が`timeoutMs`に近ければ「判定前」（`classify`で`Transient`、次の操作列でRetryに任せる）、`ElapsedUs`が0に近ければ「判定済み」（`TargetHung`）と区別する。`classify`の対応表（8.1）は`(Api, Space, Code)`の3つ組をキーにし、`(SendMessageTimeout, Win32LastError, 1460/* ERROR_TIMEOUT */)`を`TargetHung`または`ElapsedUs`に応じて`Transient`に分類する初期エントリを持つ。事前確認はバッチ内の窓ごとに並列に行い、1窓の確認待ちが他の生きている窓の`SetRect`発行を遅らせないこと（15.1 #13の具体例）。事前確認後にハングし始めたウィンドウ（TOCTOU）は、1回のRetryを経て次回の事前確認で`TargetHung`に収束することを許容する（7.2に注記）。`IsHungAppWindow`は公式ドキュメントが「一般利用を意図していない。将来のWindowsバージョンで変更・廃止される可能性がある」と明記しているため、補助的な事前チェックとしてのみ使い、主たるハング検知手段にはしない。
+**ハング事前確認は毎回行うが、タイムアウト値はレイテンシ予算から決める（v2.4で確定、ラウンド2レビューR2-1/R2-2対応で修正／実機検証でタイムアウト値を確定：failure-catalog.md F12）**：`SWP_ASYNCWINDOWPOS`が既定である以上、`SetRect`の呼出自体はハング窓に対しても即時に返る（F08/F10実証）ため、**「タイムアウトした」という事象はSetRectからは発生しない**。代わりにShellは`SetRect`を発行する**前**に毎回`SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG, timeoutMs)`で対象を事前確認する。F06が実証したのは「OSが既にハング判定済み（メッセージポンプ停止から5秒以上）の窓」への即時中断（0ms）だけであり、**判定前（停止から5秒未満）の窓は指定したタイムアウトの満了まで待つ**。GitHub Actions windows-latest実機検証（F12）で、ハング判定前の窓は`timeoutMs`に10/50/100/500msを指定したいずれでも実測`ElapsedUs`がほぼ要求値どおり（9/57/99/499ms）だったのに対し、判定後の窓は全て`0ms`で返った。「毎回確認してもコスト無視できる」はハング判定済みの窓にしか成り立たないため、`timeoutMs`は**10ms**に確定する（2.2のレイテンシ予算「数十ms台」に対し、判定前の窓1つあたりの最悪コストを10msに抑えられる。応答が遅いだけで実際にはハングしていない窓は、10msで打ち切られても`Transient`としてRetryに回るだけであり、誤ってSuspendされるわけではないので安全側に働く）。戻り値が0で`ElapsedUs`が`timeoutMs`（10ms）に近ければ「判定前」（`classify`で`Transient`、次の操作列でRetryに任せる）、`ElapsedUs`が0に近ければ「判定済み」（`TargetHung`）と区別する。`classify`の対応表（8.1）は`(Api, Space, Code)`の3つ組をキーにし、`(SendMessageTimeout, Win32LastError, 1460/* ERROR_TIMEOUT */)`を`TargetHung`または`ElapsedUs`に応じて`Transient`に分類する初期エントリを持つ。事前確認はバッチ内の窓ごとに並列に行い、1窓の確認待ちが他の生きている窓の`SetRect`発行を遅らせないこと（15.1 #13の具体例）。事前確認後にハングし始めたウィンドウ（TOCTOU）は、1回のRetryを経て次回の事前確認で`TargetHung`に収束することを許容する（7.2に注記）。`IsHungAppWindow`は公式ドキュメントが「一般利用を意図していない。将来のWindowsバージョンで変更・廃止される可能性がある」と明記しているため、補助的な事前チェックとしてのみ使い、主たるハング検知手段にはしない。
 
 **Shell/Simulationで同じ手順を共有する（v2.4で追加、R2-3対応）**：「事前確認→ASYNC呼出」という手順そのものをContractsの純粋関数として書き、Windows版とSimulation版は確認手段（`probe`）だけを差し替える。
 ```fsharp
@@ -688,7 +688,7 @@ module Native = // Wm.Windows内部（internal）。外部から呼べるのはG
         if hr >= 0 then Ok () else Error { Api = api; Space = HResult; Code = hr; ElapsedUs = us }
 ```
 
-`SetWindowPos`/`RegisterHotKey`/`SendMessageTimeout`は`callBool`、`DwmGetWindowAttribute`は`callHr`、`SetForegroundWindow`/`ShowWindowAsync`は`callBoolNoCode`を使う。`RestoreBeforeMove`（7.1）の実装は`ShowWindowAsync(SW_RESTORE)`に固定する（`ShowWindow`の戻り値は「以前に可視だったか」であり成否ではないため、同期版を`callBool`に通すと誤判定する。v2.4追加、R2-4対応）。Wm.Windows内の全P/Invoke呼出しはこの3関数のいずれかを経由し、生のBOOL/HRESULTをCore/Policy/Layoutsへ流さない。
+`SetWindowPos`/`RegisterHotKey`/`SendMessageTimeout`は`callBool`、`DwmGetWindowAttribute`は`callHr`、`SetForegroundWindow`/`ShowWindowAsync`は`callBoolNoCode`を使う。`RestoreBeforeMove`（7.1）の実装は`ShowWindowAsync(SW_RESTORE)`に固定する（`ShowWindow`の戻り値は「以前に可視だったか」であり成否ではないため、同期版を`callBool`に通すと誤判定する。v2.4追加、R2-4対応。実機検証でも同期版はハング窓で4000ms超ブロックし`ShowWindowAsync`は0msで返ることを確認済み、failure-catalog.md F13）。Wm.Windows内の全P/Invoke呼出しはこの3関数のいずれかを経由し、生のBOOL/HRESULTをCore/Policy/Layoutsへ流さない。
 
 `classify`（7.1）の対応表は、**`(Api, Space, Code)`の3つ組をキー**にする（v2.4で訂正、R2-1対応。Codeだけで分岐すると、`SetWindowPos`が偶然返した`1460`まで`TargetHung`になってしまう）。Phase 0の失敗カタログ（18章）で埋める。実測・文献から判明している初期エントリの例：
 

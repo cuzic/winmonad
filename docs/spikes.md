@@ -25,8 +25,8 @@ Phase 0は「要素技術の確認」ではなく、**捨てる前提の素朴�
 - **記録する内容**: アプリ×DPIごとの差分値（px）。差分がDPIに比例するか、アプリ固有の値か。初回表示直後の未確定値が実際に観測されるか。
 - **判定**: 差分がDPIから計算可能な定数なら「Bで対処」（Shellで補正、komorebiパターンを踏襲）。アプリ依存で予測できないなら「型に反映」（`WindowSnapshot`に補正済み/未補正の両方を持つ必要がある等）。
 
-### S2. ハング検知とEffect適用のタイムアウト（ADR-012, E-1対応）【CI実機検証済み：failure-catalog.md F05-F08】
-**結果**：`SetWindowPos`は`SWP_ASYNCWINDOWPOS`なしでハング窓に対し4000ms超ブロック、付きでは0msで返った。`IsHungAppWindow`は6秒後に正しく`true`。`SendMessageTimeout(SMTO_ABORTIFHUNG)`は即時(0ms)に中断。ADR-012の前提が実機で実証された。
+### S2. ハング検知とEffect適用のタイムアウト（ADR-012, E-1対応）【CI実機検証済み：failure-catalog.md F05-F08, F12, F13】
+**結果**：`SetWindowPos`は`SWP_ASYNCWINDOWPOS`なしでハング窓に対し4000ms超ブロック、付きでは0msで返った。`IsHungAppWindow`は6秒後に正しく`true`。`SendMessageTimeout(SMTO_ABORTIFHUNG)`は即時(0ms)に中断。ADR-012の前提が実機で実証された。**追加検証（S2b/S2c）**：ハング判定前（~1s）の窓への`SendMessageTimeout`は要求タイムアウト（10/50/100/500ms）をほぼそのまま待ち、判定後（~6s）は全て0msで返った→事前確認のタイムアウト値を**10ms**に確定（F12）。`RestoreBeforeMove`用の`ShowWindowAsync(SW_RESTORE)`も、最大化状態のハング窓で同期版が4000ms超ブロックし非同期版が0msで返ることを実証（F13）。
 - **検証する前提**: 応答しないウィンドウへ`SetWindowPos`相当の呼出を行うと呼び出し側がブロックされるか、`SWP_ASYNCWINDOWPOS`で回避できるか、`SendMessageTimeout`/`IsHungAppWindow`で事前・事後に検知できるか。既存WM（komorebi/GlazeWM）は明示的なハング検知コードを持たず`SWP_ASYNCWINDOWPOS`のみで対処しているため、それだけで十分か確認する（feasibility.md §5・§10）。
 - **方法**: `ThrowawayWm`からテスト用プロセスを起動し、メッセージループを意図的に止めてハング状態を作る（例：`Sleep`や同期待ちをUIスレッドで実行するテストハーネス）。その状態へ(a)`SWP_ASYNCWINDOWPOS`無しの`SetWindowPos`、(b)`SWP_ASYNCWINDOWPOS`付きの`SetWindowPos`をそれぞれ直接呼び、ブロック時間を比較する。次に`SendMessageTimeout(SMTO_ABORTIFHUNG, ...)`や`IsHungAppWindow`を事前に使った場合の予測精度（誤判定の有無）を確認する。`IsHungAppWindow`は公式に「一般利用を意図していない」と警告されているため、主たる検知手段にできるかも併せて判断する。
 - **対象**: 自作のテストハーネス（本物のアプリのハングを安全に再現するのは難しいため、まずは自作で確認し、可能なら「応答なし」になりやすい実アプリ（大きいファイルを開いた直後のOffice等）でも軽く試す）。

@@ -1,8 +1,8 @@
 # Failure Catalog（Phase 0 実機検証）
 
-対象: [spikes.md](./spikes.md) のS1〜S11のうち、GitHub Actions `windows-latest` ランナー上でCI実機検証できたS1, S2, S3, S4, S5, S6, S9。
+対象: [spikes.md](./spikes.md) のS1〜S11のうち、GitHub Actions `windows-latest` ランナー上でCI実機検証できたS1, S2, S2b, S2c, S3, S4, S5, S6, S9。S2b/S2cはADR-014（Result型によるエラー耐性設計）のレビュー収束後に、テキストでの推測（事前確認タイムアウト値「50ms」、`RestoreBeforeMove`の`ShowWindowAsync`化）を実機データに置き換えるために追加した。
 検証に使ったコード: [spikes/Phase0CiSpikes](../spikes/Phase0CiSpikes)（捨てる前提の検証ハーネス。Phase A以降のCoreへは持ち込まない）。
-実行結果: [GitHub Actions run #41275322319](https://github.com/cuzic/winmonad/actions/runs/41275322319)（1分24秒で全7スパイク完了、2026-11-01T05:02-05:03 UTC）。
+実行結果: [run #41275322319](https://github.com/cuzic/winmonad/actions/runs/41275322319)（S1〜S9、1分24秒）、[run #41285111988](https://github.com/cuzic/winmonad/actions/runs/41285111988)（S2b/S2c含む全9スパイク、1分43秒、2026-11-01T07:32 UTC）。
 
 環境: `Microsoft Windows NT 10.0.26100.0`（64bit）、画面 1024x768（CI仮想ディスプレイ）。
 
@@ -21,6 +21,8 @@
 | F09 | S6 | `BeginDeferWindowPos`/`DeferWindowPos`/`EndDeferWindowPos`でハング窓を含む3窓を一括適用すると、4000msの計測上限を超えてもリターンしなかった | 型に反映（確定・DeferWindowPos不採用の判断を実証） | 6.2 レイアウト切替の一括適用 |
 | F10 | S6 | 同条件（ハング窓1つ＋正常窓2つ）を個別`SetWindowPos`+`SWP_ASYNCWINDOWPOS`で適用すると、3窓すべて1ms以内にリターンした（ハング窓自身への呼出も含めて） | Bで対処（確定・6.2の既定方針を実証） | 6.2 レイアウト切替の一括適用 |
 | F11 | S3 | `Alt+J`/`Alt+Shift+Return`/`Alt+Shift+1`は`RegisterHotKey`で確保できた。`Win+Return`/`Win+1`/`Win+L`は全て`GetLastError=1409`（`ERROR_HOTKEY_ALREADY_REGISTERED`）で失敗した | 型に反映（確定） | 8.1 ホットキー登録の実現性 |
+| F12 | S2b | `SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG, timeoutMs)`を、OSがまだハング判定していない窓（停止後~1秒）に対し10/50/100/500msの各タイムアウトで呼ぶと、実測`elapsedMs`は要求値とほぼ一致した（9/57/99/499ms）。同じ窓がOSにハング判定された後（停止後~6秒）は、同じ4つのタイムアウト値すべてで`elapsedMs=0`だった。「ハング判定前は要求タイムアウトをほぼそのまま待ち、判定後は即時に返る」という挙動を実測で確定した | 型に反映（確定。タイムアウト値を10msに決定） | 7.1 ハング事前確認のタイムアウト値 |
+| F13 | S2c | 最大化状態のまま応答停止した窓に対し、`ShowWindow(SW_RESTORE)`（同期）は4000msの計測上限を超えてもリターンせず、`ShowWindowAsync(SW_RESTORE)`は0msで即時リターンした。`SetWindowPos`+`SWP_ASYNCWINDOWPOS`（F07/F08）と同じ非同期/同期の差がここでも実証された。なお最初の試行では子窓を最大化しておらず両方0msという無意味な結果になった（`SW_RESTORE`が実質no-opだったため）ため、子窓を最大化してから再実行して確認した | 型に反映（確定。`RestoreBeforeMove`=`ShowWindowAsync`を実証） | 7.1/8.1 RestoreBeforeMove |
 
 ## F04（S4）の限界：実証したことと、まだ実証していないこと
 
@@ -36,3 +38,4 @@ S4で「他プロセスが直前にフォアグラウンドだった状態から
 - `Process.StandardOutput.ReadLine()`を無期限に待つと、子プロセス側で何らかの理由（ウィンドウステーション制約、クラッシュダイアログ等）が起きた場合に親プロセス側が無期限に止まる。タイムアウト付きの読み取りに変更した。
 - `keybd_event`でAltキー（`VK_MENU`）を送出すると、Windowsのメニューモード処理に入り`Application.DoEvents()`が戻らなくなることがある。komorebi/GlazeWMが`SendInput`で**マウス**イベントを使っている理由はまさにこれを避けるためだと、実機で初めて実感を伴って理解できた。
 - どちらの地雷も、6.2/7.1に書いた「ハング耐性」の設計方針そのものと同じ種類の問題（同期呼び出しが想定外に長時間ブロックする）であり、本プロジェクトが目指す「不確実性を観測・診断可能にする」という設計思想がテストハーネス自身にも適用できることを示している。
+- S2cの初回実行では、子窓を最大化せずに`SW_RESTORE`を送ったため、同期/非同期の両方が0msで返り「差が無い」という誤った結論になりかけた。実際には`SW_RESTORE`が状態を変えない操作（既に通常状態の窓への復元）であり、ターゲットスレッドと通信する必要が最初から無かっただけだった。**「ブロックしないこと」を実証するには、本当にブロックしうる状態変化を伴う操作で試す必要がある**という、スパイク設計そのものの教訓。
