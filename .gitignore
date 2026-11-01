@@ -3,3 +3,4 @@ obj/
 *.user
 .vs/
 phase0-ci-results.md
+.claude/
