@@ -1,11 +1,14 @@
 // Phase 0 feasibility spikes that CAN be verified on a GitHub Actions
 // windows-latest runner without a real interactive desktop session.
 // See /docs/spikes.md for the full spike plan this implements a subset of
-// (S1, S2, S2b, S2c, S3, S4, S5, S6, S9). S2b/S2c were added to ground two
-// ADR-014 assumptions (the 50ms hang pre-check timeout, and
+// (S1, S2, S2b, S2c, S3, S4, S5, S6, S7, S9, S10). S2b/S2c were added to
+// ground two ADR-014 assumptions (the 50ms hang pre-check timeout, and
 // RestoreBeforeMove's ShowWindowAsync choice) in a real CI run instead of
-// a textual guess. Results are printed to stdout AND written to
-// phase0-ci-results.md for the "Upload results artifact" workflow step.
+// a textual guess. S7/S10 probe this runner's own privilege/shell
+// environment (process integrity level; whether explorer.exe exists and
+// auto-restarts) rather than Win32 call semantics. Results are printed
+// to stdout AND written to phase0-ci-results.md for the "Upload results
+// artifact" workflow step.
 //
 // This is throwaway verification code, not part of the eventual
 // ThrowawayWm (Phase 0 deliverable) or the real Core/Shell (Phase A/B).
@@ -16,6 +19,7 @@ open System.Diagnostics
 open System.Drawing
 open System.IO
 open System.Runtime.InteropServices
+open System.Security.Principal
 open System.Text
 open System.Threading
 open System.Threading.Tasks
@@ -93,6 +97,19 @@ module Native =
 
     [<DllImport("user32.dll")>]
     extern void mouse_event(uint32 dwFlags, int dx, int dy, uint32 dwData, UIntPtr dwExtraInfo)
+
+    // S7: process integrity level (no UAC prompt, no process spawn -- safe to run in CI)
+    [<DllImport("advapi32.dll", SetLastError = true)>]
+    extern bool OpenProcessToken(IntPtr ProcessHandle, uint32 DesiredAccess, IntPtr& TokenHandle)
+
+    [<DllImport("advapi32.dll", SetLastError = true)>]
+    extern bool GetTokenInformation(IntPtr TokenHandle, uint32 TokenInformationClass, byte[] TokenInformation, uint32 TokenInformationLength, uint32& ReturnLength)
+
+    [<DllImport("kernel32.dll")>]
+    extern IntPtr GetCurrentProcess()
+
+    [<DllImport("kernel32.dll")>]
+    extern bool CloseHandle(IntPtr hObject)
 
     [<DllImport("kernel32.dll")>]
     extern uint32 SetErrorMode(uint32 uMode)
@@ -596,6 +613,77 @@ let spikeS6_BatchApply (exePath: string) =
     finally
         killProcessSafely p2
 
+// S7: how does an elevated-vs-non-elevated operation fail? Actually spawning an elevated
+// child (ShellExecute "runas") would pop a UAC consent prompt with nobody to approve it,
+// hanging the job indefinitely -- too risky to attempt in CI. Instead, safely determine
+// this process's own integrity level (no prompt, no process spawn), which tells us whether
+// there is even a privilege asymmetry to observe on this runner, and feeds directly into
+// architecture.md's DenialKind.TargetIntegrityHigher classification (currently deferred,
+// 21章).
+let spikeS7_IntegrityLevel () =
+    try
+        let principal = WindowsPrincipal(WindowsIdentity.GetCurrent())
+        log (sprintf "- current process is in Administrators group: %b" (principal.IsInRole(WindowsBuiltInRole.Administrator)))
+    with ex ->
+        log (sprintf "- WindowsPrincipal check failed: %s" ex.Message)
+
+    let TOKEN_QUERY = 0x0008u
+    let mutable hToken = IntPtr.Zero
+    if not (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) then
+        log (sprintf "- OpenProcessToken failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+    else
+        try
+            let TokenIntegrityLevel = 25u
+            let mutable len = 0u
+            GetTokenInformation(hToken, TokenIntegrityLevel, null, 0u, &len) |> ignore
+            let buf = Array.zeroCreate<byte> (int len)
+            if not (GetTokenInformation(hToken, TokenIntegrityLevel, buf, len, &len)) then
+                log (sprintf "- GetTokenInformation(TokenIntegrityLevel) failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+            else
+                // TOKEN_MANDATORY_LABEL = SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes }.
+                // SID layout: BYTE Revision; BYTE SubAuthorityCount; BYTE IdentifierAuthority[6]; DWORD SubAuthority[n].
+                let pSid = IntPtr(BitConverter.ToInt64(buf, 0))
+                let subAuthorityCount = int (Marshal.ReadByte(pSid, 1))
+                let lastSubAuthority = Marshal.ReadInt32(pSid, 8 + 4 * (subAuthorityCount - 1))
+                let label =
+                    match lastSubAuthority with
+                    | 0x0000 -> "Untrusted"
+                    | 0x1000 -> "Low"
+                    | 0x2000 -> "Medium"
+                    | 0x2100 -> "Medium Plus"
+                    | 0x3000 -> "High"
+                    | 0x4000 -> "System"
+                    | 0x5000 -> "Protected Process"
+                    | v -> sprintf "Unknown(0x%04x)" v
+                log (sprintf "- current process token integrity level: %s (RID=0x%04x)" label lastSubAuthority)
+        finally
+            CloseHandle(hToken) |> ignore
+
+// S10: does windows-latest even run explorer.exe, and if we kill it, does it auto-restart
+// (and how fast)? This is the real-world condition 8.4's TaskbarCreated-based tray icon
+// recovery depends on. The runner is an ephemeral single-use VM, so killing explorer.exe
+// here is safe (nothing else on this machine depends on it surviving past this job).
+let spikeS10_ExplorerRestart () =
+    let before = Process.GetProcessesByName("explorer")
+    log (sprintf "- explorer.exe processes found: %d" before.Length)
+    if before.Length = 0 then
+        log "- no explorer.exe running on this runner; S10's premise (TaskbarCreated-based tray icon recovery) does not apply to this CI environment, needs a real desktop to verify"
+    else
+        let pid = before.[0].Id
+        try
+            before.[0].Kill()
+            log (sprintf "- killed explorer.exe (pid=%d)" pid)
+        with ex ->
+            log (sprintf "- failed to kill explorer.exe (pid=%d): %s" pid ex.Message)
+
+        let sw = Stopwatch.StartNew()
+        let mutable restarted = false
+        while not restarted && sw.ElapsedMilliseconds < 10000L do
+            Thread.Sleep(500)
+            if Process.GetProcessesByName("explorer").Length > 0 then
+                restarted <- true
+        log (sprintf "- explorer.exe auto-restarted within 10s: %b (observed after %dms)" restarted sw.ElapsedMilliseconds)
+
 [<STAThread>]
 [<EntryPoint>]
 let main argv =
@@ -629,6 +717,8 @@ let main argv =
         tryRun "S2b 事前確認のタイムアウト値の実測(ADR-014)" (fun () -> spikeS2b_PreCheckTiming exePath)
         tryRun "S2c RestoreBeforeMoveのShowWindowAsync化(ADR-014/R2-4)" (fun () -> spikeS2c_RestoreAsync exePath)
         tryRun "S6 バッチ適用(DeferWindowPos vs 個別SetWindowPos+ASYNC)" (fun () -> spikeS6_BatchApply exePath)
+        tryRun "S7 プロセスの整合性レベル" spikeS7_IntegrityLevel
+        tryRun "S10 Explorer再起動時のTaskbarCreated前提" spikeS10_ExplorerRestart
 
         log "\n(all spikes finished without the watchdog firing)"
         0
