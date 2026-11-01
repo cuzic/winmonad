@@ -1,6 +1,6 @@
 # Windows プログラマブル・ウィンドウマネージャー 統合設計書
 
-Version: 2.4.4（Result型によるエラー耐性設計を追加し、Opus批判的レビューの第2ラウンド収束確認で見つかった実装レベルの不整合を修正。ADR-014の2つの未実測仮定およびPhase 0未着手項目をGitHub Actions windows-latest実機検証で確認。さらに実デスクトップ（dragonflyg4、clipwire経由）での実機検証で、CIでは構造的に検証不能だった項目（無関係な第三者プロセスからのフォーカス奪取、実際の非昇格セッション、TaskbarCreated復旧のエンドツーエンド動作）を確認。Phase 0実現性リサーチ[feasibility.md]＋Phase 0実機検証[failure-catalog.md]の結果を反映）
+Version: 2.4.5（Result型によるエラー耐性設計を追加し、Opus批判的レビューの第2ラウンド収束確認で見つかった実装レベルの不整合を修正。ADR-014の2つの未実測仮定およびPhase 0未着手項目をGitHub Actions windows-latest実機検証で確認。さらに実デスクトップ（dragonflyg4、clipwire経由）での実機検証で、CIでは構造的に検証不能だった項目（無関係な第三者プロセスからのフォーカス奪取、実際の非昇格セッション、TaskbarCreated復旧のエンドツーエンド動作）を確認。v2.4.5でユーザーがUAC承認して開いた実際の昇格ウィンドウへの操作が`ERROR_ACCESS_DENIED`で失敗することを実機確定（F23）、および`OpenProcess`のアクセス権・`SetWindowPos`のP/Invoke宣言に関する実装上の落とし穴を特定（F24）。Phase 0実現性リサーチ[feasibility.md]＋Phase 0実機検証[failure-catalog.md]の結果を反映）
 Date: 2026-11-01
 Status: 基本アーキテクチャ決定／個別APIと性能値はPoCで検証／中核状態モデルとPhase順序を本版で見直し／Win32 API挙動の一部をdocs/feasibility.mdの調査結果で具体化／ADR-012・6.2のハング耐性方針はdocs/failure-catalog.mdで実機実証済み／例外・Result・EffectFailure・PlanValidator・PolicyArtifactのエラー表現をADR-014で整理
 Implementation language: F# / .NET
@@ -662,7 +662,7 @@ SetRectのネイティブAPI呼び出しが成功しても、目標矩形を観�
 
 **P/Invoke呼出しの変換点（v2.4で追加、ADR-014/4-1対応）**：生のWin32 API（`[<DllImport(..., SetLastError = true)>]`で宣言したもの）は失敗しても例外を投げず、呼出し規約ごとに戻り値で知らせる。規約ごとに変換点を分け、いずれも7.1の`NativeCallRecord`を作る。
 
-**前提条件（v2.4で追加、R2-23対応）**：以下の3関数が成り立つのは、対象のDllImportが全て`SetLastError = true`で宣言されている場合のみである。戻り値の`0`/`false`が正当な結果になり得るAPI（例：`GetWindowTextLength`）では、呼出前に`Marshal.SetLastPInvokeError(0)`でクリアしてから呼ぶ専用ラッパーを使う。
+**前提条件（v2.4で追加、R2-23対応／v2.4.5で実機バグとして実証：failure-catalog.md F24）**：以下の3関数が成り立つのは、対象のDllImportが全て`SetLastError = true`で宣言されている場合のみである。戻り値の`0`/`false`が正当な結果になり得るAPI（例：`GetWindowTextLength`）では、呼出前に`Marshal.SetLastPInvokeError(0)`でクリアしてから呼ぶ専用ラッパーを使う。**これは理論上の注意点ではなく実際に踏んだ罠である**：Phase 0スパイクハーネスで`SetWindowPos`のDllImport宣言に`SetLastError = true`を付け忘れた結果、昇格窓への呼出が`returned=false`なのに`GetLastError()`が`0`を返す（＝クリアされていない古い値を読んでいる）という偽の挙動を実機で観測した。属性を追加した直後に`GetLastError=5`という正しい値が得られたことで、この前提条件が単なる注記では済まない実害のある落とし穴だと確認された。レビュー・実装時は全DllImport宣言に`SetLastError = true`の有無を機械的にチェックすること。なお、同一ユーザーの上位整合性レベルプロセスを`OpenProcess`で照会する場合は`PROCESS_QUERY_INFORMATION`では拒否されるため`PROCESS_QUERY_LIMITED_INFORMATION`を使うこと（同じくF24で実証。Task Managerが非昇格のまま昇格プロセス情報を読めるのと同じ権限）。
 
 ```fsharp
 module Native = // Wm.Windows内部（internal）。外部から呼べるのはGatedEffectを受け取るShellと8.4の限定APIのみ（R2-6対応）
@@ -697,7 +697,7 @@ module Native = // Wm.Windows内部（internal）。外部から呼べるのはG
 | `(SetWindowPos, Win32LastError, 1400)`（ERROR_INVALID_WINDOW_HANDLE） | `TargetGone` |
 | `(SendMessageTimeout, Win32LastError, 1460)`（ERROR_TIMEOUT）、`ElapsedUs`が`timeoutMs`に近い | `Transient`（ハング判定前。v2.4追加、R2-1/R2-2対応） |
 | `(SendMessageTimeout, Win32LastError, 1460)`、`ElapsedUs`が0に近い | `TargetHung`（既にハング判定済み。v2.4追加、R2-1対応） |
-| `(SetWindowPos, Win32LastError, 5)`（ERROR_ACCESS_DENIED。昇格窓等） | `Denied OtherDenial`（`TargetIntegrityHigher`はPhase 0で対象プロセスの整合性レベル取得手段が決まるまで保留する。v2.4追加、R2-18対応） |
+| `(SetWindowPos, Win32LastError, 5)`（ERROR_ACCESS_DENIED。昇格窓等） | `Denied OtherDenial`（実デスクトップ`dragonflyg4`でMedium→High昇格窓への`SetWindowPos`が実際に`returned=false, GetLastError=5`で失敗することを実機確認済み：failure-catalog.md F23。`TargetIntegrityHigher`という専用ケースを増設するかは、対象プロセスの整合性レベル取得手段の設計と合わせてPhase Aで判断する。v2.4追加、R2-18対応／v2.4.5でF23により実測確定） |
 | `(RegisterHotKey, Win32LastError, 1409)`（ERROR_HOTKEY_ALREADY_REGISTERED。failure-catalog.md F11） | ※`RegisterHotKey`はEffectではなく起動時の登録。`EffectFailure`には含めない（1-8注記） |
 | `(SetForegroundWindow, BoolFalseNoCode, 0)` | `Denied ForegroundDenied` |
 | 上記以外 | `Unclassified` |
@@ -1216,7 +1216,7 @@ Tests/ConstrainedWindowScenario.fs
 | ワークスペースの実装方式（v2.1追加） | 窓を隠す/画面外へ移動/最小化のいずれか、クラッシュ時の復元容易性 | Phase A |
 | ofDto用の`Result.traverse`/最小`result`ビルダー導入（v2.4追加、ADR-014/3-2対応） | `PolicyIR.ofDto`等が3段以上の`match Ok/Error`ネストを要した最初の時点で、Contractsに自作（20行未満、外部依存なし）を追加する。発動条件は「必要になってから」で、事前に作らない | ofDtoを書く時点（Phase A） |
 | ReplClientでの`taskResult`（または同等のCE）許可（v2.4追加、ADR-014/3-3対応） | 10.3の`task { }`は複数手順を連ねる際にResultとのネストが生まれる。Core/Policy/Layoutsは外部依存なしを維持するが、Wm.ReplClientは3.1の決定性制約の外にあるため、利便性優先で外部パッケージ（FsToolkit.ErrorHandling等）か自作`taskResult`の導入を許す | Phase C |
-| `DenialKind.TargetIntegrityHigher`の生成手段（v2.4追加、ラウンド2レビューR2-18対応／GitHub Actions実機検証で判明：failure-catalog.md F14／実デスクトップ`dragonflyg4`実機検証で前提を確認：F17/F18） | 対象プロセスの整合性レベルをShellがどう取得するか（トークン比較等）、`NativeCallRecord`への`TargetIntegrity`フィールド追加の是非。CI実機検証では、ランナー自身のプロセスが既にHigh整合性レベルで動いており非対称性を観測できなかった（F14）が、**実デスクトップ（`dragonflyg4`）の通常ユーザーセッションはMedium整合性で動いており（F17）、非昇格↔昇格の非対称性そのものは実在することを確認した**。ただし検証実行時に昇格済みウィンドウが開いていなかったため、実際の`ERROR_ACCESS_DENIED`発生はまだ観測できていない（F18）。昇格アプリ（管理者権限のコマンドプロンプト等）を開いた状態でのS7r再実行が必要。Phase 0「昇格窓への操作がどう失敗するか」の結果が出るまで`classify`は`5→Denied OtherDenial`に留める | 実デスクトップでの再実行待ち、Phase A |
+| `DenialKind.TargetIntegrityHigher`の生成手段（v2.4追加、ラウンド2レビューR2-18対応／GitHub Actions実機検証で判明：failure-catalog.md F14／実デスクトップ`dragonflyg4`実機検証で確定：F17/F18/F23/F24） | 対象プロセスの整合性レベルをShellがどう取得するか（トークン比較等）、`NativeCallRecord`への`TargetIntegrity`フィールド追加の是非。CI実機検証では、ランナー自身のプロセスが既にHigh整合性レベルで動いており非対称性を観測できなかった（F14）が、実デスクトップ（`dragonflyg4`）の通常ユーザーセッションはMedium整合性で動いており（F17）、非昇格↔昇格の非対称性そのものは実在することを確認した。ユーザーが実際にUAC承認して開いた昇格ウィンドウに対し`SetWindowPos`を実行し、**`returned=false, GetLastError=5`（ERROR_ACCESS_DENIED）という予測どおりの失敗を実機で確定した（F23）**。`classify`の`5→Denied OtherDenial`マッピング自体はこれで実証済みとして確定する。残る論点は「`TargetIntegrityHigher`という専用`DenialKind`を切り出す価値があるか」（現状の`OtherDenial`で扱いが変わらないなら不要）と、対象プロセスの整合性レベルを事前に取得する手段（`OpenProcess`は`PROCESS_QUERY_LIMITED_INFORMATION`が必須、`PROCESS_QUERY_INFORMATION`では同一ユーザーでも上位整合性プロセスの取得に失敗する：F24）の2点のみで、Phase Aで判断する | Phase A |
 
 
 方針：先に必要な能力を実装し、表現形式や追加ツールを目的化しない。F*や全面Deep Embedded DSLを最初の前提に戻さない。

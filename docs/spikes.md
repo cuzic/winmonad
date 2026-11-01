@@ -62,12 +62,12 @@ Phase 0は「要素技術の確認」ではなく、**捨てる前提の素朴�
 - **記録する内容**: (a)(b)それぞれのちらつきの有無、`SW_RESTORE`が必要なケースの一覧、(b)でハング窓を含めた場合の挙動。
 - **判定**: (a)で十分なら「Bで対処」で確定（既にarchitecture.md 6.2の既定方針）。(b)が明確に優れ、かつハング耐性を損なわないと確認できた場合のみ方針変更を検討する。「`RestoreBeforeMove`が必須なケースの判定条件」はCoreのPlanValidatorが持つ必要があれば「型に反映」。
 
-### S7. 昇格（管理者）ウィンドウへの操作の失敗様式【CI検証不可→実デスクトップで非対称性を確認：failure-catalog.md F14, F17, F18】
-**結果**：GitHub Actions windows-latestランナーのプロセス自身がAdministratorsグループ所属・整合性レベル**High**で動作しており、非対称性を観測できなかった（F14）。**実デスクトップ（`dragonflyg4`）の通常セッションはAdministrators非所属・整合性レベル**Medium**であり（F17）、非昇格↔昇格の非対称性は実在することを確認した**。ただし検証時に昇格済みウィンドウが開いていなかったため、実際の`ERROR_ACCESS_DENIED`はまだ観測できていない（F18）。昇格アプリを開いた状態でのS7r再実行が必要。
+### S7. 昇格（管理者）ウィンドウへの操作の失敗様式【実デスクトップで確定：failure-catalog.md F14, F17, F18, F23, F24】
+**結果（確定）**：GitHub Actions windows-latestランナーのプロセス自身がAdministratorsグループ所属・整合性レベル**High**で動作しており、CIでは非対称性を観測できなかった（F14）。実デスクトップ（`dragonflyg4`）の通常セッションはAdministrators非所属・整合性レベル**Medium**であり（F17）、非昇格↔昇格の非対称性は実在する。ユーザーが実際にUAC承認して開いた昇格コマンドプロンプト（整合性High）に対し`SetWindowPos`（no-op移動）を呼んだ結果、**`returned=false`、`GetLastError=5`（`ERROR_ACCESS_DENIED`）**と明確に失敗することを実機で確認した（F23）。開発過程で`OpenProcess`は`PROCESS_QUERY_LIMITED_INFORMATION`が必要（通常の`PROCESS_QUERY_INFORMATION`では候補を見逃す）、`SetWindowPos`のP/Invoke宣言には`SetLastError = true`が必須、という2つの実装上の落とし穴も判明した（F24）。
 - **検証する前提**: 管理者権限で実行されたウィンドウへ非特権プロセスから`SetWindowPos`等を呼ぶとどう失敗するか（サイレント失敗か、明示的なエラーか）。
 - **方法**: 管理者権限で起動したアプリ（例：管理者権限のコマンドプロンプト）を対象に`SetWindowPos`を呼び、戻り値・`GetLastError`・実際にウィンドウが動いたかを確認する。
 - **記録する内容**: 失敗の様式（戻り値、エラー、無反応）。
-- **判定**: 「Bで対処」（検出してExcluded/Suspendedへ分類）。
+- **判定**: 「Bで対処」（`ERROR_ACCESS_DENIED=5`を`classify`で`Denied OtherDenial`として検出し、Excluded/Suspendedへ分類）で確定。
 
 ### S8. 画面構成変化（スリープ/モニタ抜き差し/RDP）の観測（E-3対応）
 - **検証する前提**: スリープ復帰、モニター抜き差し、RDP接続/切断時にOS自身が窓を動かす挙動と、それを検知できるイベント（`WM_DISPLAYCHANGE`、`WM_DEVICECHANGE`等）。
