@@ -1,6 +1,6 @@
 # Windows プログラマブル・ウィンドウマネージャー 統合設計書
 
-Version: 2.4.2（Result型によるエラー耐性設計を追加し、Opus批判的レビューの第2ラウンド収束確認で見つかった実装レベルの不整合を修正。ADR-014の2つの未実測仮定（ハング事前確認のタイムアウト値、RestoreBeforeMoveのShowWindowAsync化）をGitHub Actions windows-latest実機検証で裏付け。Phase 0実現性リサーチ[feasibility.md]＋Phase 0実機検証[failure-catalog.md]の結果を反映）
+Version: 2.4.3（Result型によるエラー耐性設計を追加し、Opus批判的レビューの第2ラウンド収束確認で見つかった実装レベルの不整合を修正。ADR-014の2つの未実測仮定（ハング事前確認のタイムアウト値、RestoreBeforeMoveのShowWindowAsync化）およびPhase 0未着手項目2点（昇格窓の非対称性、Explorer再起動）をGitHub Actions windows-latest実機検証で確認。Phase 0実現性リサーチ[feasibility.md]＋Phase 0実機検証[failure-catalog.md]の結果を反映）
 Date: 2026-11-01
 Status: 基本アーキテクチャ決定／個別APIと性能値はPoCで検証／中核状態モデルとPhase順序を本版で見直し／Win32 API挙動の一部をdocs/feasibility.mdの調査結果で具体化／ADR-012・6.2のハング耐性方針はdocs/failure-catalog.mdで実機実証済み／例外・Result・EffectFailure・PlanValidator・PolicyArtifactのエラー表現をADR-014で整理
 Implementation language: F# / .NET
@@ -717,7 +717,7 @@ module Native = // Wm.Windows内部（internal）。外部から呼べるのはG
 
 **復旧操作はGatedEffectを経由しない例外経路（v2.4で追加、ADR-014/R2-6対応）**：直前に隠した窓のベストエフォート復旧は、Coreが止まっている／ハングしている可能性を前提にHostの監視コンポーネントが直接`Native`モジュール（8.1）を呼ぶ。6.2・22章受け入れ条件4番の「全EffectはGatedEffectを経由する」の明示的な例外とし、呼べる操作を「表示の復元」と「画面内への移動」に限定する。実行したらJournalに`SafetyRecoveryAction`として記録する（9.2のKind一覧に追加）。`Native`モジュール自体はWm.Windows内部（internal）に留め、外部から呼べるのは「GatedEffectを受け取る通常のShell」とこの限定APIの2つだけにする。
 
-**制御経路の実体（v2.1で追加、E-1/E-2対応）**：安全停止の「独立した制御経路」は、Effect適用スレッド（7.1のADR-012）やメインのメッセージループとは別のスレッド、できれば別プロセス（Wm.Host内の監視用の軽量コンポーネント）で動かす。ハングした対象アプリへの呼出でメインのメッセージループや通知領域アイコンが応答しなくなっても、停止用のホットキー・経路だけは生き続けることを要件とする。通知領域アイコンはExplorer再起動時に消えるため、`TaskbarCreated`メッセージを処理してアイコンを再登録する。
+**制御経路の実体（v2.1で追加、E-1/E-2対応）**：安全停止の「独立した制御経路」は、Effect適用スレッド（7.1のADR-012）やメインのメッセージループとは別のスレッド、できれば別プロセス（Wm.Host内の監視用の軽量コンポーネント）で動かす。ハングした対象アプリへの呼出でメインのメッセージループや通知領域アイコンが応答しなくなっても、停止用のホットキー・経路だけは生き続けることを要件とする。通知領域アイコンはExplorer再起動時に消えるため、`TaskbarCreated`メッセージを処理してアイコンを再登録する。**GitHub Actions windows-latest実機検証で、`explorer.exe`を強制終了すると504ms後に自動再起動することを確認した（failure-catalog.md F15）**。再起動自体が高速（1秒未満）なので、`TaskbarCreated`処理の実装が多少遅れても、トレイアイコンの空白期間は短く収まる見込みである。
 
 **再開の条件（v2.1で追加、F-7対応）**：安全停止からの再開は既定でユーザー操作による手動再開のみとする。自動再開にすると、停止原因（例：ハングしたアプリ）が解消していない場合に停止と再開を繰り返すことになる。
 ## 9. Unified Journalとログの統合
@@ -1216,7 +1216,7 @@ Tests/ConstrainedWindowScenario.fs
 | ワークスペースの実装方式（v2.1追加） | 窓を隠す/画面外へ移動/最小化のいずれか、クラッシュ時の復元容易性 | Phase A |
 | ofDto用の`Result.traverse`/最小`result`ビルダー導入（v2.4追加、ADR-014/3-2対応） | `PolicyIR.ofDto`等が3段以上の`match Ok/Error`ネストを要した最初の時点で、Contractsに自作（20行未満、外部依存なし）を追加する。発動条件は「必要になってから」で、事前に作らない | ofDtoを書く時点（Phase A） |
 | ReplClientでの`taskResult`（または同等のCE）許可（v2.4追加、ADR-014/3-3対応） | 10.3の`task { }`は複数手順を連ねる際にResultとのネストが生まれる。Core/Policy/Layoutsは外部依存なしを維持するが、Wm.ReplClientは3.1の決定性制約の外にあるため、利便性優先で外部パッケージ（FsToolkit.ErrorHandling等）か自作`taskResult`の導入を許す | Phase C |
-| `DenialKind.TargetIntegrityHigher`の生成手段（v2.4追加、ラウンド2レビューR2-18対応） | 対象プロセスの整合性レベルをShellがどう取得するか（トークン比較等）、`NativeCallRecord`への`TargetIntegrity`フィールド追加の是非。Phase 0「昇格窓への操作がどう失敗するか」の結果が出るまで`classify`は`5→Denied OtherDenial`に留める | Phase 0の結果を見てPhase A |
+| `DenialKind.TargetIntegrityHigher`の生成手段（v2.4追加、ラウンド2レビューR2-18対応／GitHub Actions実機検証で判明：failure-catalog.md F14） | 対象プロセスの整合性レベルをShellがどう取得するか（トークン比較等）、`NativeCallRecord`への`TargetIntegrity`フィールド追加の是非。**CI実機検証では、ランナー自身のプロセスが既にHigh整合性レベルで動いており、非昇格→昇格の非対称性を観測できる環境が無いことが確認された**。したがってこの項目はCIでは検証不可能であり、実デスクトップ上の非昇格プロセスから昇格ウィンドウへ操作を試す以外に確認手段が無い。Phase 0「昇格窓への操作がどう失敗するか」の結果が出るまで`classify`は`5→Denied OtherDenial`に留める | 実デスクトップでのPhase 0の結果を見てPhase A |
 
 
 方針：先に必要な能力を実装し、表現形式や追加ツールを目的化しない。F*や全面Deep Embedded DSLを最初の前提に戻さない。

@@ -1,8 +1,8 @@
 # Failure Catalog（Phase 0 実機検証）
 
-対象: [spikes.md](./spikes.md) のS1〜S11のうち、GitHub Actions `windows-latest` ランナー上でCI実機検証できたS1, S2, S2b, S2c, S3, S4, S5, S6, S9。S2b/S2cはADR-014（Result型によるエラー耐性設計）のレビュー収束後に、テキストでの推測（事前確認タイムアウト値「50ms」、`RestoreBeforeMove`の`ShowWindowAsync`化）を実機データに置き換えるために追加した。
+対象: [spikes.md](./spikes.md) のS1〜S11のうち、GitHub Actions `windows-latest` ランナー上でCI実機検証できたS1, S2, S2b, S2c, S3, S4, S5, S6, S7, S9, S10。S2b/S2cはADR-014（Result型によるエラー耐性設計）のレビュー収束後に、テキストでの推測（事前確認タイムアウト値「50ms」、`RestoreBeforeMove`の`ShowWindowAsync`化）を実機データに置き換えるために追加した。S7/S10はPhase 0計画のうち未着手だった項目（昇格窓・Explorer再起動）を、UACプロンプト等の危険を避けつつ安全に検証できる形に落として追加した。
 検証に使ったコード: [spikes/Phase0CiSpikes](../spikes/Phase0CiSpikes)（捨てる前提の検証ハーネス。Phase A以降のCoreへは持ち込まない）。
-実行結果: [run #41275322319](https://github.com/cuzic/winmonad/actions/runs/41275322319)（S1〜S9、1分24秒）、[run #41285111988](https://github.com/cuzic/winmonad/actions/runs/41285111988)（S2b/S2c含む全9スパイク、1分43秒、2026-11-01T07:32 UTC）。
+実行結果: [run #41275322319](https://github.com/cuzic/winmonad/actions/runs/41275322319)（S1〜S9、1分24秒）、[run #41285111988](https://github.com/cuzic/winmonad/actions/runs/41285111988)（S2b/S2c含む、1分43秒）、[run #41285769219](https://github.com/cuzic/winmonad/actions/runs/41285769219)（S7/S10含む全11スパイク、1分47秒、2026-11-01T07:42 UTC）。
 
 環境: `Microsoft Windows NT 10.0.26100.0`（64bit）、画面 1024x768（CI仮想ディスプレイ）。
 
@@ -23,6 +23,8 @@
 | F11 | S3 | `Alt+J`/`Alt+Shift+Return`/`Alt+Shift+1`は`RegisterHotKey`で確保できた。`Win+Return`/`Win+1`/`Win+L`は全て`GetLastError=1409`（`ERROR_HOTKEY_ALREADY_REGISTERED`）で失敗した | 型に反映（確定） | 8.1 ホットキー登録の実現性 |
 | F12 | S2b | `SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG, timeoutMs)`を、OSがまだハング判定していない窓（停止後~1秒）に対し10/50/100/500msの各タイムアウトで呼ぶと、実測`elapsedMs`は要求値とほぼ一致した（9/57/99/499ms）。同じ窓がOSにハング判定された後（停止後~6秒）は、同じ4つのタイムアウト値すべてで`elapsedMs=0`だった。「ハング判定前は要求タイムアウトをほぼそのまま待ち、判定後は即時に返る」という挙動を実測で確定した | 型に反映（確定。タイムアウト値を10msに決定） | 7.1 ハング事前確認のタイムアウト値 |
 | F13 | S2c | 最大化状態のまま応答停止した窓に対し、`ShowWindow(SW_RESTORE)`（同期）は4000msの計測上限を超えてもリターンせず、`ShowWindowAsync(SW_RESTORE)`は0msで即時リターンした。`SetWindowPos`+`SWP_ASYNCWINDOWPOS`（F07/F08）と同じ非同期/同期の差がここでも実証された。なお最初の試行では子窓を最大化しておらず両方0msという無意味な結果になった（`SW_RESTORE`が実質no-opだったため）ため、子窓を最大化してから再実行して確認した | 型に反映（確定。`RestoreBeforeMove`=`ShowWindowAsync`を実証） | 7.1/8.1 RestoreBeforeMove |
+| F14 | S7 | GitHub Actions windows-latestランナー上のプロセスは、Administratorsグループに属し、トークンの整合性レベルは**High**（RID=0x3000）だった。つまりCI実機検証ハーネス自身が既に昇格済みの状態で動いている | 無視してよい（CI環境固有の制約。非昇格↔昇格の非対称性を観測する前提がこの環境には無い） | 21章 `DenialKind.TargetIntegrityHigher`の生成手段：CIでは検証不可、実デスクトップでの検証が必要と明記 |
+| F15 | S10 | `explorer.exe`はCIランナー上にも実際に1プロセス存在し、`Process.Kill()`で終了させると**504ms後に自動的に再起動**した（10秒以内の再起動を確認） | 型に反映（確定。Explorer再起動の発生自体と再起動の速さを実証） | 8.4 `TaskbarCreated`によるトレイアイコン再登録：再起動は高速（1秒未満）なので、トレイアイコンの空白期間は短いことを前提にできる |
 
 ## F04（S4）の限界：実証したことと、まだ実証していないこと
 
