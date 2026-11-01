@@ -1,14 +1,21 @@
 // Phase 0 feasibility spikes that CAN be verified on a GitHub Actions
 // windows-latest runner without a real interactive desktop session.
 // See /docs/spikes.md for the full spike plan this implements a subset of
-// (S1, S2, S2b, S2c, S3, S4, S5, S6, S7, S9, S10). S2b/S2c were added to
-// ground two ADR-014 assumptions (the 50ms hang pre-check timeout, and
-// RestoreBeforeMove's ShowWindowAsync choice) in a real CI run instead of
-// a textual guess. S7/S10 probe this runner's own privilege/shell
-// environment (process integrity level; whether explorer.exe exists and
-// auto-restarts) rather than Win32 call semantics. Results are printed
-// to stdout AND written to phase0-ci-results.md for the "Upload results
-// artifact" workflow step.
+// (S1, S2, S2b, S2c, S3, S4, S4r, S5, S5r, S6, S7, S7r, S9, S10, S11r).
+// S2b/S2c were added to ground two ADR-014 assumptions (the 50ms hang
+// pre-check timeout, and RestoreBeforeMove's ShowWindowAsync choice) in
+// a real CI run instead of a textual guess. S7/S10 probe this machine's
+// own privilege/shell environment (process integrity level; whether
+// explorer.exe exists and auto-restarts) rather than Win32 call
+// semantics. The *r-suffixed spikes (S4r/S5r/S7r/S11r) are real-desktop-
+// only: they need a genuine interactive desktop (an existing third-party
+// foreground window, a modern UWP shell, an already-running elevated
+// window, multiple monitors at different DPI) that a GitHub Actions
+// windows-latest runner structurally cannot provide -- they report
+// themselves as inconclusive rather than failing when run somewhere
+// that can't exercise them. Results are printed to stdout AND written
+// to phase0-ci-results.md for the "Upload results artifact" workflow
+// step (or read directly from that file when run outside CI).
 //
 // This is throwaway verification code, not part of the eventual
 // ThrowawayWm (Phase 0 deliverable) or the real Core/Shell (Phase A/B).
@@ -113,6 +120,46 @@ module Native =
 
     [<DllImport("kernel32.dll")>]
     extern uint32 SetErrorMode(uint32 uMode)
+
+    // ===== real-desktop-only spikes (S4r/S5r/S7r/S10/S11r) =====
+    [<DllImport("user32.dll")>]
+    extern bool EnumWindows(EnumChildProc lpEnumFunc, IntPtr lParam) // same callback shape as EnumChildWindows
+
+    [<DllImport("user32.dll")>]
+    extern bool IsWindowVisible(IntPtr hWnd)
+
+    [<DllImport("user32.dll", CharSet = CharSet.Unicode)>]
+    extern int GetWindowTextLength(IntPtr hWnd)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern IntPtr OpenProcess(uint32 dwDesiredAccess, bool bInheritHandle, int dwProcessId)
+
+    type MonitorEnumProc = delegate of IntPtr * IntPtr * IntPtr * IntPtr -> bool
+
+    [<DllImport("user32.dll")>]
+    extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr lprcClip, MonitorEnumProc lpfnEnum, IntPtr dwData)
+
+    [<DllImport("shcore.dll")>]
+    extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, uint32& dpiX, uint32& dpiY)
+
+    [<StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)>]
+    type NOTIFYICONDATA =
+        struct
+            val mutable cbSize: int
+            val mutable hWnd: IntPtr
+            val mutable uID: int
+            val mutable uFlags: int
+            val mutable uCallbackMessage: int
+            val mutable hIcon: IntPtr
+            [<MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)>]
+            val mutable szTip: string
+        end
+
+    [<DllImport("shell32.dll", CharSet = CharSet.Unicode)>]
+    extern bool Shell_NotifyIcon(int dwMessage, NOTIFYICONDATA& lpdata)
+
+    [<DllImport("user32.dll", CharSet = CharSet.Unicode)>]
+    extern uint32 RegisterWindowMessage(string lpString)
 
 open Native
 
@@ -613,11 +660,37 @@ let spikeS6_BatchApply (exePath: string) =
     finally
         killProcessSafely p2
 
+// Shared by S7 and S7r: read a process token's integrity level (TokenIntegrityLevel=25).
+// TOKEN_MANDATORY_LABEL = SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes }.
+// SID layout: BYTE Revision; BYTE SubAuthorityCount; BYTE IdentifierAuthority[6]; DWORD SubAuthority[n].
+let private integrityLabelOf (rid: int) =
+    match rid with
+    | 0x0000 -> "Untrusted"
+    | 0x1000 -> "Low"
+    | 0x2000 -> "Medium"
+    | 0x2100 -> "Medium Plus"
+    | 0x3000 -> "High"
+    | 0x4000 -> "System"
+    | 0x5000 -> "Protected Process"
+    | v -> sprintf "Unknown(0x%04x)" v
+
+let private getIntegrityRid (hToken: IntPtr) : Result<int, string> =
+    let TokenIntegrityLevel = 25u
+    let mutable len = 0u
+    GetTokenInformation(hToken, TokenIntegrityLevel, null, 0u, &len) |> ignore
+    let buf = Array.zeroCreate<byte> (int len)
+    if not (GetTokenInformation(hToken, TokenIntegrityLevel, buf, len, &len)) then
+        Error (sprintf "GetTokenInformation(TokenIntegrityLevel) failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+    else
+        let pSid = IntPtr(BitConverter.ToInt64(buf, 0))
+        let subAuthorityCount = int (Marshal.ReadByte(pSid, 1))
+        Ok(Marshal.ReadInt32(pSid, 8 + 4 * (subAuthorityCount - 1)))
+
 // S7: how does an elevated-vs-non-elevated operation fail? Actually spawning an elevated
 // child (ShellExecute "runas") would pop a UAC consent prompt with nobody to approve it,
-// hanging the job indefinitely -- too risky to attempt in CI. Instead, safely determine
+// hanging the job indefinitely -- too risky to attempt unattended. Instead, safely determine
 // this process's own integrity level (no prompt, no process spawn), which tells us whether
-// there is even a privilege asymmetry to observe on this runner, and feeds directly into
+// there is even a privilege asymmetry to observe on this machine, and feeds directly into
 // architecture.md's DenialKind.TargetIntegrityHigher classification (currently deferred,
 // 21章).
 let spikeS7_IntegrityLevel () =
@@ -633,42 +706,108 @@ let spikeS7_IntegrityLevel () =
         log (sprintf "- OpenProcessToken failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
     else
         try
-            let TokenIntegrityLevel = 25u
-            let mutable len = 0u
-            GetTokenInformation(hToken, TokenIntegrityLevel, null, 0u, &len) |> ignore
-            let buf = Array.zeroCreate<byte> (int len)
-            if not (GetTokenInformation(hToken, TokenIntegrityLevel, buf, len, &len)) then
-                log (sprintf "- GetTokenInformation(TokenIntegrityLevel) failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
-            else
-                // TOKEN_MANDATORY_LABEL = SID_AND_ATTRIBUTES { PSID Sid; DWORD Attributes }.
-                // SID layout: BYTE Revision; BYTE SubAuthorityCount; BYTE IdentifierAuthority[6]; DWORD SubAuthority[n].
-                let pSid = IntPtr(BitConverter.ToInt64(buf, 0))
-                let subAuthorityCount = int (Marshal.ReadByte(pSid, 1))
-                let lastSubAuthority = Marshal.ReadInt32(pSid, 8 + 4 * (subAuthorityCount - 1))
-                let label =
-                    match lastSubAuthority with
-                    | 0x0000 -> "Untrusted"
-                    | 0x1000 -> "Low"
-                    | 0x2000 -> "Medium"
-                    | 0x2100 -> "Medium Plus"
-                    | 0x3000 -> "High"
-                    | 0x4000 -> "System"
-                    | 0x5000 -> "Protected Process"
-                    | v -> sprintf "Unknown(0x%04x)" v
-                log (sprintf "- current process token integrity level: %s (RID=0x%04x)" label lastSubAuthority)
+            match getIntegrityRid hToken with
+            | Ok rid -> log (sprintf "- current process token integrity level: %s (RID=0x%04x)" (integrityLabelOf rid) rid)
+            | Error e -> log (sprintf "- %s" e)
         finally
             CloseHandle(hToken) |> ignore
 
-// S10: does windows-latest even run explorer.exe, and if we kill it, does it auto-restart
-// (and how fast)? This is the real-world condition 8.4's TaskbarCreated-based tray icon
-// recovery depends on. The runner is an ephemeral single-use VM, so killing explorer.exe
-// here is safe (nothing else on this machine depends on it surviving past this job).
+// S7r (real-desktop only): unlike S7 (which only reads our own integrity level), this looks
+// for an ALREADY-RUNNING window owned by a higher-integrity process (e.g. an admin Command
+// Prompt the user happens to have open) and tries a harmless no-op SetWindowPos (same rect)
+// against it, to observe the real ERROR_ACCESS_DENIED failure mode without ever spawning
+// anything elevated ourselves (no UAC prompt risk).
+let spikeS7r_ElevationAsymmetry () =
+    let selfRid =
+        let TOKEN_QUERY = 0x0008u
+        let mutable hToken = IntPtr.Zero
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken) then
+            try
+                match getIntegrityRid hToken with
+                | Ok r -> Some r
+                | Error _ -> None
+            finally
+                CloseHandle(hToken) |> ignore
+        else
+            None
+
+    match selfRid with
+    | None -> log "- could not determine own integrity level, skipping"
+    | Some myRid ->
+        log (sprintf "- own integrity level: %s" (integrityLabelOf myRid))
+        let PROCESS_QUERY_INFORMATION = 0x0400u
+        let TOKEN_QUERY = 0x0008u
+        let candidates = ResizeArray<IntPtr * int * int>()
+        let cb =
+            EnumChildProc(fun hwnd _ ->
+                if IsWindowVisible(hwnd) && GetWindowTextLength(hwnd) > 0 then
+                    let mutable pid = 0
+                    GetWindowThreadProcessId(hwnd, &pid) |> ignore
+                    if pid <> 0 then
+                        let hProc = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid)
+                        if hProc <> IntPtr.Zero then
+                            let mutable hTok = IntPtr.Zero
+                            if OpenProcessToken(hProc, TOKEN_QUERY, &hTok) then
+                                (match getIntegrityRid hTok with
+                                 | Ok rid when rid > myRid -> candidates.Add(hwnd, pid, rid)
+                                 | _ -> ())
+                                CloseHandle(hTok) |> ignore
+                            CloseHandle(hProc) |> ignore
+                true)
+        EnumWindows(cb, IntPtr.Zero) |> ignore
+
+        if candidates.Count = 0 then
+            log "- no visible top-level window owned by a higher-integrity process was found on this desktop right now (open an elevated app, e.g. an admin Command Prompt, to test this)"
+        else
+            let (hwnd, pid, rid) = candidates.[0]
+            log (sprintf "- found higher-integrity window: pid=%d integrity=%s" pid (integrityLabelOf rid))
+            let mutable r = RECT()
+            GetWindowRect(hwnd, &r) |> ignore
+            // No-op move (same rect) so we don't actually disturb the user's window if this succeeds.
+            let ok = SetWindowPos(hwnd, IntPtr.Zero, r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top, 0x0004u (* SWP_NOZORDER *))
+            let err = Marshal.GetLastWin32Error()
+            log (sprintf "- SetWindowPos (no-op, same rect) against higher-integrity window: returned=%b GetLastError=%d" ok err)
+
+// Minimal Form subclass that can observe whether it received the "TaskbarCreated" broadcast
+// (sent to all top-level windows when Explorer restarts), used by S10's full tray-icon test.
+type private TrayTestForm(taskbarCreatedMsg: uint32) =
+    inherit Form()
+    let mutable received = false
+    member _.Received = received
+    override this.WndProc(m: Message byref) =
+        if taskbarCreatedMsg <> 0u && uint32 m.Msg = taskbarCreatedMsg then
+            received <- true
+        base.WndProc(&m)
+
+// S10: does explorer.exe exist on this machine, and if we kill it, does it auto-restart (and
+// how fast)? Then the full loop 8.4 actually depends on: register "TaskbarCreated", add a
+// tray icon, kill Explorer, and see whether we both receive the broadcast and can re-add the
+// icon afterward. NOTE: on a real desktop (unlike an ephemeral CI runner) this visibly
+// restarts the user's Explorer shell/taskbar for a moment -- intentional here, since this is
+// exactly the real-world event 8.4 needs to recover from.
 let spikeS10_ExplorerRestart () =
     let before = Process.GetProcessesByName("explorer")
     log (sprintf "- explorer.exe processes found: %d" before.Length)
     if before.Length = 0 then
-        log "- no explorer.exe running on this runner; S10's premise (TaskbarCreated-based tray icon recovery) does not apply to this CI environment, needs a real desktop to verify"
+        log "- no explorer.exe running on this machine; S10's premise (TaskbarCreated-based tray icon recovery) does not apply here"
     else
+        let taskbarCreatedMsg = RegisterWindowMessage("TaskbarCreated")
+        log (sprintf "- RegisterWindowMessage(\"TaskbarCreated\") = 0x%08x" taskbarCreatedMsg)
+
+        use form = new TrayTestForm(taskbarCreatedMsg, Bounds = Rectangle(0, 0, 1, 1))
+        form.Show()
+        pump 5
+
+        let mutable nid = NOTIFYICONDATA()
+        nid.cbSize <- Marshal.SizeOf(typeof<NOTIFYICONDATA>)
+        nid.hWnd <- form.Handle
+        nid.uID <- 1
+        nid.uFlags <- 0x00000002 (* NIF_ICON *) ||| 0x00000004 (* NIF_TIP *)
+        nid.hIcon <- SystemIcons.Application.Handle
+        nid.szTip <- "winmonad S10 test"
+        let added = Shell_NotifyIcon(0 (* NIM_ADD *), &nid)
+        log (sprintf "- Shell_NotifyIcon(NIM_ADD) before killing Explorer: %b" added)
+
         let pid = before.[0].Id
         try
             before.[0].Kill()
@@ -679,10 +818,142 @@ let spikeS10_ExplorerRestart () =
         let sw = Stopwatch.StartNew()
         let mutable restarted = false
         while not restarted && sw.ElapsedMilliseconds < 10000L do
-            Thread.Sleep(500)
+            Thread.Sleep(300)
+            pump 2 // keep pumping so TaskbarCreated can actually reach TrayTestForm.WndProc
             if Process.GetProcessesByName("explorer").Length > 0 then
                 restarted <- true
         log (sprintf "- explorer.exe auto-restarted within 10s: %b (observed after %dms)" restarted sw.ElapsedMilliseconds)
+
+        // The broadcast can lag a little behind the new explorer.exe process actually starting.
+        for _ in 1 .. 20 do
+            pump 5
+            Thread.Sleep(100)
+        log (sprintf "- received TaskbarCreated broadcast: %b" form.Received)
+
+        if form.Received then
+            let readded = Shell_NotifyIcon(0 (* NIM_ADD *), &nid)
+            log (sprintf "- re-added tray icon after TaskbarCreated: %b" readded)
+
+        Shell_NotifyIcon(2 (* NIM_DELETE *), &nid) |> ignore
+
+// S5r (real-desktop only): calc.exe (and ms-settings:) may resolve to the modern UWP app here,
+// unlike the CI runner image which only has the classic win32calc (failure-catalog.md F02).
+let spikeS5r_RealUwp () =
+    let inspect (label: string) (topHwnd: IntPtr) (ownerProcessName: string) =
+        let topClass = StringBuilder(256)
+        GetClassName(topHwnd, topClass, 256) |> ignore
+        log (sprintf "- %s: owning process name=%s, top-level window class=%s" label ownerProcessName (topClass.ToString()))
+        let found = ResizeArray<IntPtr>()
+        let cb = EnumChildProc(fun h _ -> found.Add(h); true)
+        EnumChildWindows(topHwnd, cb, IntPtr.Zero) |> ignore
+        log (sprintf "- %s: %d direct child window(s) found" label found.Count)
+        for h in found do
+            let cls = StringBuilder(256)
+            GetClassName(h, cls, 256) |> ignore
+            let mutable pid = 0
+            GetWindowThreadProcessId(h, &pid) |> ignore
+            let procName =
+                try (Process.GetProcessById(pid)).ProcessName with _ -> "?"
+            log (sprintf "  - %s child hwnd class=%s owning pid=%d process=%s" label (cls.ToString()) pid procName)
+
+    try
+        let p = Process.Start("calc.exe")
+        Thread.Sleep(2500)
+        p.Refresh()
+        if p.MainWindowHandle = IntPtr.Zero then
+            log "- calc.exe: no top-level window detected within timeout"
+        else
+            inspect "calc.exe" p.MainWindowHandle p.ProcessName
+        killProcessSafely p
+    with ex ->
+        log (sprintf "- calc.exe: ERROR %s" ex.Message)
+
+    try
+        let psi = ProcessStartInfo("ms-settings:", UseShellExecute = true)
+        use p = Process.Start(psi)
+        Thread.Sleep(2500)
+        // ms-settings: launches SystemSettings.exe as a separate process from the one Process.Start returns.
+        let settings = Process.GetProcessesByName("SystemSettings")
+        if settings.Length = 0 then
+            log "- ms-settings:: no SystemSettings.exe process found within timeout"
+        else
+            let sp = settings.[0]
+            if sp.MainWindowHandle = IntPtr.Zero then
+                log "- ms-settings:: SystemSettings.exe found but no MainWindowHandle yet"
+            else
+                inspect "ms-settings:" sp.MainWindowHandle sp.ProcessName
+            killProcessSafely sp
+    with ex ->
+        log (sprintf "- ms-settings:: ERROR %s" ex.Message)
+
+// S11r (real-desktop only): enumerate real monitors and their DPI, to see whether this
+// desktop can even exercise the Per-Monitor-V2 DPI-transition question (architecture.md 8.3).
+let spikeS11r_MonitorDpi () =
+    let MDT_EFFECTIVE_DPI = 0
+    let dpis = ResizeArray<int>()
+    let cb =
+        MonitorEnumProc(fun hMonitor _ _ _ ->
+            let mutable dpiX = 0u
+            let mutable dpiY = 0u
+            let hr = GetDpiForMonitor(hMonitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)
+            dpis.Add(if hr = 0 then int dpiX else -1)
+            true)
+    EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, cb, IntPtr.Zero) |> ignore
+    log (sprintf "- monitor count: %d, DPI values: %s" dpis.Count (String.Join(", ", dpis)))
+    let distinct = dpis |> Seq.filter (fun d -> d > 0) |> Seq.distinct |> Seq.toList
+    if distinct.Length <= 1 then
+        log "- all monitors share the same DPI (or only one monitor present); cannot test a Per-Monitor-V2 DPI transition on this desktop right now"
+    else
+        log (
+            sprintf
+                "- found %d distinct DPI values across monitors: %s -- moving a real window between them would exercise S11, not automated by this spike yet"
+                distinct.Length
+                (String.Join(", ", distinct))
+        )
+
+// S4r (real-desktop only): unlike S4 (which only tests stealing focus from a child process we
+// ourselves spawned, confounded by the "launched by" permission rule -- failure-catalog.md
+// F04), this uses whatever window genuinely already has the foreground on this real desktop.
+let spikeS4r_ThirdPartyFocus () =
+    let before = GetForegroundWindow()
+    let selfPid = Process.GetCurrentProcess().Id
+    if before = IntPtr.Zero then
+        log "- no foreground window detected right now, skipping"
+    else
+        let mutable pidBefore = 0
+        GetWindowThreadProcessId(before, &pidBefore) |> ignore
+        if pidBefore = selfPid then
+            log "- the current foreground window already belongs to this test process; run this with a genuinely different app focused to test third-party stealing"
+        else
+            log (sprintf "- genuine third-party foreground window detected: pid=%d (this process is pid=%d)" pidBefore selfPid)
+            use formB = new Form(Text = "S4r", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(300, 300, 200, 150))
+            formB.Show()
+            pump 5
+
+            let ok1 = SetForegroundWindow(formB.Handle)
+            pump 3
+            let fg1 = GetForegroundWindow()
+            log (sprintf "- plain SetForegroundWindow against genuine third-party foreground: API returned=%b, actually foreground=%b" ok1 (fg1 = formB.Handle))
+
+            if fg1 <> formB.Handle then
+                SetForegroundWindow(before) |> ignore
+                pump 3
+                let MOUSEEVENTF_MOVE = 0x0001u
+                mouse_event (MOUSEEVENTF_MOVE, 0, 0, 0u, UIntPtr.Zero)
+                let ok2 = SetForegroundWindow(formB.Handle)
+                pump 3
+                let fg2 = GetForegroundWindow()
+                log (
+                    sprintf
+                        "- mouse_event self-priming + SetForegroundWindow against genuine third-party foreground: API returned=%b, actually foreground=%b"
+                        ok2
+                        (fg2 = formB.Handle)
+                )
+            else
+                log "- plain SetForegroundWindow already succeeded against a genuine third party; the priming trick may not be necessary here"
+
+            // Courtesy: put the user's original foreground window back.
+            SetForegroundWindow(before) |> ignore
 
 [<STAThread>]
 [<EntryPoint>]
@@ -719,6 +990,10 @@ let main argv =
         tryRun "S6 バッチ適用(DeferWindowPos vs 個別SetWindowPos+ASYNC)" (fun () -> spikeS6_BatchApply exePath)
         tryRun "S7 プロセスの整合性レベル" spikeS7_IntegrityLevel
         tryRun "S10 Explorer再起動時のTaskbarCreated前提" spikeS10_ExplorerRestart
+        tryRun "S4r 無関係な第三者プロセスからのフォーカス奪取(実デスクトップ限定)" spikeS4r_ThirdPartyFocus
+        tryRun "S5r 実際のUWPアプリ判定(実デスクトップ限定)" spikeS5r_RealUwp
+        tryRun "S7r 昇格ウィンドウの非対称性(実デスクトップ限定)" spikeS7r_ElevationAsymmetry
+        tryRun "S11r 複数モニタのDPI検出(実デスクトップ限定)" spikeS11r_MonitorDpi
 
         log "\n(all spikes finished without the watchdog firing)"
         0
