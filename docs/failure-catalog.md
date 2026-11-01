@@ -1,8 +1,8 @@
 # Failure Catalog（Phase 0 実機検証）
 
-対象: [spikes.md](./spikes.md) のS1〜S11のうち、GitHub Actions `windows-latest` ランナー上でCI実機検証できたS1, S2, S2b, S2c, S3, S4, S5, S6, S7, S9, S10。S2b/S2cはADR-014（Result型によるエラー耐性設計）のレビュー収束後に、テキストでの推測（事前確認タイムアウト値「50ms」、`RestoreBeforeMove`の`ShowWindowAsync`化）を実機データに置き換えるために追加した。S7/S10はPhase 0計画のうち未着手だった項目（昇格窓・Explorer再起動）を、UACプロンプト等の危険を避けつつ安全に検証できる形に落として追加した。
+対象: [spikes.md](./spikes.md) のS1〜S11のうち、GitHub Actions `windows-latest` ランナー上でCI実機検証できたS1, S2, S2b, S2c, S3, S4, S5, S6, S7, S9, S10。S2b/S2cはADR-014（Result型によるエラー耐性設計）のレビュー収束後に、テキストでの推測（事前確認タイムアウト値「50ms」、`RestoreBeforeMove`の`ShowWindowAsync`化）を実機データに置き換えるために追加した。S7/S10はPhase 0計画のうち未着手だった項目（昇格窓・Explorer再起動）を、UACプロンプト等の危険を避けつつ安全に検証できる形に落として追加した。さらにarchitecture.md v2.6（ADR-015〜018、Belief層・ドメイン分割Core・waiting-as-data）の新しい前提をCIで検証できる範囲に絞ったS12（部分）/S13/S13b/S14〜S19を追加した（F25〜F32）。
 検証に使ったコード: [spikes/Phase0CiSpikes](../spikes/Phase0CiSpikes)（捨てる前提の検証ハーネス。Phase A以降のCoreへは持ち込まない）。
-実行結果: [run #41275322319](https://github.com/cuzic/winmonad/actions/runs/41275322319)（S1〜S9、1分24秒）、[run #41285111988](https://github.com/cuzic/winmonad/actions/runs/41285111988)（S2b/S2c含む、1分43秒）、[run #41285769219](https://github.com/cuzic/winmonad/actions/runs/41285769219)（S7/S10含む全11スパイク、1分47秒、2026-11-01T07:42 UTC）。
+実行結果: [run #41275322319](https://github.com/cuzic/winmonad/actions/runs/41275322319)（S1〜S9、1分24秒）、[run #41285111988](https://github.com/cuzic/winmonad/actions/runs/41285111988)（S2b/S2c含む、1分43秒）、[run #41285769219](https://github.com/cuzic/winmonad/actions/runs/41285769219)（S7/S10含む全11スパイク、1分47秒、2026-11-01T07:42 UTC）、[run #41304977018](https://github.com/cuzic/winmonad/actions/runs/41304977018)（v2.6フォローアップのS13/S13b/S14〜S19、2分19秒、ハング無し、2026-11-01T12:09 UTC）。
 
 環境: `Microsoft Windows NT 10.0.26100.0`（64bit）、画面 1024x768（CI仮想ディスプレイ）。
 
@@ -36,6 +36,14 @@
 | F20 | S1/S9(実デスクトップ) | 可視フレーム差分`diff(L,T,R,B)=(7,0,7,7)`はCI（Windows 11 build 26100）と実デスクトップ（build 22631）の両方で一致し、Windowsビルドに依存しない値であることが分かった。`SHQueryUserNotificationState`は実デスクトップでは`state=5`（`QUNS_ACCEPTS_NOTIFICATIONS`）を返した（CIでは`state=6`=`QUNS_QUIET_TIME`。CIが新規プロビジョニングされた直後で「最初の時間帯の静かな時間」扱いだったためと推測）。どちらの場合もボーダレス全画面相当の窓を「フルスクリーン」と認識せず、ジオメトリヒューリスティックは両環境で一致して検出できた | 型に反映（確定。ジオメトリヒューリスティックの環境非依存性を実証） | 4.2 座標系の契約／8.1 フルスクリーンアプリの除外 |
 | F21 | S5r | `dragonflyg4`でも`calc.exe`はトップレベル窓を一定時間内に取得できなかった（CI同様、クラシック版かStore版が無効化されている可能性）。`ms-settings:`は`SystemSettings.exe`（WinUIパッケージアプリ）の起動自体は確認できたが、2.5秒以内には`MainWindowHandle`が得られなかった | 未確定（待機時間を延ばして再検証が必要） | 5.3 `AppId`導出注記 |
 | F22 | S11r | `dragonflyg4`は単一モニター・96 DPIのみで、複数DPIモニタ間のウィンドウ移動は検証できなかった | 無視してよい（この環境の制約。複数DPI環境を用意できれば再検証） | 8.3 DPI自己リサイズ：実機でも未検証のまま |
+| F25 | S13 | テスト窓を`(IsVisible, IsMinimized, DWMWA_CLOAKED)`で観測：「通常表示」=(true,false,0)、`SW_HIDE`=(false,false,0)、`SW_MINIMIZE`=(true,true,0)、「画面外へ移動(X=-5000)」=(true,false,0)。**「画面外へ移動」と「通常表示」が同一タプルになり、この3値だけでは区別できない** | 型に反映（確定。4.5の`ObservedPresence`が「画面外へ移動」方式を使う場合、矩形位置も見る必要がある） | 4.5 `ObservedPresence`／21章 ワークスペースの実装方式 |
+| F26 | S13b | オーナー窓を持つ窓を用意し、オーナーを最小化する前後で`DwmGetWindowAttribute(DWMWA_CLOAKED)`を観測：最小化前`value=0`、最小化後も`value=0`のまま（`DWM_CLOAKED_INHERITED=4`は観測されず）。仮説（オーナーの最小化が被所有窓をCloakさせる）はこの実装では成立しなかった | 未確定（要再検証。S12「WM自身によるCloakと他要因によるCloakの判別」は依然として完全に未解決。自己要因側（未文書化`IApplicationView::SetCloak`/`IVirtualDesktopManager`）は今回意図的に未着手） | 21章 ワークスペースの実装方式／R3-8 |
+| F27 | S14 | `WH_KEYBOARD_LL`フックのコールバックを約1150ms停止（文書上の上限1000msを超過）させた後、ベースライン（1回のキー入力でコールバック呼び出し回数=2）と比較したが、**フックは脱落しなかった**（再登録ロジックは試す機会が無かった） | 未確定（要再検証。「Windows 7以降は無言で脱落する」という文書の挙動と、この環境でのこの検証方法の結果が一致しない。判定手段（呼び出し回数の比較のみ）自体を見直すか、停止時間をさらに延ばした別検証が必要） | 8.1 ホットキー登録の実現性（`WH_KEYBOARD_LL`フォールバック） |
+| F28 | S15 | 子プロセスを2回連続で起動し`(Pid, GetProcessTimes)`を記録：1回目`pid=9492`、2回目`pid=6712`（PIDの偶然の重複は無く、`(Pid,CreationTime)`キーの衝突も無し）。比較の仕組み自体は動作を確認したが、実際のPID再利用ケースは再現できていない | 無視してよい（メカニズム確認。4.5のStickyのHWND再利用検知の前提は妥当） | 4.5 Sticky規則／`ProcessKey` |
+| F29 | S16 | ハング中の窓（最後のポンプから約6秒）への`SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG)`は`returned=0, elapsedMs=0`（ハング）。その後子窓がメッセージポンプを再開（約9秒後）し、同じ呼出で`returned=1, elapsedMs=17`（応答）に変わった。**Hung→Responding方向の復帰を実機で初めて確認**（F05〜F08は進入方向のみ検証していた） | 型に反映（確定。4.5のResponsiveness信念の復帰規則、Hungの窓が後で配置対象へ復帰する設計を実証） | 4.5 Responsiveness／7.2 Pending遷移図 |
+| F30 | S17 | `WM_CLOSE`を無視する窓（`DestroyWindow`を呼ばないWndProc）へ`PostMessage(WM_CLOSE)`を送ると、呼出自体は`posted=true`で0ms（非ブロッキング）。送信後も窓は生存（WndProcは`WM_CLOSE`を1回受信）。通常の窓（`WM_CLOSE`で`DestroyWindow`する）は実際に閉じた | Bで対処（確定。`RequestClose`Effectが非ブロッキングかつ拒否可能な丁寧な要求として機能することを実証） | 7.1 `Effect.RequestClose`／R6-2 |
+| F31 | S18 | `SendInput`ではなく投稿メッセージによる`WM_ENTERSIZEMOVE`/`WM_EXITSIZEMOVE`のシミュレーションで、ドロップ時点の矩形`(400,250,700,450)`（意図した移動先と一致）と`MonitorFromWindow`のハンドル`65537`（非null）を正しく捕捉した。単一モニタでの捕捉機構のみの検証であり、クロスモニタでの実際の転送（R3-4の本来の動機）はS11と同じ理由で未検証のまま | Bで対処（単一モニタの捕捉機構は確定。クロスモニタ部分は実機のマルチモニタ環境が必要） | 4.4 `MoveCause`/`UserDrag`／R4-7 |
+| F32 | S19 | `GetWindowDpiAwarenessContext`は自作/子WinFormsウィンドウで`0x6010`、`notepad.exe`で`0x22`という、プロセスの種類によって異なる値を返した（APIの呼出経路自体は機能している）。ただしスパイクのラベル関数が`-1`〜`-5`の既知sentinel値しか判定しておらず、両方とも`unknown(...)`と表示された | 無視してよい（スパイク実装の手抜き。`GetAwarenessFromDpiAwarenessContext`を呼べば直る。実際のマルチDPI問題はS11と同じく未解決のまま） | （architecture.mdへの反映は不要。実装上のTODOのみ） |
 
 ## F04/F16（S4/S4r）：フォーカス移動の実現性は実デスクトップで解消済み
 
@@ -44,6 +52,12 @@ CI実機検証の時点では、S4で使った「他プロセス」が**この�
 **実デスクトップ（`dragonflyg4`）での再検証（F16）で、この限界は解消した**：
 - 自分が起動した子プロセス（S4）・**自分が起動していない無関係な第三者プロセス**（S4r）の両方で、plain `SetForegroundWindow`は明確に失敗し、`mouse_event`自己プライミング版は明確に成功した。
 - komorebi/GlazeWM方式（自己`SendInput`/`mouse_event`プライミング）が実際に必要であることが、無関係な第三者プロセスに対しても実証された。8.1節の既定実装方針は、推測ではなく実機実証済みの確定事項として扱える。
+
+## F27（S14）：WH_KEYBOARD_LLが文書上の挙動と食い違った
+
+`LowLevelKeyboardProc`の公式ドキュメントは「Windows 7以降、タイムアウトしたフックは黙って外される」と明記している（feasibility.md §3でも確認済み）。S14ではフックのコールバックを約1150ms停止させ（文書上の最大許容値1000msを超過）、その後1回のキー入力に対するコールバック呼び出し回数をベースライン（停止なしで2回）と比較したが、脱落を示す結果は得られなかった。
+
+考えられる原因は複数あり、どれが正しいかは今回の検証だけでは分からない：(a) このCI環境（GitHub Actions windows-latest）のレジストリの`LowLevelHooksTimeout`実効値が文書の記述と異なる、(b) 判定手段（1回のキー入力後の呼び出し回数比較）がフックの脱落を正しく検出できていない、(c) スレッドの状態（メッセージポンプの有無等）がこの検証では文書が想定する条件を満たしていない。再登録による自己回復ロジック（8.1で「検討する」と書かれている、まだ確定していない項目）は、脱落自体が起きなかったため一度も試せていない。**別の判定手段（例：フック登録直後に`GetLastError`を確認する、より長い停止時間を試す、実機デスクトップでも同条件を確認する）での再検証が必要**。
 
 ## CI実機検証で踏んだ地雷（それ自体が成果）
 

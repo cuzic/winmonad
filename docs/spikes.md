@@ -96,6 +96,62 @@ Phase 0は「要素技術の確認」ではなく、**捨てる前提の素朴�
 - **記録する内容**: Per-Monitor-V2対応アプリと非対応アプリでの挙動差、対応アプリで2段階目のSetWindowPosが実際に観測されるタイミング。
 - **判定**: 「型に反映」の可能性あり。ShellがDPI Awarenessを取得して対応/非対応で異なる完了判定をする設計（architecture.md 8.3）を、`SelfRepositionAfterMs`と区別する`DpiSelfResize`のような振る舞い種別として疑似OSに反映する必要があるか判断する。
 
+### S12. Cloakの自己/他者判別と未文書化COMによる制御（21章/R3-8対応）【他者要因の一部のみCI検証済み、自己要因は未着手：failure-catalog.md F26】
+**結果（部分）**：§21のワークスペース非表示方式の判断は2つの軸を持つ——(a) WM自身が付けたCloakを他要因（他の仮想デスクトップ、UWPゴーストフレーム）によるCloakと`CloakState`の理由ビットだけで区別できるか、(b) 未文書化の`IApplicationView::SetCloak`で非表示/復帰できるか。今回CIで安全に試せる範囲として、(a)のうち「オーナー窓の最小化によるCloak(`DWM_CLOAKED_INHERITED`)」という他要因の一例だけをS13bとして検証したが、仮説通りの挙動が得られず（F26）、データが得られなかった。(a)の残り（他の仮想デスクトップ、ゴーストフレーム）と(b)（自己要因、未文書化COM）はまだ全く手を付けていない。
+- **検証する前提**: `DWMWA_CLOAKED`の理由ビット（`DWM_CLOAKED_APP`/`SHELL`/`INHERITED`）が、Cloakの原因ごとに実際に異なる値を返すか。WM自身が`IApplicationView::SetCloak`相当の操作でCloak/解除を行えるか。
+- **方法**: (a)は複数の誘発方法（オーナー最小化、仮想デスクトップ切替、UWPゴーストフレーム）それぞれで`DwmGetWindowAttribute(DWMWA_CLOAKED)`を観測し比較する。(b)は`IApplicationView`/`IVirtualDesktopManager`系の未文書化COMインターフェース（GUIDがWindowsビルドごとに変わりうる）を安全に呼べるラッパー（既存の検証済みOSSラッパーライブラリの利用を検討する、生のCOM相互運用をブラインドで書かない）で試す。
+- **記録する内容**: 誘発方法ごとの理由ビットの値、COM呼出の成否、安全停止の復旧経路からの呼出可否（8.4）。
+- **判定**: (a)(b)のどちらかが満たせない場合はCloakを21章の選択肢から外す（既存方針）。
+
+### S13. ObservedPresenceの方式非依存性（4.5対応）【CI実機検証済み：failure-catalog.md F25】
+**結果**：テスト窓を`(IsVisible, IsMinimized, DWMWA_CLOAKED)`で観測すると、「通常表示」=(true,false,0)、`SW_HIDE`=(false,false,0)、`SW_MINIMIZE`=(true,true,0)、「画面外へ移動」=(true,false,0)。**「画面外へ移動」と「通常表示」が同一タプルになり区別できない**。21章の「画面外へ移動」方式を使う場合、`ObservedPresence`の判定には矩形位置も必要（4.5は元々「Shellが自分の非表示方式を知って判定する」前提なので設計の誤りではないが、具体的に明記すべき）。
+- **検証する前提**: 4.5の`ObservedPresence`（`VisibleToUser`/`HiddenByWmMethod`/`HiddenOther`）が、窓の非表示方式（`SW_HIDE`/最小化/画面外移動/Cloak）それぞれについて、Shell側で観測可能な属性から一意に導出できるか。
+- **方法**: テスト窓を4つの状態（通常表示、`SW_HIDE`、`SW_MINIMIZE`、画面外へ移動）それぞれにし、`IsVisible`/`IsMinimized`/`DWMWA_CLOAKED`を記録して状態ごとに比較する。
+- **記録する内容**: 状態ごとの属性タプル、タプルが一意かどうか。
+- **判定**: 「型に反映」（確定。4.5に、非表示方式ごとにShellが追加で見るべき属性を明記する）。
+
+### S14. WH_KEYBOARD_LLの無言脱落と自己回復（8.1対応）【CI実機検証済み：failure-catalog.md F27、文書と矛盾する結果・要再検証】
+**結果**：フックのコールバックを約1150ms停止（文書上の上限1000msを超過）させたが、脱落は観測されなかった（呼び出し回数での判定）。文書の記述（Windows 7以降は無言で脱落）と一致しない。判定方法自体に疑問があり、再検証が必要（F27参照）。
+- **検証する前提**: `LowLevelHooksTimeout`を超えてブロックしたフックコールバックが実際に無言で外れるか、再登録で回復できるか（feasibility.md §3）。
+- **方法**: `WH_KEYBOARD_LL`フックを別スレッドで登録し、コールバックを意図的に1秒超停止させ、その後のキー入力への反応（呼び出し回数）で脱落を判定する。
+- **記録する内容**: 停止前後の呼び出し回数、再登録の成否。
+- **判定**: 未確定（要再検証。判定方法の見直し、または実機デスクトップでの再確認）。
+
+### S15. ProcessKeyによるHWND再利用検知（4.5 Sticky規則対応）【CI実機検証済み：failure-catalog.md F28】
+**結果**：2つの子プロセスを連続起動し`(Pid, CreationTime)`を記録すると、PID（9492→6712）・作成時刻とも異なり、キーの衝突は無かった。メカニズム自体は想定通り動作することを確認（実際のPID再利用は偶然に依存するため再現できていない）。
+- **検証する前提**: `GetWindowThreadProcessId`+`GetProcessTimes`による`(Pid, CreationTime)`の組が、HWND再利用（プロセス再起動後の同一HWND）を正しく検知できるか。
+- **方法**: 子プロセスを起動→終了→再起動し、2回分の`(Pid, CreationTime)`を比較する。
+- **記録する内容**: 各回のPID・作成時刻、キーの衝突有無。
+- **判定**: 「無視してよい」（メカニズム確認。4.5のSticky規則の前提は妥当）。
+
+### S16. Hung→Responding復帰（4.5 Responsiveness対応）【CI実機検証済み：failure-catalog.md F29】
+**結果**：ハング中（最後のポンプから約6秒）は`SendMessageTimeout`が`returned=0, elapsedMs=0`（ハング）。その後子窓がメッセージポンプを再開すると、同じ呼出が`returned=1, elapsedMs=17`（応答）に変わった。**復帰方向を実機で初めて確認**（既存のS2/F05〜F08は進入方向のみ）。
+- **検証する前提**: ハングと判定された窓が応答を取り戻した後、`SendMessageTimeout`が正しく「応答あり」に戻るか。
+- **方法**: S2のハング窓ハーネスを拡張し、一定時間停止後にメッセージポンプを再開させ、前後で`SendMessageTimeout(WM_NULL, SMTO_ABORTIFHUNG)`を呼ぶ。
+- **記録する内容**: 停止中・復帰後それぞれの戻り値・経過時間。
+- **判定**: 「型に反映」（確定。4.5のResponsiveness信念の復帰規則を実証）。
+
+### S17. RequestClose/WM_CLOSEの丁寧な拒否（7.1 R6-2対応）【CI実機検証済み：failure-catalog.md F30】
+**結果**：`WM_CLOSE`を無視する窓へ`PostMessage(WM_CLOSE)`を送ると、呼出は即時（0ms、非ブロッキング）に返り、窓は生存したまま（WndProcは`WM_CLOSE`を受信）。通常の窓（`DestroyWindow`を呼ぶ）は実際に閉じた。
+- **検証する前提**: `RequestClose`Effect（`WM_CLOSE`の送信）が非ブロッキングで、アプリ側が拒否できる「丁寧な要求」として機能するか。
+- **方法**: `WM_CLOSE`を無視する窓・通常に閉じる窓の両方へ`PostMessage(WM_CLOSE)`を送り、呼出時間と窓の生死を確認する。
+- **記録する内容**: 呼出のブロック時間、窓の生死、WndProcでの受信回数。
+- **判定**: 「Bで対処」（確定）。
+
+### S18. MoveSizeEnded矩形/モニタ捕捉（4.4 R4-7対応、単一モニタ部分のみ）【CI実機検証済み：failure-catalog.md F31】
+**結果**：投稿メッセージによる`WM_ENTERSIZEMOVE`/`WM_EXITSIZEMOVE`のシミュレーションで、ドロップ時点の矩形`(400,250,700,450)`（意図した移動先と一致）とモニタハンドル`65537`を正しく捕捉した。単一モニタでの捕捉機構のみの確認であり、クロスモニタでの実際の転送（R3-4の本来の動機）はS11と同じ理由で未検証。
+- **検証する前提**: `WM_EXITSIZEMOVE`のハンドリングで、ドロップ時点の矩形・モニタを正確に捕捉できるか（v2.6の`MoveSizeEnded`ペイロード変更、R4-7）。
+- **方法**: テスト窓へ投稿メッセージで`WM_ENTERSIZEMOVE`→移動→`WM_EXITSIZEMOVE`を発生させ、ハンドラ内で`GetWindowRect`/`MonitorFromWindow`を呼ぶ。実際のドラッグ（`SendInput`）は使わず、過去のVK_MENUハング教訓を踏まえてより安全な投稿メッセージ方式を採った。
+- **記録する内容**: 捕捉した矩形・モニタハンドル、意図した移動先との一致。
+- **判定**: 「Bで対処」（単一モニタの捕捉機構は確定。クロスモニタはS11同様実機待ち）。
+
+### S19. DpiAwarenessContext問い合わせの健全性確認（8.3対応、低優先）【CI実機検証済み：failure-catalog.md F32、実装の穴あり】
+**結果**：`GetWindowDpiAwarenessContext`は自作/子WinFormsウィンドウで`0x6010`、`notepad.exe`で`0x22`という異なる値を返し、API呼出経路自体は機能した。ただしスパイクのラベル関数が既知sentinel値（-1〜-5）しか判定しておらず両方`unknown`と表示された（実装の手抜き、`GetAwarenessFromDpiAwarenessContext`呼出で直る見込み）。実際のマルチDPI問題（S11）は未解決のまま。
+- **検証する前提**: `GetWindowDpiAwarenessContext`の呼出経路がこの環境で機能するか（マルチDPI問題自体の解決ではない）。
+- **方法**: 複数の既存テスト窓・外部プロセス（notepad.exe）に対し呼び出し、返り値を記録する。
+- **記録する内容**: プロセスごとの返り値。
+- **判定**: 「無視してよい」（低優先。本質的な問題はS11のまま実機待ち）。
+
 ## 失敗カタログのテンプレート（`docs/failure-catalog.md`、Phase 0完了時に作成）
 
 ```markdown
