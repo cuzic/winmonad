@@ -358,6 +358,24 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             | _ -> { stateAfterMovability with Workspaces = workspaces' }, []
         | _ -> stateAfterMovability, []
 
+    // `UserCommand CloseFocused`（§4.4「focused = Elsewhereなら何もしない」、v2.34）：`RequestClose`
+    // （`WM_CLOSE`相当の丁寧な要求、アプリが拒否できる——8.4「窓を破壊・終了するEffectを提供しない」に
+    // 反しない）を発行する。architecture.mdの§4.4本文は、より層を分けた経路（Workspacesが
+    // `CloseRequested w`を出し、Placementが`RequestClose`へ変換する、§7.1段⑤/⑦の表参照）を描くが、
+    // この経路は複数の入口から来る`FocusTargetRequested`/`RequestClose`候補を1つに調停するための
+    // もの（R6-2「RequestForegroundは全経路のFocusTargetRequestedのうち最後の1件だけから作る」）。
+    // 現在のstepは1入力につき1つのUserCommandしか処理しない（競合する候補が同じstep内で複数生じる
+    // 経路が無い）ため、v2.27のMoveFocusedToWorkspace以降の3ラウンドと同じく、調停が要らない
+    // この段階ではWmState.stepから直接Effectを発行する簡略形を採る——複数の経路が同じstepで競合する
+    // 入口（`TopologySettled`のHeldFocusTarget再発行等、R7-3）を実装する時点で、この簡略化は見直しが
+    // 必要になる。
+    let stateAfterMovability, closeFocusedEffects =
+        match envelope.Input, focused stateAfterMovability with
+        | UserCommand CloseFocused, ManagedWindow w ->
+            let rid, placementSt' = Placement.allocateRequestId stateAfterMovability.Placement
+            { stateAfterMovability with Placement = placementSt' }, [ RequestClose (rid, w) ]
+        | _ -> stateAfterMovability, []
+
     // Health：ResponsivenessReprobeタイマーの発火と、PlacementのEffectCallReturned処理が`TargetHung`と
     // 判定した場合のResponsiveness修正（§7.2「EffectCallReturned(Error) → classify → TargetHung →
     // Cancelled ＋ Responsiveness:=Hung」。この信念修正自体はHealthの管轄なのでPlacement.fsではなく
@@ -484,7 +502,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
           HiddenByWm = Set.empty
           NeedsRestore = Set.empty }
 
-    let gated, rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects @ switchForegroundEffects @ focusRotateEffects)
+    let gated, rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects @ switchForegroundEffects @ focusRotateEffects @ closeFocusedEffects)
 
     // §7.2「GateRejected → Cancelled（Deadlineまで待たず同じstep内で即時に遷移する）」。
     let rejectedRequestIds = rejected |> List.choose fst

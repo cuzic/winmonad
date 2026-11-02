@@ -402,6 +402,34 @@ let ``FocusNextはアクティブなモニターが無い(NoMonitors)場合、�
     Assert.Empty(afterNext.Effects)
 
 [<Fact>]
+let ``CloseFocusedはfocusedの窓へRequestCloseを発行する(v2.34)`` () =
+    let w = WindowId 1L
+    let afterW = settleOneMonitorThenDiscoverWindow w
+    let afterFocused = step RuntimePolicy.defaults afterW.Next (mkEnvelope 101L (mkForegroundObserved 101L w))
+    match focused afterFocused.Next with
+    | ManagedWindow target -> Assert.Equal(w, target)
+    | Elsewhere -> Assert.True(false, "expected w to be focused")
+
+    let afterClose = step RuntimePolicy.defaults afterFocused.Next (mkEnvelope 102L (UserCommand CloseFocused))
+    let effects = afterClose.Effects |> List.map GatedEffect.effect
+    Assert.Contains(effects, function RequestClose (_, target) -> target = w | _ -> false)
+
+[<Fact>]
+let ``CloseFocusedは、窓が存在してもフォーカスが無い(Elsewhere)なら何もしない`` () =
+    // 窓が1つも無い状態だと、「focusedを見ずに何か適当な窓を閉じようとする」という壊れたガードでも
+    // 偶然「対象が無いので何もしない」になってしまい区別できない（最初のmutation testingの試行で
+    // 実際に踏んだ）。窓は存在するがForegroundObservedを一度も受けていない(focused=Elsewhere)、
+    // という状態で検査する。
+    let w = WindowId 1L
+    let afterW = settleOneMonitorThenDiscoverWindow w
+    match focused afterW.Next with
+    | Elsewhere -> ()
+    | ManagedWindow _ -> Assert.True(false, "expected Elsewhere before any ForegroundObserved")
+    let afterClose = step RuntimePolicy.defaults afterW.Next (mkEnvelope 101L (UserCommand CloseFocused))
+    let effects = afterClose.Effects |> List.map GatedEffect.effect
+    Assert.DoesNotContain(effects, function RequestClose _ -> true | _ -> false)
+
+[<Fact>]
 let ``WindowRemovedは同じstepでPlacement.Geometryも除く`` () =
     let state = initial RuntimePolicy.defaults
     let obs: Observation<bool> = { Value = Ok true; SampleSequence = 1L; MonotonicTime = 1L; Source = "test" }
