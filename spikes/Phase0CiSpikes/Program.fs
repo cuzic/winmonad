@@ -28,6 +28,10 @@
 // SetWinEventHook (the same mechanism the real Shell will use for
 // ForegroundObserved) around repeated self-process foreground switches,
 // to measure hook-delivery latency and detect any post-switch bounce.
+// S20b follows up on S20's first-round result (clean, no bounce) with a
+// more faithful reproduction of what SwitchSettle actually guards
+// against: SwitchWorkspace's real hide-then-show-then-RequestForeground
+// order (S20 only exchanged focus between two already-visible windows).
 // The *r-suffixed spikes (S4r/S5r/S7r/S11r) are real-desktop-
 // only: they need a genuine interactive desktop (an existing third-party
 // foreground window, a modern UWP shell, an already-running elevated
@@ -1693,6 +1697,82 @@ let spikeS20_SwitchSettleTiming () =
         finally
             UnhookWinEvent(hook) |> ignore
 
+// S20b: S20は「どちらも既にvisibleな2窓間の単純なフォーカス交換」であり、architecture.mdの
+// SwitchSettleが本来吸収したい経路——`SwitchWorkspace`が旧Workspaceの窓を隠し(`SetPresence`)、
+// 新Workspaceの窓を見せてからフォーカスを要求する——を再現していなかった。隠す操作そのものが
+// OS側の一時的なフォーカス再割り当て（例えば隠した窓が前面だった場合、何かへ"揺れ"てから
+// 目的の窓へ落ち着く）を引き起こすかどうかが、単純なフォーカス交換だけでは検証できない。
+// 本spikeは`ShowWindow(SW_HIDE)`で前面窓を隠した直後に(self-priming付き)`SetForegroundWindow`
+// で別窓へ要求する、という実際の`SwitchWorkspace`の順序を再現し、目的の窓以外への
+// `EVENT_SYSTEM_FOREGROUND`が先行して届くか（＝本当の意味での「揺れ」）を記録する。
+let spikeS20b_WorkspaceHideShowSettle () =
+    let SW_HIDE = 0
+    let SW_SHOWNOACTIVATE = 4
+    let MOUSEEVENTF_MOVE = 0x0001u
+    let EVENT_SYSTEM_FOREGROUND = 0x0003u
+    let WINEVENT_OUTOFCONTEXT = 0x0000u
+
+    let events = ResizeArray<int64 * IntPtr>()
+    let sw = Stopwatch()
+    let callback =
+        WinEventProc(fun _hWinEventHook eventType hwnd _idObject _idChild _idEventThread _dwmsEventTime ->
+            if eventType = EVENT_SYSTEM_FOREGROUND then
+                events.Add(sw.ElapsedMilliseconds, hwnd))
+
+    let hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, callback, 0u, 0u, WINEVENT_OUTOFCONTEXT)
+    if hook = IntPtr.Zero then
+        log (sprintf "- SetWinEventHook(EVENT_SYSTEM_FOREGROUND) failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+    else
+        try
+            use formA = new Form(Text = "S20b-A", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(100, 100, 200, 150))
+            use formB = new Form(Text = "S20b-B", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(400, 100, 200, 150))
+            formA.Show()
+            formB.Show()
+            pump 5
+
+            let label (target: Form) (other: Form) (hwnd: IntPtr) =
+                if hwnd = target.Handle then "target"
+                elif hwnd = other.Handle then "other-known"
+                else "unexpected-third-party"
+
+            let roundTrip (hideForm: Form) (showForm: Form) (tag: string) =
+                SetForegroundWindow(hideForm.Handle) |> ignore
+                pump 5
+                events.Clear()
+                sw.Restart()
+                ShowWindow(hideForm.Handle, SW_HIDE) |> ignore
+                mouse_event (MOUSEEVENTF_MOVE, 0, 0, 0u, UIntPtr.Zero)
+                let apiOk = SetForegroundWindow(showForm.Handle)
+                while sw.ElapsedMilliseconds < 800L do
+                    Application.DoEvents()
+                    Thread.Sleep(1)
+                let snapshot = events |> List.ofSeq
+                let firstToTarget = snapshot |> List.tryFind (fun (_, h) -> h = showForm.Handle)
+                let precedingNonTarget =
+                    match firstToTarget with
+                    | Some (t, _) -> snapshot |> List.filter (fun (t2, h) -> t2 <= t && h <> showForm.Handle)
+                    | None -> snapshot
+                log (
+                    sprintf
+                        "- %s: API returned=%b, first-to-target=%s, events=%s, preceding-non-target(=the wobble SwitchSettle would need to absorb)=%s"
+                        tag
+                        apiOk
+                        (match firstToTarget with
+                         | Some (t, _) -> sprintf "%dms" t
+                         | None -> "NEVER")
+                        (snapshot |> List.map (fun (t, h) -> sprintf "(%dms,%s)" t (label showForm hideForm h)) |> String.concat " ")
+                        (if precedingNonTarget.IsEmpty then "none" else sprintf "%d event(s)" precedingNonTarget.Length)
+                )
+                // Restore hideForm's visibility (without stealing focus) so the next round trip starts clean.
+                ShowWindow(hideForm.Handle, SW_SHOWNOACTIVATE) |> ignore
+                pump 3
+
+            for i in 1 .. 5 do
+                roundTrip formA formB (sprintf "round %d hide(A)->show(B)" i)
+                roundTrip formB formA (sprintf "round %d hide(B)->show(A)" i)
+        finally
+            UnhookWinEvent(hook) |> ignore
+
 [<STAThread>]
 [<EntryPoint>]
 let main argv =
@@ -1753,6 +1833,7 @@ let main argv =
         tryRun "S18 MoveSizeEnded矩形/モニタ捕捉(単一モニタのみ、R4-7)" spikeS18_MoveSizeCapture
         tryRun "S19 DpiAwareness問い合わせの健全性確認(低優先、実多DPI問題は未解決)" (fun () -> spikeS19_DpiAwarenessQuery exePath)
         tryRun "S20 SwitchSettleのための前面切替フック遅延/揺れの実測(4.4/R4-5)" spikeS20_SwitchSettleTiming
+        tryRun "S20b SwitchWorkspace実際の順序(hide->show->RequestForeground)での揺れの実測(4.4/R4-5)" spikeS20b_WorkspaceHideShowSettle
 
         log "\n(all spikes finished without the watchdog firing)"
         0
