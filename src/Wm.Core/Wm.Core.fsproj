@@ -11,6 +11,7 @@
     <Compile Include="Topology.fs" />
     <Compile Include="Workspaces.fs" />
     <Compile Include="Health.fs" />
+    <Compile Include="Focus.fs" />
   </ItemGroup>
 
   <ItemGroup>
