@@ -19,7 +19,14 @@
 /// 返せるようになったので配線した。`onEffectCallReturned`は`classify`の結果に応じて`Cancelled`にし、
 /// `Denied OtherDenial`なら`Movability`を`NotMovable`へ修正する。`TargetHung`時の`Health.Responsiveness`
 /// 修正はPlacementの管轄外（Health.fsの責務）なので、呼び出し側（`WmState.step`）が
-/// `onEffectCallReturned`の戻り値（`(WindowId * EffectFailure) option`）を見て行う。
+/// `onEffectCallReturned`の戻り値（`(WindowId * EffectFailure) option`）を見て行う。`Unplaced`への
+/// 読み替え（`Movability = NotMovable`→Core.Windowsが`EffUnplaced`を導く）はv2.23で閉じた
+/// （Windows.fsのファイル冒頭コメント参照）。
+///
+/// `Movability`の`Satisfied`→`Movable`遷移（v2.24追加）：`checkPendingSatisfied`が一致を検出した
+/// その場で`Movable`（`Confirmed`）へ確定する（§4.5。「試したかどうか」の判定は不要——この遷移は
+/// 無条件に「配置できた」という直接の証拠であり、既にMovableの窓に対しても確度を`Inferred []`から
+/// `Confirmed`へ進める意味を持つ）。
 ///
 /// このラウンドで意図的に対象外にしたこと（いずれも「できればやる」ではなく、別の未実装の仕組みが
 /// 前提になっているため実装できない項目であり、専用のラウンドへ切り出す）：
@@ -27,18 +34,13 @@
 ///   `onEffectCallReturned`も1回で諦め、`Desired`も取り消す（次のReconcileが最初から再試行する、
 ///   バックオフでの間隔調整は無い。`Transient`/`Unclassified`も同じ単発の諦めにする）。
 /// - **`Mismatch` → `Reevaluate`**：観測が`TargetRect`と一致しない場合、`checkPendingSatisfied`は
-///   何もしない（Pendingはそのまま残り、`PendingDeadline`満了か次のReconcileに委ねる）。
-/// - **`Movability`の`Satisfied`→`Movable`遷移、ユーザー操作による1回だけの試し直し**：前者は
-///   「試したかどうか」の判定にPendingの履歴照合が要り、後者はユーザーコマンド経由でPlacementへの
-///   新しい入口が要る——どちらも専用のラウンドへ切り出す。
-/// - **`Unplaced`への読み替え（既知のギャップ、v2.22で発見）**：`Denied OtherDenial`で`Movability`を
-///   `NotMovable`にしても、Windows側（`classificationView`）はまだ`Movability`を常に`Movable`として
-///   読む（Windows.fsのファイル冒頭コメント参照）ため、§4.4の「`NotMovable`の窓は`Unplaced`として
-///   Workspacesから外す」が起こらない。その窓は`Tiled`のままWorkspacesに残り、次のReconcileトリガーの
-///   たびに`Desired`が空（`onEffectCallReturned`が取り消したため）なので再試行し、ゲートに
-///   `TargetNotMovable`で弾かれ、`onGateRejected`が再び`Desired`を取り消す……という無駄な繰返しになる
-///   （安全だが非効率。クラッシュや誤動作にはならない）。Windows側がPlacementの`Movability`を読んで
-///   `EffUnplaced`を導く配線は、Core.Windowsの次のラウンドへ持ち越す。
+///   何もしない（Pendingはそのまま残り、`PendingDeadline`満了か次のReconcileに委ねる）。即座に
+///   `Desired`を取り消して再試行させる実装も検討したが、`SetRect`完了前に届く無関係な観測
+///   （他の属性変化による全体Snapshot等）が、まだ反映されていない古い矩形を運んで「不一致」と
+///   誤判定し、実際には進行中のPendingを早まって取り消してしまう危険がある（`IntentEpoch`照合や
+///   観測の鮮度判定が無いこのラウンドでは安全に区別できない）。安全側に倒して対象外のままにする。
+/// - **ユーザー操作による1回だけの試し直し**：ユーザーコマンド経由でPlacementへの新しい入口が要る
+///   ——専用のラウンドへ切り出す。
 /// - **トポロジ確定（ScreenSettle満了）→`Superseded`**：`Topology`が出す`TopologySettled`
 ///   DomainEventはまだ`step`で捨てられている（Opusレビュー5-3）。配線すればPendingの一括失効も書ける。
 /// - **`MinWidth`/`DpiBehavior`（Accumulating規則）**：証拠（`SetRect`の`Mismatch`、DPI切替後の
@@ -147,13 +149,19 @@ let private scheduleIntegrityReprobe
 /// §7.2のPending→Satisfied遷移：窓`w`の現在の`Geometry.VisibleFrameRect`と、`w`宛てのPendingの
 /// `TargetRect`が一致すれば、そのPendingを取り除き待ちのタイマーを取り消す。複数のPendingが同じ窓を
 /// 指すことは無い（`dispatchPlacements`が新しい意図を発行する際に古いPendingを必ず失効させるため、下記）。
-let private checkPendingSatisfied (w: WindowId) (state: PlacementState) : PlacementState * TimerCommand<TimerId> list =
+/// §4.5「`SetRect`の目標矩形が観測されたら（7.2のSatisfied）`Movable`（`Confirmed`）」も同じ場所で行う
+/// （v2.24追加）——発見時の楽観的既定値（`Inferred []`）を、実際に配置できたという直接の証拠で確定へ進める。
+let private checkPendingSatisfied (now: int64) (w: WindowId) (state: PlacementState) : PlacementState * TimerCommand<TimerId> list =
     let observedRect = Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.VisibleFrameRect)
     match observedRect with
     | None -> state, []
     | Some rect ->
         match state.Pending |> Map.toSeq |> Seq.tryFind (fun (_, pr) -> pr.Window = w && pr.TargetRect = rect) with
-        | Some (rid, _) -> { state with Pending = Map.remove rid state.Pending }, [ CancelTimer (TimerId.Placement (PendingDeadline rid)) ]
+        | Some (rid, _) ->
+            { state with
+                Pending = Map.remove rid state.Pending
+                Movability = Map.add w { Value = Movable; Confidence = Confirmed; LastRevisedAt = now } state.Movability },
+            [ CancelTimer (TimerId.Placement (PendingDeadline rid)) ]
         | None -> state, []
 
 /// `WindowObserved`：§7.1段①「Windows→Placement→Health→Focus」のPlacement分。Windowsと同じ入力から
@@ -217,7 +225,7 @@ let onWindowObserved (now: int64) (snapshot: WindowSnapshot) (state: PlacementSt
     // ここでGeometryが今まさに更新されたVisibleFrameRectと、窓宛てのPendingのTargetRectを照合する。
     // Mismatch（§7.2の`Reevaluate`）はこのラウンドでは明示的に扱わず、一致しなければ次のPendingDeadline
     // タイマーの発火（またはこの先の再Reconcile）に委ねる（ファイル冒頭「対象外」参照）。
-    let pendingState, pendingTimerCmds = checkPendingSatisfied w stateAfterBeliefs
+    let pendingState, pendingTimerCmds = checkPendingSatisfied now w stateAfterBeliefs
     pendingState, effects, timerCmds @ pendingTimerCmds
 
 let onMinimizedStateChanged (now: int64) (w: WindowId) (obs: Observation<bool>) (state: PlacementState) : PlacementState =

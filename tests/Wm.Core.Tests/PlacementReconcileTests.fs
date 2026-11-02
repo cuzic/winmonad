@@ -118,6 +118,20 @@ let ``観測された矩形がPendingのTargetRectと一致すればSatisfiedに
     Assert.NotEmpty(timerCmds) // CancelTimerが出る
 
 [<Fact>]
+let ``Satisfiedになった瞬間、Movabilityの確度はInferred[]からConfirmedへ進む`` () =
+    let w = WindowId 1L
+    // 発見（onWindowObserved）で楽観的既定値（Movable, Inferred []）が入る。
+    let afterDiscovered, _, _ = onWindowObserved 5L (observedSnapshot w { X = 0; Y = 0; Width = 1; Height = 1 } 0L) initial
+    match Map.tryFind w afterDiscovered.Movability with
+    | Some { Value = Movable; Confidence = Inferred [] } -> ()
+    | other -> Assert.True(false, sprintf "expected the discovery default, got %A" other)
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterDiscovered
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w workArea 1L) afterReconcile
+    match Map.tryFind w afterObserved.Movability with
+    | Some { Value = Movable; Confidence = Confirmed } -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+
+[<Fact>]
 let ``観測された矩形がTargetRectと一致しなければPendingは残る(Mismatchはこのラウンドでは静観)`` () =
     let w = WindowId 1L
     let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial

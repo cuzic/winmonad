@@ -1,5 +1,14 @@
 # Windows プログラマブル・ウィンドウマネージャー 統合設計書
 
+Version: 2.24（§4.5のMovability信念規則のうち未実装だった「`Satisfied`（Pendingが観測と一致）の瞬間に
+`Movable`（`Confirmed`）へ確定する」を`checkPendingSatisfied`に実装した。「試したかどうか」の判定は
+不要で、この遷移は無条件に「配置できた」という直接の証拠であり、既にMovableの窓に対しても確度を
+`Inferred []`から`Confirmed`へ進める意味を持つ。あわせて`Mismatch` → `Reevaluate`を依然未実装のまま
+とする理由を明文化した：観測が`TargetRect`と一致しない場合に即座に`Desired`を取り消して再試行させる
+実装も検討したが、`SetRect`完了前に届く無関係な観測（他の属性変化による全体Snapshot等）が、まだ
+反映されていない古い矩形を運んで「不一致」と誤判定し、実際には進行中のPendingを早まって取り消して
+しまう危険がある（`IntentEpoch`照合や観測の鮮度判定が無いこのラウンドでは安全に区別できない）ため、
+安全側に倒して対象外のままにする）
 Version: 2.23（v2.22で見つけ記録した既知のギャップ（`Denied OtherDenial`で`Movability`が`NotMovable`に
 なっても、Windows側がまだこれを読んで`Unplaced`へ降格しない）を閉じた。`Core.Windows`の
 `ClassificationCtx`に`Movability: Map<WindowId, Belief<Movability>>`（Placementの信念の読み取り専用の
@@ -10,7 +19,10 @@ Version: 2.23（v2.22で見つけ記録した既知のギャップ（`Denied Oth
 （`ByUserOverride`の窓は対象外、§4.4のUnplaced読み替えはPolicyの分類結果に対する規則なのでR4-20と
 同じ理由でユーザーの明示的な指定を上書きしない）。`classificationEvent`も`EffUnplaced`を`EffExcluded`
 と同じく`WindowUnmanaged`として扱うようになった（§4.4「動かせない窓はどのWorkspaceにも属さない」）。
-これにより、前バージョンで「安全だが非効率」としていた無駄な再試行・ゲート拒否の繰返しが止まる）
+これにより、前バージョンで「安全だが非効率」としていた無駄な再試行・ゲート拒否の繰返しが止まる）／
+`checkPendingSatisfied`が一致観測を検出した瞬間に`Movability`を`Movable`（`Confirmed`）へ確定するように
+した。`Mismatch` → `Reevaluate`は安全上の理由（鮮度判定無しでは誤判定の危険）で意図的に未実装のまま
+とすることを明文化した（v2.24）
 Version: 2.22（Wm.Simulationが`EffectCallReturned`を実際に返せるようになったので（v2.21）、
 `InputEvent.EffectCallReturned`をPlacement/Healthへ配線した。`Placement.onEffectCallReturned`は
 `Ok ()`では何もせず（§7.2「目標矩形を観測するまではSatisfiedにしない」）、`Error`は`classify`で
