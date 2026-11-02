@@ -298,6 +298,20 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         else
             stateAfterMovability, []
 
+    // `WorkspaceHidden`/`WorkspaceShown`（v2.31で消費を開始。`CurrentChanged`は`SwitchWorkspace`自体が
+    // 未配線のため依然捨てる）：現時点でこれらを出すのは`MonitorLifecycle.reconcile`（モニター接続・
+    // 切断、`settle`の中で`TopologySettled`と同時に発行される）だけだが、将来`SwitchWorkspace`を
+    // 配線しても同じ受け口を再利用できる。該当Workspaceに属する窓を`Placement.onWorkspaceHidden`/
+    // `onWorkspaceShown`へ渡し、`Desired`/`SetPresence`を更新する（Placement.fsのコメント参照）。
+    let windowsOfWorkspace (ws: WorkspaceId) : WindowId list =
+        (WorkspaceSet.stateOf ws stateAfterMovability.Workspaces).Stack |> Option.map Zipper.toList |> Option.defaultValue []
+    let hiddenWindows = topologyEvents |> List.choose (function WorkspaceHidden ws -> Some ws | _ -> None) |> List.collect windowsOfWorkspace
+    let shownWindows = topologyEvents |> List.choose (function WorkspaceShown (ws, _) -> Some ws | _ -> None) |> List.collect windowsOfWorkspace
+    let stateAfterMovability, presenceEffects =
+        let placementSt1, e1 = Placement.onWorkspaceHidden hiddenWindows stateAfterMovability.Placement
+        let placementSt2, e2 = Placement.onWorkspaceShown shownWindows placementSt1
+        { stateAfterMovability with Placement = placementSt2 }, e1 @ e2
+
     // Health：ResponsivenessReprobeタイマーの発火と、PlacementのEffectCallReturned処理が`TargetHung`と
     // 判定した場合のResponsiveness修正（§7.2「EffectCallReturned(Error) → classify → TargetHung →
     // Cancelled ＋ Responsiveness:=Hung」。この信念修正自体はHealthの管轄なのでPlacement.fsではなく
@@ -424,7 +438,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
           HiddenByWm = Set.empty
           NeedsRestore = Set.empty }
 
-    let gated, rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects)
+    let gated, rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects)
 
     // §7.2「GateRejected → Cancelled（Deadlineまで待たず同じstep内で即時に遷移する）」。
     let rejectedRequestIds = rejected |> List.choose fst
@@ -432,9 +446,9 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     let finalNext = { next with Placement = placementAfterGateRejection }
 
     // 段①のDomainEventは、消費する後続の段（Topologyの`current`追従等）がまだ無いため捨てる
-    // （Opusレビュー5-3）。段②のDomainEventのうち`TopologySettled`はv2.29で消費するようになった
-    // （上記）。`WorkspaceShown`/`WorkspaceHidden`/`CurrentChanged`は`SwitchWorkspace`自体が未配線の
-    // ため依然捨てる。
+    // （Opusレビュー5-3）。段②のDomainEventのうち`TopologySettled`（v2.29）/`WorkspaceShown`/
+    // `WorkspaceHidden`（v2.31）は上で消費するようになった。`CurrentChanged`は`SwitchWorkspace`
+    // 自体が未配線のため依然捨てる。
     ignore stage1Events
     ignore topologyEvents
 

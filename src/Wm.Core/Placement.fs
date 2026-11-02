@@ -58,6 +58,16 @@
 /// がTimerCommandを返せるようになったので、`rid`自身の`PendingDeadline`タイマー（まだ生きている状態で
 /// 呼ばれるため、諦める場合もCancelTimerが必要）という既存の取りこぼしも同時に塞いだ。
 ///
+/// `WorkspaceHidden`/`WorkspaceShown` → `HiddenByWm`/`Shown None`（v2.31追加）：`onWorkspaceHidden`/
+/// `onWorkspaceShown`が、そのWorkspaceに属する窓の`Desired`を更新し`SetPresence`を発行する
+/// （`DesiredPresence`の型直前のコメント参照）。`SwitchWorkspace`自体はまだ未配線だが、
+/// `MonitorLifecycle.reconcile`（モニター接続・切断）は既に`WorkspaceShown`/`WorkspaceHidden`を
+/// 発行しており（`settle`の中で`TopologySettled`と同時に）、`WmState.step`はこれまで捨てていた
+/// （v2.29の`WorkspaceShown`/`WorkspaceHidden`/`CurrentChanged`は依然捨てたままという記述を、
+/// `WorkspaceShown`/`WorkspaceHidden`の消費分だけ更新した）。これにより、モニター切断で非表示になった
+/// WorkspaceのウィンドウがOS側では表示されたまま取り残される、という実在する不具合（今回初めて
+/// `SetPresence`を発行するまで、WMはこの種の窓を一度も隠していなかった）を閉じた。
+///
 
 /// このラウンドで意図的に対象外にしたこと（いずれも「できればやる」ではなく、別の未実装の仕組みが
 /// 前提になっているため実装できない項目であり、専用のラウンドへ切り出す）：
@@ -65,6 +75,12 @@
 ///   v2.28で実装済み（上記）。試行間隔を空ける理由・適切な遅延量はPhase 0の実測が必要。
 /// - **`onEffectCallReturned`の`Unclassified`のRetry**：`Transient`はv2.30で対象にしたが（上記）、
 ///   `Unclassified`（未知の失敗）を当てなく再試行するのは危険なため対象外のまま。
+/// - **`HiddenByWm`/`Shown None`の観測による確認（`Satisfied`相当）**：`onWorkspaceHidden`/
+///   `onWorkspaceShown`（v2.31）は`SetPresence`を発行するだけで、実際に非表示/表示になったかの
+///   確認は無い（`ObservedPresence`信念との一致判定、専用の信念・タイムアウト機構が必要）。
+///   `SetPresence`呼出の`EffectCallReturned`も、これらのRequestIdに対応するPendingが無いため、
+///   現状の`onEffectCallReturned`では「対応するPendingが無い＝無害に無視」される（型直前のコメント
+///   参照）——失敗した`SetPresence`は今は何も検知しない。
 /// - **`Mismatch` → `Reevaluate`**：観測が`TargetRect`と一致しない場合、`checkPendingSatisfied`は
 ///   何もしない（Pendingはそのまま残り、`PendingDeadline`満了か次のReconcileに委ねる）。即座に
 ///   `Desired`を取り消して再試行させる実装も検討したが、`SetRect`完了前に届く無関係な観測
@@ -115,8 +131,10 @@ let reviseGeometryFromSnapshot (now: int64) (current: GeometryBeliefs) (snapshot
 let reviseMinimized (now: int64) (current: GeometryBeliefs) (obs: Observation<bool>) : GeometryBeliefs =
     { current with IsMinimized = LatestWins.revise now current.IsMinimized obs }
 
-/// §4.4「WMが見せているべきか。非表示の実装方式に依存しない」。このラウンドでは`Shown (Some rect)`
-/// しか作らない（`HiddenByWm`/`Shown None`はWorkspaceの表示状態の反映が必要で、まだ対象外）。
+/// §4.4「WMが見せているべきか。非表示の実装方式に依存しない」。`HiddenByWm`/`Shown None`は
+/// `onWorkspaceHidden`/`onWorkspaceShown`（v2.31）が作る。「実際にそうなったか」の観測による確認
+/// （`ObservedPresence`との一致判定、`Satisfied`相当）はまだ無い——発行するだけで確認はしない
+/// （ファイル冒頭「対象外」参照）。
 type DesiredPresence =
     | Shown of PixelRect option
     | HiddenByWm
@@ -491,6 +509,34 @@ let onTopologySettled (state: PlacementState) : PlacementState * TimerCommand<Ti
         Pending = Map.empty
         RetryAttempts = affectedWindows |> Set.fold (fun m w -> Map.remove w m) state.RetryAttempts },
     cancelCmds
+
+/// `DomainEvents.WorkspaceHidden`（§4.4「WMが見せているべきか。非表示の実装方式に依存しない」、v2.31で
+/// 初めて消費する）：そのWorkspaceに属していた窓を`HiddenByWm`にし、`SetPresence(_, w, false)`を発行
+/// する。「実際に非表示になったか」の観測による確認（`Satisfied`相当、`ObservedPresence`との一致判定）
+/// はまだ無い——発行するだけで確認はしない（`DesiredPresence`の型直前のコメント「まだ対象外」参照、
+/// これは専用の信念・確認機構が必要な別の課題として残す）。各窓ごとに`allocateRequestId`で新しい
+/// RequestIdを採番する（SetRectと同じ採番元を共有、§7.1）。
+let onWorkspaceHidden (windows: WindowId list) (state: PlacementState) : PlacementState * Effect list =
+    windows
+    |> List.fold
+        (fun (st: PlacementState, effects) w ->
+            let rid, st' = allocateRequestId st
+            { st' with Desired = Map.add w HiddenByWm st'.Desired }, effects @ [ SetPresence (rid, w, false) ])
+        (state, [])
+
+/// `DomainEvents.WorkspaceShown`（上記の逆）：そのWorkspaceに属する窓を`Shown None`にし、
+/// `SetPresence(_, w, true)`を発行する。目標矩形はまだ無い（`Shown None`、`DesiredPresence`の型直前の
+/// コメント参照）——このWorkspaceが`current`/`visible`になった同じstepのReconcileが実際の目標を計算し、
+/// `dispatchPlacements`の`desiredChanged`判定は`Shown (Some _)`以外を常に「変化あり」と見なすので、
+/// 必ず新しいSetRectが発行される（隠されていた間に実際の位置が変わっていたかもしれないため、
+/// 古い矩形を信用しない）。
+let onWorkspaceShown (windows: WindowId list) (state: PlacementState) : PlacementState * Effect list =
+    windows
+    |> List.fold
+        (fun (st: PlacementState, effects) w ->
+            let rid, st' = allocateRequestId st
+            { st' with Desired = Map.add w (Shown None) st'.Desired }, effects @ [ SetPresence (rid, w, true) ])
+        (state, [])
 
 /// 窓の消滅時、`Geometry`/`Movability`/`TargetIntegrity`/`IntegrityReprobes`/`Desired`/`Pending`/`Epochs`
 /// を除く（§4.4「各ドメインの信念は窓が消滅した時点でのみ除去する」）。動いている再probeタイマーと、

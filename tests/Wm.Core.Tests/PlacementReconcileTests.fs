@@ -236,6 +236,43 @@ let ``onTopologySettledは全PendingをCancelTimer付きで取り消し、RetryA
     Assert.Equal(None, Map.tryFind w1 afterSettled.RetryAttempts)
     Assert.Equal<TimerCommand<TimerId> list>(expectedCancelCmds, cancelCmds |> List.sort)
 
+// ===== WorkspaceHidden/WorkspaceShown → HiddenByWm/Shown None（§4.4、v2.31） =====
+
+[<Fact>]
+let ``onWorkspaceHiddenは窓をHiddenByWmにしSetPresence(false)を発行する`` () =
+    let w1, w2 = WindowId 1L, WindowId 2L
+    let state', effects = onWorkspaceHidden [ w1; w2 ] initial
+    Assert.Equal(Some HiddenByWm, Map.tryFind w1 state'.Desired)
+    Assert.Equal(Some HiddenByWm, Map.tryFind w2 state'.Desired)
+    let targets = effects |> List.choose (function SetPresence (_, w, shown) -> Some (w, shown) | _ -> None) |> List.sort
+    Assert.Equal<(WindowId * bool) list>([ (w1, false); (w2, false) ], targets)
+    // 2窓分、異なるRequestIdを採番している(§7.1「EffectCallReturnedのRequestIdで相関する」)。
+    let rids = effects |> List.choose (function SetPresence (rid, _, _) -> Some rid | _ -> None)
+    Assert.Equal(2, rids |> List.distinct |> List.length)
+
+[<Fact>]
+let ``onWorkspaceShownは窓をShown NoneにしSetPresence(true)を発行する`` () =
+    let w = WindowId 1L
+    let state', effects = onWorkspaceShown [ w ] initial
+    Assert.Equal(Some (Shown None), Map.tryFind w state'.Desired)
+    Assert.Equal<Effect list>([ SetPresence (RequestId 0L, w, true) ], effects)
+
+[<Fact>]
+let ``Workspaceが非表示→再表示になった後のReconcileは、Shown Noneを無条件に変化ありと見て新しいSetRectを発行する`` () =
+    let w = WindowId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    Assert.Equal(Some (Shown (Some workArea)), Map.tryFind w afterReconcile.Desired)
+
+    let afterHidden, _ = onWorkspaceHidden [ w ] afterReconcile
+    let afterShown, _ = onWorkspaceShown [ w ] afterHidden
+    Assert.Equal(Some (Shown None), Map.tryFind w afterShown.Desired)
+
+    // 同じWorkArea/TiledWindowsでも、Shown Noneから再開すると必ず新しいSetRectが発行される
+    // （隠されていた間に実際の位置が変わっていたかもしれないため、古い矩形を信用しない、§4.4）。
+    let afterReReconcile, effects, _ = reconcileWorkspace 30L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterShown
+    Assert.Equal<Effect list>([ SetRect (RequestId afterShown.NextRequestId, w, workArea) ], effects)
+    Assert.Equal(Some (Shown (Some workArea)), Map.tryFind w afterReReconcile.Desired)
+
 // ===== GateRejected（§7.2） =====
 
 [<Fact>]

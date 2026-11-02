@@ -265,6 +265,41 @@ let ``TopologySettledは、窓のモニターの配置が変わった場合は�
     Assert.Equal(Some (Shown (Some resizedMonitor0.WorkArea)), Map.tryFind w afterSettle1.Next.Placement.Desired)
 
 [<Fact>]
+let ``モニターの切断はWorkspaceHiddenを経てHiddenByWm+SetPresence(false)を発行し、再接続はShown Noneから再配置する(v2.31)`` () =
+    let w = WindowId 1L
+    let afterW = settleOneMonitorThenDiscoverWindow w
+    let ws0 = WorkspaceSet.workspaceOf w afterW.Next.Workspaces |> Option.get
+
+    // モニター0が切断される（0台になる）。
+    let settleMs = TopologyConfig.defaults.SettleMs
+    let afterDisconnect = step RuntimePolicy.defaults afterW.Next (mkEnvelope 200L (MonitorTopologyObserved []))
+    let afterDisconnectSettle =
+        step RuntimePolicy.defaults afterDisconnect.Next (mkEnvelope (200L + settleMs) (TimerElapsed (TimerId.Topology ScreenSettle)))
+    match displays afterDisconnectSettle.Next.Topology with
+    | NoMonitors -> ()
+    | Displays _ -> failwith "expected 0 monitors after disconnecting the only one"
+
+    Assert.Equal(Some HiddenByWm, Map.tryFind w afterDisconnectSettle.Next.Placement.Desired)
+    let hideEffects = afterDisconnectSettle.Effects |> List.map GatedEffect.effect
+    Assert.Contains(hideEffects, function SetPresence (_, target, false) -> target = w | _ -> false)
+    // Pendingも(TopologySettledの一括Supersededで)取り消されている。
+    Assert.Empty(afterDisconnectSettle.Next.Placement.Pending)
+
+    // モニター0が再接続される。切断時に退避したWorkspace(ws0)が同じモニターへ戻る（§4.4のReturns規則）。
+    let afterReconnect = step RuntimePolicy.defaults afterDisconnectSettle.Next (mkEnvelope 400L (MonitorTopologyObserved [ mkMonitor 0 ]))
+    let afterReconnectSettle =
+        step RuntimePolicy.defaults afterReconnect.Next (mkEnvelope (400L + settleMs) (TimerElapsed (TimerId.Topology ScreenSettle)))
+    match displays afterReconnectSettle.Next.Topology with
+    | Displays (current, _) -> Assert.Equal(ws0, current.Workspace)
+    | NoMonitors -> failwith "expected the monitor to settle back"
+
+    // Shown None → Reconcileが新しいSetRectを発行し直す、かつSetPresence(true)も発行されている。
+    Assert.Equal(1, Map.count afterReconnectSettle.Next.Placement.Pending)
+    Assert.Equal(Some (Shown (Some (mkMonitor 0).WorkArea)), Map.tryFind w afterReconnectSettle.Next.Placement.Desired)
+    let showEffects = afterReconnectSettle.Effects |> List.map GatedEffect.effect
+    Assert.Contains(showEffects, function SetPresence (_, target, true) -> target = w | _ -> false)
+
+[<Fact>]
 let ``WindowRemovedは同じstepでPlacement.Geometryも除く`` () =
     let state = initial RuntimePolicy.defaults
     let obs: Observation<bool> = { Value = Ok true; SampleSequence = 1L; MonotonicTime = 1L; Source = "test" }
