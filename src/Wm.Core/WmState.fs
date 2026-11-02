@@ -113,9 +113,10 @@ let private removeFromWorkspacesAndFocus (w: WindowId) (state: WmState) : WmStat
 /// 取りこぼしが起きやすい。
 ///
 /// Opusレビュー4-3（docs/review-phase-a-round1.md、v2.15でCore.Windows着手時に反映）：除去するMapに
-/// 対応する待ちのタイマーが動いていれば`CancelTimer`を返す。Reprobes（Health）とAwaitingEvidenceの
-/// ClassificationDeadline（Windows）の両方が対象——`Map.remove`だけではタイマー実行器側のエントリが
-/// 残り、消滅した窓へ向けて後から（二度と意味を持たない）発火が起こり得る。
+/// 対応する待ちのタイマーが動いていれば`CancelTimer`を返す。Reprobes（Health）、AwaitingEvidenceの
+/// ClassificationDeadline（Windows）、IntegrityReprobes（Placement、v2.19で追加）が対象——
+/// `Map.remove`だけではタイマー実行器側のエントリが残り、消滅した窓へ向けて後から
+/// （二度と意味を持たない）発火が起こり得る。
 let private vanishWindow (w: WindowId) (state: WmState) : WmState * TimerCommand<TimerId> list =
     let state' = removeFromWorkspacesAndFocus w state
     let reprobeCancel =
@@ -124,6 +125,7 @@ let private vanishWindow (w: WindowId) (state: WmState) : WmState * TimerCommand
         match Map.tryFind w state'.Windows.Records with
         | Some { Classification = ClassificationState.AwaitingEvidence _ } -> [ CancelTimer (TimerId.Windows (ClassificationDeadline w)) ]
         | _ -> []
+    let placement', integrityReprobeCancel = Placement.onWindowVanished w state'.Placement
     let next =
         { state' with
             Health =
@@ -131,8 +133,9 @@ let private vanishWindow (w: WindowId) (state: WmState) : WmState * TimerCommand
                     Responsiveness = Map.remove w state'.Health.Responsiveness
                     Reprobes = Map.remove w state'.Health.Reprobes }
             Windows = Windows.onWindowVanished w state'.Windows
-            Placement = Placement.onWindowVanished w state'.Placement }
-    next, reprobeCancel @ classificationCancel
+            Placement = placement' }
+    next, reprobeCancel @ classificationCancel @ integrityReprobeCancel
+
 
 /// 窓の「管理外化」（Excluded化。消滅はしていない）。Workspaces/Focus.History/SwitchSettleからだけ除き、
 /// 各ドメインの信念（Health/Windows）は保持する（§4.4、`WindowUnmanaged`DomainEventの契機）。
@@ -197,14 +200,16 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         { state with Windows = windowsRegistry' }
         |> fun s -> windowsEvents |> List.fold applyWindowsEvent s
 
-    // 段①相当（Placement、Geometryの信念のみ）：WindowObservedはWindowsと同じ入力から自分の信念だけを
-    // 修正する（§7.1「Windows→Placement→Health→Focus」の順）。MinimizedStateChangedもここで初めて配線する
+    // 段①相当（Placement）：WindowObservedはWindowsと同じ入力から自分の信念（Geometry/Movability/
+    // TargetIntegrity）だけを修正する（§7.1「Windows→Placement→Health→Focus」の順）。TargetIntegrityの
+    // ProbeOnceタイマー（IntegrityReprobe）の発火もここで処理する。MinimizedStateChangedもここで配線する
     // （Placement.fsのファイル冒頭コメント参照。Desired/Pending等の本格的なReconcileはまだ無い）。
-    let placementState' =
+    let placementState', placementEffects, placementTimerCmds =
         match envelope.Input with
         | WindowObserved snapshot -> Placement.onWindowObserved now snapshot stateAfterWindows.Placement
-        | MinimizedStateChanged (w, obs) -> Placement.onMinimizedStateChanged now w obs stateAfterWindows.Placement
-        | _ -> stateAfterWindows.Placement
+        | MinimizedStateChanged (w, obs) -> Placement.onMinimizedStateChanged now w obs stateAfterWindows.Placement, [], []
+        | TimerElapsed (TimerId.Placement (IntegrityReprobe w)) -> Placement.onIntegrityReprobeTimerFired now w stateAfterWindows.Placement
+        | _ -> stateAfterWindows.Placement, [], []
 
     let stateAfterPlacement = { stateAfterWindows with Placement = placementState' }
 
@@ -260,9 +265,9 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
 
     let next = { stateAfterBeliefs with Focus = focusFinal; Workspaces = workspacesFinal }
 
-    // 段⑧ゲート（§6.2/§7.1）：Windowsの実装に伴い、Alive/Management/Hungを実際の状態から組み立てる
-    // （以前はPlacementが無く窓単位Effectも発行していないため全て空集合にしていた。NotMovable/HiddenByWm/
-    // NeedsRestoreはPlacementの信念が必要なため、引き続き空集合のまま、既知のギャップとして残す）。
+    // 段⑧ゲート（§6.2/§7.1）：Windows/Placementの実装に伴い、Alive/Management/NotMovable/Hungを
+    // 実際の状態から組み立てる（HiddenByWm/NeedsRestoreはDesired/Pendingが無いため、引き続き空集合の
+    // まま、既知のギャップとして残す）。
     let gateInput =
         { Alive = next.Windows.Records |> Map.toSeq |> Seq.map fst |> Set.ofSeq
           Management =
@@ -274,7 +279,12 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             match Topology.displays next.Topology with
             | NoMonitors -> []
             | Displays (current, visible) -> (current :: visible) |> List.map (fun sc -> sc.Monitor)
-          NotMovable = Set.empty
+          NotMovable =
+            next.Placement.Movability
+            |> Map.toSeq
+            |> Seq.filter (fun (_, b) -> b.Value = NotMovable)
+            |> Seq.map fst
+            |> Set.ofSeq
           Hung =
             next.Health.Responsiveness
             |> Map.toSeq
@@ -284,7 +294,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
           HiddenByWm = Set.empty
           NeedsRestore = Set.empty }
 
-    let gated, _rejected = GatedEffect.gate gateInput topologyResponse.Actions
+    let gated, _rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects)
 
     // 段①・段②のDomainEventは、消費する後続の段（Topologyの`current`追従、Placementの配置判断等）が
     // まだ無いため捨てる（Opusレビュー5-3。Placement実装時にここへ配線を追加する）。
@@ -293,5 +303,5 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
 
     { Next = next
       Effects = gated
-      Timers = topologyResponse.TimerCommands @ healthTimerCmds @ switchSettleTimerCmds @ windowsTimerCmds @ vanishTimerCmds
+      Timers = topologyResponse.TimerCommands @ healthTimerCmds @ switchSettleTimerCmds @ windowsTimerCmds @ vanishTimerCmds @ placementTimerCmds
       Trace = traces }
