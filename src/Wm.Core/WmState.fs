@@ -230,8 +230,8 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             let s, e, t = Placement.onPendingDeadlineTimerFired now rid stateAfterWindows.Placement
             s, e, t, None
         | EffectCallReturned (rid, result) ->
-            let s, failureInfo = Placement.onEffectCallReturned now envelope.Sequence rid result stateAfterWindows.Placement
-            s, [], [], failureInfo
+            let s, e, t, failureInfo = Placement.onEffectCallReturned now envelope.Sequence rid result stateAfterWindows.Placement
+            s, e, t, failureInfo
         | _ -> stateAfterWindows.Placement, [], [], None
 
     let stateAfterPlacement = { stateAfterWindows with Placement = placementState' }

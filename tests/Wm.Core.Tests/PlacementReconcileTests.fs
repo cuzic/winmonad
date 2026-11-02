@@ -277,7 +277,7 @@ let ``Ok()はPendingを変えない(Satisfiedにするのは観測の一致だ�
     let w = WindowId 1L
     let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let state', failureInfo = onEffectCallReturned 20L 2L rid (Ok ()) afterReconcile
+    let state', _, _, failureInfo = onEffectCallReturned 20L 2L rid (Ok ()) afterReconcile
     Assert.Equal<Map<RequestId, PendingRequest>>(afterReconcile.Pending, state'.Pending)
     Assert.Equal(None, failureInfo)
 
@@ -287,7 +287,10 @@ let ``ERROR_INVALID_WINDOW_HANDLEはTargetGoneに分類され、PendingとDesire
     let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let error: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 1400; ElapsedUs = 0L }
-    let state', failureInfo = onEffectCallReturned 20L 2L rid (Error error) afterReconcile
+    let state', _, cmds, failureInfo = onEffectCallReturned 20L 2L rid (Error error) afterReconcile
+    // Retryしない分類でも、まだ生きているridのPendingDeadlineはCancelTimerする（v2.30で塞いだ既存の
+    // 取りこぼし——以前はこの関数がTimerCommandを返せなかった）。
+    Assert.Equal<TimerCommand<TimerId> list>([ CancelTimer (TimerId.Placement (PendingDeadline rid)) ], cmds)
     Assert.Empty(state'.Pending)
     Assert.Equal(None, Map.tryFind w state'.Desired)
     Assert.Equal(Some (w, TargetGone), failureInfo)
@@ -298,7 +301,7 @@ let ``ERROR_ACCESS_DENIEDはDenied OtherDenialに分類され、MovabilityをNot
     let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let error: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 5; ElapsedUs = 0L }
-    let state', failureInfo = onEffectCallReturned 20L 2L rid (Error error) afterReconcile
+    let state', _, _, failureInfo = onEffectCallReturned 20L 2L rid (Error error) afterReconcile
     Assert.Empty(state'.Pending)
     Assert.Equal(Some (w, Denied OtherDenial), failureInfo)
     match Map.tryFind w state'.Movability with
@@ -311,7 +314,7 @@ let ``TargetHungと分類された場合、Movabilityは変えない(HealthのRe
     let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let error: NativeCallRecord = { Api = "SendMessageTimeout"; Space = Win32LastError; Code = 1460; ElapsedUs = 0L }
-    let state', failureInfo = onEffectCallReturned 20L 2L rid (Error error) afterReconcile
+    let state', _, _, failureInfo = onEffectCallReturned 20L 2L rid (Error error) afterReconcile
     Assert.Empty(state'.Pending)
     Assert.Equal(Some (w, TargetHung), failureInfo)
     Assert.Equal(None, Map.tryFind w state'.Movability) // Movabilityはこの関数の対象外
@@ -319,6 +322,39 @@ let ``TargetHungと分類された場合、Movabilityは変えない(HealthのRe
 [<Fact>]
 let ``対応するPendingが無いRequestId(古い結果)は無害に無視する`` () =
     let error: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 1400; ElapsedUs = 0L }
-    let state', failureInfo = onEffectCallReturned 20L 2L (RequestId 999L) (Error error) initial
+    let state', _, _, failureInfo = onEffectCallReturned 20L 2L (RequestId 999L) (Error error) initial
     Assert.Equal(initial, state')
     Assert.Equal(None, failureInfo)
+
+[<Fact>]
+let ``Transient(ハング判定前のERROR_TIMEOUT)は即座に再試行し、Desiredは取り消さない(v2.30)`` () =
+    let w = WindowId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid0 = pendingRidFor afterReconcile w
+    let error: NativeCallRecord = { Api = "SendMessageTimeout"; Space = Win32LastError; Code = 1460; ElapsedUs = 500L } // >0なのでTransient
+    let afterRetry, effects, cmds, failureInfo = onEffectCallReturned 20L 2L rid0 (Error error) afterReconcile
+    Assert.Equal(Some (w, Transient), failureInfo)
+    Assert.Equal(1, Map.count afterRetry.Pending)
+    let rid1 = pendingRidFor afterRetry w
+    Assert.NotEqual(rid0, rid1)
+    Assert.Equal(Some (Shown (Some workArea)), Map.tryFind w afterRetry.Desired)
+    Assert.Equal(Some 1, Map.tryFind w afterRetry.RetryAttempts)
+    Assert.Equal<Effect list>([ SetRect (rid1, w, workArea) ], effects)
+    // 古いridのPendingDeadlineを取り消し、新しいridのPendingDeadlineを始動する(どちらも必要)。
+    Assert.Contains(CancelTimer (TimerId.Placement (PendingDeadline rid0)), cmds)
+    Assert.Contains(StartTimer (TimerId.Placement (PendingDeadline rid1), pendingDeadlineMs), cmds)
+
+[<Fact>]
+let ``Transientが上限回数続くと、最終的にPendingとDesiredを取り消し古いPendingDeadlineもCancelTimerする(v2.30)`` () =
+    let w = WindowId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let error: NativeCallRecord = { Api = "SendMessageTimeout"; Space = Win32LastError; Code = 1460; ElapsedUs = 500L }
+    let rec driveToGiveUp (attemptsLeft: int) (state: PlacementState) : PlacementState * TimerCommand<TimerId> list =
+        let rid = pendingRidFor state w
+        let state', _, cmds, _ = onEffectCallReturned 20L 2L rid (Error error) state
+        if attemptsLeft <= 1 then state', cmds else driveToGiveUp (attemptsLeft - 1) state'
+    let final, lastCmds = driveToGiveUp pendingRetryMaxAttempts afterReconcile
+    Assert.Empty(final.Pending)
+    Assert.Equal(None, Map.tryFind w final.Desired)
+    Assert.Equal(None, Map.tryFind w final.RetryAttempts)
+    Assert.NotEmpty(lastCmds) // 最後の諦めでも、まだ生きている古いPendingDeadlineはCancelTimerする

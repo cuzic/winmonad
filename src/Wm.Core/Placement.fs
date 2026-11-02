@@ -39,10 +39,9 @@
 /// は依然対象外：`IntegrityReprobe`の間隔は「外部プロセスを急かさない」という明確な理由があったが、
 /// `SetRect`の再試行に同じ理由は無く、適切な遅延量をPhase 0の実測無しに決める根拠が無いため、
 /// 即座に再試行し試行回数だけを数える単純な形にする（`RetryAttempts`の型直前のコメント参照）。
-/// `onEffectCallReturned`側（`Transient`/`Unclassified`を含む）は依然単発の諦めのまま——Retryの対象を
-/// Timeoutだけに絞ったのは、`classify`の各分岐ごとに「リトライが安全か」を個別に検討する必要があり
-/// （`Denied`系はおそらく再試行しても無駄、`TargetHung`はHealthの管轄、等）、根拠の無い当てはめを
-/// 避けるため。
+/// v2.28時点では`onEffectCallReturned`側（`Transient`/`Unclassified`を含む）は単発の諦めのままだった
+/// ——Retryの対象をTimeoutだけに絞ったのは、`classify`の各分岐ごとに「リトライが安全か」を個別に
+/// 検討する必要があったため。
 ///
 /// `TopologySettled` → `Superseded`（v2.29追加）：`onTopologySettled`が、モニター構成が確定した
 /// （§7.3のScreenSettle→Grace）瞬間に既存の全Pendingを観測を待たず`CancelTimer`付きで一括取り消す
@@ -50,13 +49,22 @@
 /// 必ずReconcileも走らせる（`shouldReconcile`を拡張した）ので、取り消した代わりが即座に発行し直される
 /// （窓のモニターが変わらなければ`dispatchPlacements`のdesiredChanged判定により無駄な再発行はしない）。
 ///
+/// `onEffectCallReturned`の`Transient`分類にもRetryを拡張（v2.30追加）：`classify`の各分岐を個別に
+/// 検討した結果——`TargetGone`（ハンドル無効、再試行しても同じ結果）、`Denied`（拒否は持続的）、
+/// `TargetHung`（Healthの管轄）はいずれも再試行の根拠が無いので単発の諦めのまま、`Unclassified`
+/// （未知の失敗）も当てなく再試行するのは危険なので対象外のまま——`Transient`（ERROR_TIMEOUTのうち
+/// ハング判定前のもの）だけは「一時的」という性質自体がリトライの根拠になるため、`retryOrGiveUp`
+/// （`onPendingDeadlineTimerFired`と共有）で即座に再試行するようにした。この変更で`onEffectCallReturned`
+/// がTimerCommandを返せるようになったので、`rid`自身の`PendingDeadline`タイマー（まだ生きている状態で
+/// 呼ばれるため、諦める場合もCancelTimerが必要）という既存の取りこぼしも同時に塞いだ。
+///
 
 /// このラウンドで意図的に対象外にしたこと（いずれも「できればやる」ではなく、別の未実装の仕組みが
 /// 前提になっているため実装できない項目であり、専用のラウンドへ切り出す）：
 /// - **`PendingDeadline`のBackoff**（§7.2「Timeout → Retry/Backoff」のBackoff部分、§7.3）：Retry自体は
 ///   v2.28で実装済み（上記）。試行間隔を空ける理由・適切な遅延量はPhase 0の実測が必要。
-/// - **`onEffectCallReturned`（`Transient`/`Unclassified`含む）のRetry**：`classify`の各分岐ごとに
-///   リトライの安全性を個別に検討する必要があるため、v2.28ではTimeoutだけに絞った（上記）。
+/// - **`onEffectCallReturned`の`Unclassified`のRetry**：`Transient`はv2.30で対象にしたが（上記）、
+///   `Unclassified`（未知の失敗）を当てなく再試行するのは危険なため対象外のまま。
 /// - **`Mismatch` → `Reevaluate`**：観測が`TargetRect`と一致しない場合、`checkPendingSatisfied`は
 ///   何もしない（Pendingはそのまま残り、`PendingDeadline`満了か次のReconcileに委ねる）。即座に
 ///   `Desired`を取り消して再試行させる実装も検討したが、`SetRect`完了前に届く無関係な観測
@@ -369,30 +377,37 @@ let reconcileWorkspace
                 | Some (Ok validated) -> dispatchPlacements now validated state
                 | _ -> state, [], [] // 再計算してもダメなら諦める(既知のギャップ、Explain未実装)
 
+/// `Timeout`（`onPendingDeadlineTimerFired`）と`Transient`な`EffectCallReturned`（下記、v2.30）の両方が
+/// 使う、同じ`TargetRect`/`Epoch`への即座の再試行（§7.2「Timeout → Retry/Backoff」のRetry部分、
+/// Backoffは`RetryAttempts`の型直前のコメントの理由により対象外）。上限（既定3回）に達したら単発の
+/// 諦め（`Desired`も取り消すので、次にこの窓を含むReconcileが走れば最初から再試行される）。
+/// `rid`自身の`PendingDeadline`タイマーの後始末（`CancelTimer`）は呼び出し側の責務——
+/// `onPendingDeadlineTimerFired`はタイマーが発火した直後で既に表から消えているため不要だが、
+/// `onEffectCallReturned`はタイマーがまだ生きている状態で呼ばれるため必要、という違いがあるため。
+let private retryOrGiveUp (now: int64) (rid: RequestId) (pr: PendingRequest) (state: PlacementState) : PlacementState * Effect list * TimerCommand<TimerId> list =
+    let attemptsSoFar = Map.tryFind pr.Window state.RetryAttempts |> Option.defaultValue 0
+    if attemptsSoFar + 1 >= pendingRetryMaxAttempts then
+        { state with
+            Pending = Map.remove rid state.Pending
+            Desired = Map.remove pr.Window state.Desired
+            RetryAttempts = Map.remove pr.Window state.RetryAttempts },
+        [], []
+    else
+        let newRid = RequestId state.NextRequestId
+        let deadline = now + pendingDeadlineMs
+        let retried = { pr with IssuedAt = now; Deadline = deadline }
+        { state with
+            Pending = Map.add newRid retried (Map.remove rid state.Pending)
+            NextRequestId = state.NextRequestId + 1L
+            RetryAttempts = Map.add pr.Window (attemptsSoFar + 1) state.RetryAttempts },
+        [ SetRect (newRid, pr.Window, pr.TargetRect) ],
+        [ StartTimer (TimerId.Placement (PendingDeadline newRid), pendingDeadlineMs) ]
+
 /// `TimerElapsed (Placement (PendingDeadline rid))`：§7.2「Timeout → Retry/Backoff、上限後は配置対象外」
-/// （v2.28、Backoffは対象外のまま——`RetryAttempts`の型直前のコメント参照）。同じ`TargetRect`/`Epoch`へ
-/// 新しい`RequestId`で`SetRect`を即座に再発行し、新しい`PendingDeadline`を始動する。上限（既定3回）に
-/// 達したら単発の諦め（`Desired`も取り消すので、次にこの窓を含むReconcileが走れば最初から再試行される）。
+/// （v2.28）。`retryOrGiveUp`参照。
 let onPendingDeadlineTimerFired (now: int64) (rid: RequestId) (state: PlacementState) : PlacementState * Effect list * TimerCommand<TimerId> list =
     match Map.tryFind rid state.Pending with
-    | Some pr when awaitDeadline (Some pr.Deadline) now ->
-        let attemptsSoFar = Map.tryFind pr.Window state.RetryAttempts |> Option.defaultValue 0
-        if attemptsSoFar + 1 >= pendingRetryMaxAttempts then
-            { state with
-                Pending = Map.remove rid state.Pending
-                Desired = Map.remove pr.Window state.Desired
-                RetryAttempts = Map.remove pr.Window state.RetryAttempts },
-            [], []
-        else
-            let newRid = RequestId state.NextRequestId
-            let deadline = now + pendingDeadlineMs
-            let retried = { pr with IssuedAt = now; Deadline = deadline }
-            { state with
-                Pending = Map.add newRid retried (Map.remove rid state.Pending)
-                NextRequestId = state.NextRequestId + 1L
-                RetryAttempts = Map.add pr.Window (attemptsSoFar + 1) state.RetryAttempts },
-            [ SetRect (newRid, pr.Window, pr.TargetRect) ],
-            [ StartTimer (TimerId.Placement (PendingDeadline newRid), pendingDeadlineMs) ]
+    | Some pr when awaitDeadline (Some pr.Deadline) now -> retryOrGiveUp now rid pr state
     | _ -> state, [], []
 
 /// §7.2「GateRejected → Cancelled（Deadlineまで待たず同じstep内で即時に遷移する）」。
@@ -415,9 +430,13 @@ let onGateRejected (rejectedRequestIds: RequestId list) (state: PlacementState) 
 /// `EffectCallReturned`：§7.2のPending終端遷移のうち、Coreが直接判断できる部分（ファイル冒頭コメント
 /// 参照）。`Ok ()`は「受付が成功した」だけを意味し、`Satisfied`にするのは観測の一致だけなので
 /// （§7.2「SetRectのネイティブAPI呼出が成功しても、目標矩形を観測するまではSatisfiedにしない」）、
-/// 何もしない。`Error`は`classify`で`EffectFailure`へ変換し、対応するPendingを`Cancelled`にする
-/// （`Desired`も取り消し、次のReconcileに最初からの再試行を委ねる——Timeout/GateRejectedと同じ簡略化）。
-/// `Denied OtherDenial`はさらに`Movability`を`NotMovable`へ修正する（§4.5）。戻り値の
+/// 何もしない。`Error`は`classify`で`EffectFailure`へ変換する。`Transient`だけは`retryOrGiveUp`で
+/// 即座に再試行する（v2.30。ERROR_TIMEOUTのうちハング判定前のもので、「名前の通り一時的」という
+/// 性質そのものがリトライの根拠になる、ファイル冒頭「このラウンドで意図的に対象外にしたこと」参照）。
+/// 他の分類（`TargetGone`：ハンドルが無効で再試行しても同じ結果になる、`Denied`：拒否は持続的、
+/// `TargetHung`：Healthが別途Hungとして扱う、`Unclassified`：未知の失敗を当てなく再試行するのは
+/// 危険）は依然`Cancelled`にする単発の諦め（`Desired`も取り消し、次のReconcileに最初からの再試行を
+/// 委ねる）。`Denied OtherDenial`はさらに`Movability`を`NotMovable`へ修正する（§4.5）。戻り値の
 /// `(WindowId * EffectFailure) option`は、`TargetHung`時のHealth.Responsiveness修正（Placementの
 /// 管轄外）を呼び出し側（`WmState.step`）が行うために必要な情報を運ぶ。
 let onEffectCallReturned
@@ -426,27 +445,36 @@ let onEffectCallReturned
     (rid: RequestId)
     (result: Result<unit, NativeCallRecord>)
     (state: PlacementState)
-    : PlacementState * (WindowId * EffectFailure) option =
+    : PlacementState * Effect list * TimerCommand<TimerId> list * (WindowId * EffectFailure) option =
     match result with
-    | Ok () -> state, None
+    | Ok () -> state, [], [], None
     | Error record ->
         match Map.tryFind rid state.Pending with
-        | None -> state, None // 古い結果、またはこのPendingはすでに別の経路で終端済み
+        | None -> state, [], [], None // 古い結果、またはこのPendingはすでに別の経路で終端済み
         | Some pr ->
             let failure = classify record
-            let cancelled =
-                { state with
-                    Pending = Map.remove rid state.Pending
-                    Desired = Map.remove pr.Window state.Desired
-                    RetryAttempts = Map.remove pr.Window state.RetryAttempts }
-            let state' =
-                match failure with
-                | Denied OtherDenial ->
-                    { cancelled with
-                        Movability =
-                            Map.add pr.Window { Value = NotMovable; Confidence = Inferred [ Outcome (evidenceSequence, rid) ]; LastRevisedAt = now } cancelled.Movability }
-                | _ -> cancelled
-            state', Some (pr.Window, failure)
+            // `rid`自身の`PendingDeadline`タイマーはまだ生きている（Timeoutより先にこの結果が届いた）
+            // ので、再試行するか諦めるかに関わらず必ず取り消す（`retryOrGiveUp`の型直前のコメント参照。
+            // v2.30でこの関数がTimerCommandを返せるようになって初めて修正できた既存の取りこぼし）。
+            let cancelOldTimer = [ CancelTimer (TimerId.Placement (PendingDeadline rid)) ]
+            match failure with
+            | Transient ->
+                let state', effects, cmds = retryOrGiveUp now rid pr state
+                state', effects, cancelOldTimer @ cmds, Some (pr.Window, failure)
+            | _ ->
+                let cancelled =
+                    { state with
+                        Pending = Map.remove rid state.Pending
+                        Desired = Map.remove pr.Window state.Desired
+                        RetryAttempts = Map.remove pr.Window state.RetryAttempts }
+                let state' =
+                    match failure with
+                    | Denied OtherDenial ->
+                        { cancelled with
+                            Movability =
+                                Map.add pr.Window { Value = NotMovable; Confidence = Inferred [ Outcome (evidenceSequence, rid) ]; LastRevisedAt = now } cancelled.Movability }
+                    | _ -> cancelled
+                state', [], cancelOldTimer, Some (pr.Window, failure)
 
 /// `DomainEvents.TopologySettled`（§7.3のScreenSettle→Grace。モニター構成が確定した）：既存の全Pendingは
 /// 古いモニター配置に基づく目標なので、観測を待たず即座に`Superseded`（Cancelled）にする（§7.2

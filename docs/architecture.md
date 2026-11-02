@@ -1,5 +1,15 @@
 # Windows プログラマブル・ウィンドウマネージャー 統合設計書
 
+Version: 2.30（`onEffectCallReturned`の`classify`結果のうち`Transient`（ERROR_TIMEOUTのハング判定前）
+にもRetryを拡張した。`classify`の各分岐を個別に検討した結果——`TargetGone`（ハンドル無効、再試行
+しても同じ結果）、`Denied`（拒否は持続的）、`TargetHung`（Healthの管轄）は根拠が無いので単発の諦め
+のまま、`Unclassified`（未知の失敗）も当てなく再試行するのは危険なので対象外のまま——`Transient`
+だけは「一時的」という性質自体がリトライの根拠になるため、`onPendingDeadlineTimerFired`と共有する
+`retryOrGiveUp`ヘルパーで即座に再試行するようにした。この変更で`onEffectCallReturned`が
+`Effect list`/`TimerCommand<TimerId> list`を返せるようになったので、`rid`自身の`PendingDeadline`
+タイマー（`EffectCallReturned`はタイマー発火より先に届くことがあるため、まだ生きている状態で
+呼ばれる）を取り消していなかった既存の取りこぼしも同時に塞いだ——以前はこの関数がTimerCommandを
+一切返せず、`WmState.step`の呼び出し側が`[], []`を固定で渡していたため、修正自体ができなかった。
 Version: 2.29（§7.2「TopologySettled → Superseded」を実装した。`Topology`が出す`TopologySettled`
 DomainEventをこれまで`WmState.step`が捨てていた（Opusレビュー5-3）のをやめ、`Placement.onTopologySettled`
 を呼ぶようになった：既存の全Pendingは古いモニター配置に基づく目標なので、観測を待たず即座に
@@ -98,7 +108,9 @@ Version: 2.23（v2.22で見つけ記録した既知のギャップ（`Denied Oth
 実装し、`PendingDeadline`満了を上限回数まで同じTargetへの即座の再試行として扱うようにした
 （Backoffは実測値が無いため依然対象外）（v2.28）／§7.2の`TopologySettled → Superseded`を実装し、
 `WmState.step`が捨てていた`TopologySettled`DomainEventを初めて消費するようになった。`shouldReconcile`
-も拡張し、取り消した代わりが同じstepで発行し直されるようにした（v2.29）
+も拡張し、取り消した代わりが同じstepで発行し直されるようにした（v2.29）／
+`onEffectCallReturned`の`Transient`分類にRetryを拡張し、まだ生きている`PendingDeadline`タイマーを
+取り消していなかった既存の取りこぼしも塞いだ（v2.30）
 Version: 2.22（Wm.Simulationが`EffectCallReturned`を実際に返せるようになったので（v2.21）、
 `InputEvent.EffectCallReturned`をPlacement/Healthへ配線した。`Placement.onEffectCallReturned`は
 `Ok ()`では何もせず（§7.2「目標矩形を観測するまではSatisfiedにしない」）、`Error`は`classify`で
