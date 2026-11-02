@@ -204,6 +204,34 @@ let ``SwitchWorkspaceで既にvisibleなWorkspaceへ切り替えると、current
         Assert.Contains(effects, function RequestForeground (_, target) -> target = w2 | _ -> false)
     | other -> Assert.True(false, sprintf "expected exactly 1 visible (non-active) screen, got %A" other)
 
+[<Fact>]
+let ``FocusMonitorはアクティブなモニターを切り替え、そのzipperのFocusへRequestForegroundする(v2.36)`` () =
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0; mkMonitor 1 ]
+    let current, visible =
+        match displays topology with
+        | Displays (c, v) -> c, v
+        | NoMonitors -> failwith "expected 2 monitors to settle into Displays"
+    match visible with
+    | [ visibleScreen ] ->
+        let w2 = WindowId 2L
+        let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+        let windows2 =
+            { seeded.Windows with
+                Records = Map.add w2 { WindowRecord.initial with Classification = Classified (EffTiled, ByUserOverride) } seeded.Windows.Records }
+        let workspaces2 = WorkspaceSet.addWindow visibleScreen.Workspace w2 false seeded.Workspaces
+        let seeded2 = { seeded with Windows = windows2; Workspaces = workspaces2 }
+
+        let afterFocusMonitor = step RuntimePolicy.defaults seeded2 (mkEnvelope 1L (UserCommand (FocusMonitor visibleScreen.Monitor.Id)))
+        match displays afterFocusMonitor.Next.Topology with
+        | Displays (newCurrent, [ newVisible ]) ->
+            Assert.Equal(visibleScreen.Workspace, newCurrent.Workspace) // monitor1はws1を表示したまま
+            Assert.Equal(current.Workspace, newVisible.Workspace)
+        | other -> failwithf "expected current/visible to swap by monitor, got %A" other
+
+        let effects = afterFocusMonitor.Effects |> List.map GatedEffect.effect
+        Assert.Contains(effects, function RequestForeground (_, target) -> target = w2 | _ -> false)
+    | other -> Assert.True(false, sprintf "expected exactly 1 visible (non-active) screen, got %A" other)
+
 let private mkForegroundObserved (sequence: int64) (w: WindowId) : InputEvent =
     ForegroundObserved { Value = Ok (Some w); SampleSequence = sequence; MonotonicTime = sequence; Source = "test" }
 

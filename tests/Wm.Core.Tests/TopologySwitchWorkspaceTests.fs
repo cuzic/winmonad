@@ -104,3 +104,60 @@ let ``抑止区間中(Reconfiguring)のSwitchWorkspaceも、他のUserCommandと
     | Settling _ -> ()
     | other -> failwithf "expected SwitchWorkspace during Reconfiguring to force Settling, got %A" other
     Assert.Contains(CancelTimer (TimerId.Topology ReconfigurationCap), response.TimerCommands)
+
+// ===== FocusMonitor（§4.4、v2.36） =====
+
+[<Fact>]
+let ``FocusMonitorはvisibleな対象モニターへcurrentを入れ替え、どのWorkspaceが表示されているかは変えない`` () =
+    let t0, state0 = settleFully 0L [ mkMonitor 0 true; mkMonitor 1 false ] (initial Map.empty)
+    let ws0, ws1, monitor1Id =
+        match displays state0 with
+        | Displays (current, [ visible1 ]) -> current.Workspace, visible1.Workspace, visible1.Monitor.Id
+        | other -> failwithf "expected 2 monitors to settle, got %A" other
+
+    let state1, response, events, _ = update config (t0 + 1L) (UserCommand (FocusMonitor monitor1Id)) state0
+    match displays state1 with
+    | Displays (current, [ visible1 ]) ->
+        Assert.Equal(monitor1Id, current.Monitor.Id)
+        Assert.Equal(ws1, current.Workspace) // monitor1はws1を表示したまま(所属は変えない)
+        Assert.Equal(ws0, visible1.Workspace)
+    | other -> failwithf "expected current/visible to swap by monitor, got %A" other
+    Assert.Equal<DomainEvent list>([ CurrentChanged ws1 ], events)
+    Assert.Equal({ Actions = []; TimerCommands = [] }, response)
+
+[<Fact>]
+let ``FocusMonitorで既にcurrentなモニターを指定しても何もしない`` () =
+    let t0, state0 = settleFully 0L [ mkMonitor 0 true ] (initial Map.empty)
+    let state1, response, events, trace = update config (t0 + 1L) (UserCommand (FocusMonitor (MonitorId 0L))) state0
+    Assert.Equal(state0, state1)
+    Assert.Equal({ Actions = []; TimerCommands = [] }, response)
+    Assert.Empty(events)
+    Assert.Empty(trace)
+
+[<Fact>]
+let ``FocusMonitorは接続されていないMonitorIdなら何もしない`` () =
+    let t0, state0 = settleFully 0L [ mkMonitor 0 true ] (initial Map.empty)
+    let state1, response, events, trace = update config (t0 + 1L) (UserCommand (FocusMonitor (MonitorId 999L))) state0
+    Assert.Equal(state0, state1)
+    Assert.Equal({ Actions = []; TimerCommands = [] }, response)
+    Assert.Empty(events)
+    Assert.Empty(trace)
+
+[<Fact>]
+let ``FocusMonitorはNoMonitorsなら何もしない`` () =
+    let state0 = initial Map.empty
+    let state1, response, events, trace = update config 10L (UserCommand (FocusMonitor (MonitorId 0L))) state0
+    Assert.Equal(state0, state1)
+    Assert.Equal({ Actions = []; TimerCommands = [] }, response)
+    Assert.Empty(events)
+    Assert.Empty(trace)
+
+[<Fact>]
+let ``抑止区間中(Reconfiguring)のFocusMonitorも、他のUserCommandと同じく強制的にSettlingへ入らせる`` () =
+    let t0, state0 = settleFully 0L [ mkMonitor 0 true ] (initial Map.empty)
+    let stateReconfiguring, _, _, _ = update config (t0 + 1L) (ScreenReconfigurationInProgress true) state0
+    let state1, response, _, _ = update config (t0 + 2L) (UserCommand (FocusMonitor (MonitorId 0L))) stateReconfiguring
+    match phase state1 with
+    | Settling _ -> ()
+    | other -> failwithf "expected FocusMonitor during Reconfiguring to force Settling, got %A" other
+    Assert.Contains(CancelTimer (TimerId.Topology ReconfigurationCap), response.TimerCommands)

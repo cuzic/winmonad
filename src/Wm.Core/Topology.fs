@@ -12,6 +12,14 @@
 /// `Focus.startSwitchSettle`/`onSwitchSettleTimerFired`は既に実装されているが、実際のOS側の
 /// タイミング挙動（揺れの幅・頻度）の実測がまだ無く、適切なSettleMsや再要求の発火条件を決める
 /// 根拠が無いため、専用のラウンドへ切り出す。
+///
+/// `FocusMonitor`（v2.36追加）：対象モニターが現在表示中（visible）ならcurrentをそのモニターへ入れ替える
+/// だけで、どのモニターがどのWorkspaceを表示しているかは変えない。`SwitchWorkspace`の「既にvisible」
+/// 分岐と同じ`CurrentChanged`を出すので、`WmState.step`のv2.32のRequestForeground受け口をそのまま
+/// 再利用できる。対象外：「Foregroundの信念が変わったらcurrentが追従する」仕組み（§4.4、R5-1）は
+/// まだ存在しない（`ForegroundChanged`DomainEventは出すが誰も消費していない）。R5-1はこの追従と
+/// `FocusMonitor`の順序（追従が同じstepでFocusMonitorを打ち消さないこと）を定めているが、追従自体が
+/// 無い今は単に無関係——追従を実装する専用のラウンドで一緒に検討する。
 module Wm.Core.Topology
 
 open Wm.Contracts.Identifiers
@@ -316,6 +324,32 @@ let update (config: TopologyConfig) (now: int64) (input: InputEvent) (state: Top
                     noResponse,
                     [ WorkspaceHidden oldWorkspace; WorkspaceShown (ws, UserView) ],
                     []
+    | UserCommand (FocusMonitor m) ->
+        match state.Phase with
+        | Reconfiguring _ ->
+            let state', response, events, trace = enterSettling state (latestForForcedSettle ()) (now + config.HardDeadlineMs)
+            state',
+            { response with TimerCommands = CancelTimer (TimerId.Topology ReconfigurationCap) :: response.TimerCommands },
+            events,
+            trace
+        | _ ->
+            // §4.4「アクティブなモニターを切り替える」：対象モニターが現在visible（接続済み）なら
+            // currentをそのモニターへ入れ替えるだけ（どのモニターがどのWorkspaceを表示しているかは
+            // 変えない）。SwitchWorkspaceの「既にvisible」分岐と同じ`CurrentChanged`を出すので、
+            // 切替先WorkspaceのzipperのFocusへのRequestForegroundは`WmState.step`のv2.32の受け口を
+            // そのまま再利用できる。「既にcurrent」を明示的なガードにはしない——`current`と`visible`は
+            // 互いに素という不変条件があるため、`m = current.Monitor.Id`のときvisibleをいくら探しても
+            // 絶対に見つからず、下の`None`分岐（無害な何もしない）へ自然に落ちる（SwitchWorkspaceの
+            // 同じ形の分岐とは違い、ここでは「既にcurrent」と「接続されていないMonitorId」が完全に
+            // 同じ結果になるため、分けて書く意味が無い）。
+            match state.Displays with
+            | NoMonitors -> state, noResponse, [], []
+            | Displays (current, visible) ->
+                match visible |> List.tryFind (fun sc -> sc.Monitor.Id = m) with
+                | Some targetScreen ->
+                    let visible' = current :: (visible |> List.filter (fun sc -> sc.Monitor.Id <> m))
+                    { state with Displays = Displays (targetScreen, visible') }, noResponse, [ CurrentChanged targetScreen.Workspace ], []
+                | None -> state, noResponse, [], [] // そのMonitorIdは現在表示されていない
     | UserCommand _ ->
         match state.Phase with
         | Reconfiguring _ ->
