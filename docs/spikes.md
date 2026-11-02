@@ -155,6 +155,12 @@ Phase 0は「要素技術の確認」ではなく、**捨てる前提の素朴�
 - **記録する内容**: プロセスごとの返り値。
 - **判定**: 「無視してよい」（低優先。本質的な問題はS11のまま実機待ち）。
 
+### S20. SwitchSettle用、前面切替のフック遅延と揺れの実測（4.4/R4-5対応）【未検証：CIで実行予定】
+- **検証する前提**: `FocusState.SwitchSettle`（Workspace切替直後の揺れの吸収、§4.4/R4-5）の`SettleMs`は、実際のOS側のタイミング挙動の実測が無いまま未決定だった（architecture.md v2.29）。実運用の`ForegroundObserved`は`SetWinEventHook(WINEVENT_OUTOFCONTEXT)`で`EVENT_SYSTEM_FOREGROUND`を購読して届く（§8.1/21章）ので、ポーリングではなくこのフック自体で一次データを取る必要がある。
+- **方法**: `Phase0CiSpikes`の`spikeS20_SwitchSettleTiming`で、自プロセスの2窓（A/B）間を`mouse_event`自己プライミング付き`SetForegroundWindow`で5往復させ、各切替について(a)呼び出しから`EVENT_SYSTEM_FOREGROUND`が最初に届くまでの遅延、(b)その後800ms観測窓の中で別のhwndへのイベントが続く「揺れ」の有無、を記録する。
+- **記録する内容**: 往復ごとの最初のイベント遅延（最小/最大/平均の見立て）、揺れの発生回数、`SetForegroundWindow`のAPI戻り値。
+- **判定**: CI実機（仮想化・ヘッドレス寄り）での一次データ。S4がS4rで実デスクトップ再検証を要したのと同様、ここでの数値が実デスクトップでの値と大きく異なる可能性があり、再検証（S20r）が必要かはCI結果を見て判断する。CI結果が「十分に短く安定（揺れ無し）」なら`SettleMs`の下限値として採用し「型に反映」、揺れが観測されるなら再要求の発火条件の設計に反映する。
+
 ## 失敗カタログのテンプレート（`docs/failure-catalog.md`、Phase 0完了時に作成）
 
 ```markdown

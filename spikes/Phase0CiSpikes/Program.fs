@@ -22,7 +22,13 @@
 // a real CI run instead of a textual guess. S7/S10 probe this machine's
 // own privilege/shell environment (process integrity level; whether
 // explorer.exe exists and auto-restarts) rather than Win32 call
-// semantics. The *r-suffixed spikes (S4r/S5r/S7r/S11r) are real-desktop-
+// semantics. S20 was added to ground FocusState.SwitchSettle's SettleMs
+// (architecture.md 4.4/R4-5, previously undetermined for lack of any
+// real OS timing evidence): it hooks EVENT_SYSTEM_FOREGROUND via
+// SetWinEventHook (the same mechanism the real Shell will use for
+// ForegroundObserved) around repeated self-process foreground switches,
+// to measure hook-delivery latency and detect any post-switch bounce.
+// The *r-suffixed spikes (S4r/S5r/S7r/S11r) are real-desktop-
 // only: they need a genuine interactive desktop (an existing third-party
 // foreground window, a modern UWP shell, an already-running elevated
 // window, multiple monitors at different DPI) that a GitHub Actions
@@ -244,6 +250,14 @@ module Native =
 
     [<DllImport("user32.dll")>]
     extern bool PostThreadMessage(uint32 idThread, uint32 Msg, IntPtr wParam, IntPtr lParam)
+
+    type WinEventProc = delegate of IntPtr * uint32 * IntPtr * int * int * uint32 * uint32 -> unit
+
+    [<DllImport("user32.dll", SetLastError = true)>]
+    extern IntPtr SetWinEventHook(uint32 eventMin, uint32 eventMax, IntPtr hmodWinEventProc, WinEventProc lpfnWinEventProc, uint32 idProcess, uint32 idThread, uint32 dwFlags)
+
+    [<DllImport("user32.dll")>]
+    extern bool UnhookWinEvent(IntPtr hWinEventHook)
 
 open Native
 
@@ -1605,6 +1619,80 @@ let spikeS19_DpiAwarenessQuery (exePath: string) =
         log (sprintf "- notepad.exe: ERROR %s" ex.Message)
     log "- NOTE: this only confirms the query path works; it does NOT test real cross-monitor WM_DPICHANGED behavior (needs real multi-DPI hardware, see S11/S11r)"
 
+// S20: SwitchSettle(4.4/R4-5)のSettleMsは「実際のOS側のタイミング挙動の実測が無く、適切な
+// SettleMsや再要求の発火条件を決める根拠が無い」まま保留されている(architecture.md v2.29)。
+// 実運用のForegroundObservedはSetWinEventHook(WINEVENT_OUTOFCONTEXT, EVENT_SYSTEM_FOREGROUND)
+// 経由で届く(8.1/21章)ので、ポーリングではなくこのフックで一次データを取る：自プロセスの2窓
+// A/B間をself-priming付きSetForegroundWindowで往復させ、(a)呼び出しからフックへ
+// EVENT_SYSTEM_FOREGROUNDが最初に届くまでの遅延、(b)その直後に別のhwndへのイベントが続く
+// 「揺れ」の有無を複数回計測する。CI実機（仮想化・ヘッドレス寄り）での一次データであり、
+// S4がS4rで実デスクトップ再検証を要したのと同様、ここでの数値も実デスクトップでの
+// 再検証（S20r）を要する可能性がある——本spikeはその前段の、一次データ無しの状態を
+// 解消するためのものである。
+let spikeS20_SwitchSettleTiming () =
+    let EVENT_SYSTEM_FOREGROUND = 0x0003u
+    let WINEVENT_OUTOFCONTEXT = 0x0000u
+    let MOUSEEVENTF_MOVE = 0x0001u
+
+    let events = ResizeArray<int64 * IntPtr>()
+    let sw = Stopwatch()
+    let callback =
+        WinEventProc(fun _hWinEventHook eventType hwnd _idObject _idChild _idEventThread _dwmsEventTime ->
+            if eventType = EVENT_SYSTEM_FOREGROUND then
+                events.Add(sw.ElapsedMilliseconds, hwnd))
+
+    let hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, callback, 0u, 0u, WINEVENT_OUTOFCONTEXT)
+    if hook = IntPtr.Zero then
+        log (sprintf "- SetWinEventHook(EVENT_SYSTEM_FOREGROUND) failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+    else
+        try
+            use formA = new Form(Text = "S20-A", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(100, 100, 200, 150))
+            use formB = new Form(Text = "S20-B", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(400, 100, 200, 150))
+            formA.Show()
+            formB.Show()
+            pump 5
+
+            let label (target: Form) (source: Form) (hwnd: IntPtr) =
+                if hwnd = target.Handle then "target"
+                elif hwnd = source.Handle then "source"
+                else "other"
+
+            let roundTrip (fromForm: Form) (toForm: Form) (tag: string) =
+                SetForegroundWindow(fromForm.Handle) |> ignore
+                pump 5
+                events.Clear()
+                sw.Restart()
+                mouse_event (MOUSEEVENTF_MOVE, 0, 0, 0u, UIntPtr.Zero)
+                let apiOk = SetForegroundWindow(toForm.Handle)
+                // Tight-pump for up to 500ms to catch hook-delivery latency, then keep
+                // pumping to 800ms total (no further switch issued) to catch any bounce.
+                while sw.ElapsedMilliseconds < 800L do
+                    Application.DoEvents()
+                    Thread.Sleep(1)
+                let snapshot = events |> List.ofSeq
+                let firstToTarget = snapshot |> List.tryFind (fun (_, h) -> h = toForm.Handle)
+                let bounceAfter =
+                    match firstToTarget with
+                    | Some (t, _) -> snapshot |> List.filter (fun (t2, h) -> t2 > t && h <> toForm.Handle)
+                    | None -> []
+                log (
+                    sprintf
+                        "- %s: API returned=%b, first-to-target=%s, events=%s, bounce-after-target=%s"
+                        tag
+                        apiOk
+                        (match firstToTarget with
+                         | Some (t, _) -> sprintf "%dms" t
+                         | None -> "NEVER")
+                        (snapshot |> List.map (fun (t, h) -> sprintf "(%dms,%s)" t (label toForm fromForm h)) |> String.concat " ")
+                        (if bounceAfter.IsEmpty then "none" else sprintf "%d event(s)" bounceAfter.Length)
+                )
+
+            for i in 1 .. 5 do
+                roundTrip formA formB (sprintf "round %d A->B" i)
+                roundTrip formB formA (sprintf "round %d B->A" i)
+        finally
+            UnhookWinEvent(hook) |> ignore
+
 [<STAThread>]
 [<EntryPoint>]
 let main argv =
@@ -1664,6 +1752,7 @@ let main argv =
         tryRun "S17 RequestClose/WM_CLOSEの丁寧な拒否(7.1 R6-2)" spikeS17_RequestClose
         tryRun "S18 MoveSizeEnded矩形/モニタ捕捉(単一モニタのみ、R4-7)" spikeS18_MoveSizeCapture
         tryRun "S19 DpiAwareness問い合わせの健全性確認(低優先、実多DPI問題は未解決)" (fun () -> spikeS19_DpiAwarenessQuery exePath)
+        tryRun "S20 SwitchSettleのための前面切替フック遅延/揺れの実測(4.4/R4-5)" spikeS20_SwitchSettleTiming
 
         log "\n(all spikes finished without the watchdog firing)"
         0
