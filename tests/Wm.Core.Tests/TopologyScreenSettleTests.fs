@@ -79,6 +79,66 @@ let ``#21前半 変化していないトポロジ観測ではStableからSettlin
     let state', response, events, trace = update config (int64 now) (MonitorTopologyObserved unchanged) state
     (phase state' = Stable) && (response.Actions = []) && (response.TimerCommands = []) && (events = []) && (trace = [])
 
+/// Settling→genuine発火→Graceまで進める（テストの土台）。
+let private settleFully (t0: int64) (snapshots: MonitorSnapshot list) (state: TopologyState) : int64 * TopologyState =
+    let state1, _, _, _ = update config t0 (MonitorTopologyObserved snapshots) state
+    match phase state1 with
+    | Settling (_, deadline, _) ->
+        let state2, _, _, _ = update config deadline (TimerElapsed (TimerId.Topology ScreenSettle)) state1
+        deadline, state2
+    | _ -> t0, state1
+
+/// round2レビューT-2：3-1（blocking）の回帰を実際に捕まえるため、Reconfiguring区間を実際に通す。
+/// 「Stable/Settlingから、ScreenReconfigurationInProgress trueに入り、0回以上のMonitorTopologyObserved
+/// を経て、false／UserCommand／ReconfigurationCap満了のいずれかで解除し、ScreenSettleの発火まで進めたとき、
+/// 確定したDisplaysのモニター集合は、Reconfiguring中に最後に観測したトポロジ（無ければ解除前のDisplays）に
+/// 等しい」ことを検査する。元のバグ（`latestForForcedSettle`が`[]`を返す）では、観測を何もしていないのに
+/// `NoMonitors`へ確定してしまい、この性質が破れる。
+[<Property>]
+let ``T-2 Reconfiguring解除後は、最後に観測したトポロジ（無ければ解除前のDisplays）で確定する``
+    (initialRawIds: int list)
+    (observedDuring: int list list)
+    (releaseKind: int)
+    =
+    let initialSnapshots = mkSnapshots initialRawIds
+    let t0, state0 = settleFully 0L initialSnapshots (initial Map.empty) // Stable、Displays=initialSnapshots
+
+    let t1, stateReconfiguring, _, _ =
+        let s, r, e, tr = update config (t0 + 1L) (ScreenReconfigurationInProgress true) state0
+        (t0 + 1L, s, r, e)
+
+    let observedList = observedDuring |> List.truncate 5 |> List.map mkSnapshots
+
+    let tN, stateAfterObserved, lastObserved =
+        observedList
+        |> List.fold
+            (fun (t, s, _lastObs) snaps ->
+                let s', _, _, _ = update config (t + 1L) (MonitorTopologyObserved snaps) s
+                (t + 1L, s', Some snaps))
+            (t1, stateReconfiguring, None)
+
+    let expectedMonitorIds =
+        (lastObserved |> Option.defaultValue initialSnapshots) |> List.map (fun m -> m.Id) |> Set.ofList
+
+    let stateReleased, _, _, _ =
+        match (abs releaseKind) % 3 with
+        | 0 -> update config (tN + 1L) (ScreenReconfigurationInProgress false) stateAfterObserved
+        | 1 -> update config (tN + 1L) (UserCommand FocusNext) stateAfterObserved
+        | _ ->
+            match phase stateAfterObserved with
+            | Reconfiguring since -> update config (since + config.ReconfigurationCapMs) (TimerElapsed (TimerId.Topology ReconfigurationCap)) stateAfterObserved
+            | _ -> update config (tN + 1L) (ScreenReconfigurationInProgress false) stateAfterObserved
+
+    match phase stateReleased with
+    | Settling (_, deadline, _) ->
+        let stateSettled, _, _, _ = update config deadline (TimerElapsed (TimerId.Topology ScreenSettle)) stateReleased
+        match displays stateSettled with
+        | Displays (current, visible) ->
+            let actualIds = (current :: visible) |> List.map (fun sc -> sc.Monitor.Id) |> Set.ofList
+            actualIds = expectedMonitorIds
+        | NoMonitors -> Set.isEmpty expectedMonitorIds
+    | _ -> false // Reconfiguring中は常に解除されるので到達しないはず
+
 [<Property>]
 let ``deadline到達ちょうどのTimerElapsedは本物の発火としてGraceへ進む`` (settlingStart: int) (rawIds: int list) =
     let state0 = initial Map.empty

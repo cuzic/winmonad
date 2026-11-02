@@ -59,6 +59,9 @@ let initial (assignments: Map<WorkspaceId, MonitorSelector>) : TopologyState =
 let displays (s: TopologyState) : Displays = s.Displays
 let phase (s: TopologyState) : ScreenPhase = s.Phase
 
+/// 切断時の復帰先の予約（§4.4の`Returns`）。性質テストがN-3（予約の漏れ）を検査するための読み取り専用アクセサ。
+let returns (s: TopologyState) : Map<WorkspaceId, MonitorId> = s.Returns
+
 let private shownScreens (d: Displays) : Screen list =
     match d with
     | NoMonitors -> []
@@ -168,10 +171,11 @@ module MonitorLifecycle =
                         |> Option.orElse byAssignment
                         |> Option.defaultValue bySmallestUnshown
 
-                    let returns' =
-                        match byReturn with
-                        | Some ws -> Map.remove ws returns
-                        | None -> returns
+                    // 選ばれた経路（byReturn/byAssignment/bySmallestUnshown）を問わず、`chosen`の予約は
+                    // ここで必ず解除する（round2レビューN-3の修正）：byAssignmentで表示された場合も予約を
+                    // 残したままにすると、そのWorkspaceが新しいモニターへの割当候補から永久に外れ続ける
+                    // （元のモニターが戻ってきても二度と受け取れない）。「予約より明示的な表示を優先する」。
+                    let returns' = Map.remove chosen returns
 
                     screens @ [ { Monitor = monitor; Workspace = chosen } ],
                     evs @ [ WorkspaceShown (chosen, Reconcile) ],
