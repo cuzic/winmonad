@@ -12,8 +12,10 @@
     <Compile Include="HealthInvariantTests.fs" />
     <Compile Include="FocusInvariantTests.fs" />
     <Compile Include="WindowsTests.fs" />
+    <Compile Include="PlacementTests.fs" />
     <Compile Include="WmStateFocusTests.fs" />
     <Compile Include="WmStateWindowsTests.fs" />
+    <Compile Include="WmStatePlacementTests.fs" />
     <Compile Include="CrossDomainInvariantTests.fs" />
     <Compile Include="GatedEffectTests.fs" />
   </ItemGroup>

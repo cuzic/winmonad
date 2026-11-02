@@ -16,6 +16,7 @@ open Wm.Core.Workspaces
 open Wm.Core.Health
 open Wm.Core.Focus
 open Wm.Core.Windows
+open Wm.Core.Placement
 open Wm.Policy.PolicyTypes
 open Wm.Policy.PolicyEvaluator
 
@@ -39,20 +40,23 @@ module RuntimePolicy =
 
 /// 親の状態。最初はTopologyのフィールドだけを持ち、ドメインを実装するたびにフィールドを追加する
 /// （ADR-019決定8。6フィールドを骨格だけ一括で用意する代替案は退けた）。Workspaces・Health・Focus・
-/// Windowsを追加（決定2：6ドメインに強制順序は無い）。
+/// Windows・Placementを追加（決定2：6ドメインに強制順序は無い）。Placementは今はGeometryの信念だけを
+/// 持つ（Placement.fsのファイル冒頭コメント参照。Desired/Pending等は専用のラウンドで追加する）。
 type WmState =
     { Topology: TopologyState
       Workspaces: WorkspaceSet
       Health: HealthState
       Focus: FocusState
-      Windows: WindowRegistry }
+      Windows: WindowRegistry
+      Placement: PlacementState }
 
 let initial (runtimePolicy: RuntimePolicy) : WmState =
     { Topology = Topology.initial Map.empty
       Workspaces = WorkspaceSet.empty
       Health = Health.initial
       Focus = Focus.initial
-      Windows = Windows.initial }
+      Windows = Windows.initial
+      Placement = Placement.initial }
 
 type StepResult = {
     Next: WmState
@@ -126,7 +130,8 @@ let private vanishWindow (w: WindowId) (state: WmState) : WmState * TimerCommand
                 { state'.Health with
                     Responsiveness = Map.remove w state'.Health.Responsiveness
                     Reprobes = Map.remove w state'.Health.Reprobes }
-            Windows = Windows.onWindowVanished w state'.Windows }
+            Windows = Windows.onWindowVanished w state'.Windows
+            Placement = Placement.onWindowVanished w state'.Placement }
     next, reprobeCancel @ classificationCancel
 
 /// 窓の「管理外化」（Excluded化。消滅はしていない）。Workspaces/Focus.History/SwitchSettleからだけ除き、
@@ -156,15 +161,15 @@ let private applyWindowsEvent (state: WmState) (ev: DomainEvent) : WmState =
     | WindowUnmanaged w -> unmanageWindow w state
     | _ -> state
 
-/// Topology段（§7.1の段②）、Focusの観測反映（段①相当）、Windowsの信念反映・分類（段①⑤相当）、
+/// Topology段（§7.1の段②）、Focusの観測反映（段①相当）、Windows/Placementの信念反映・分類（段①⑤相当）、
 /// Health/FocusのTimerElapsedディスパッチ、窓の消滅クリーンアップ、focusedの変化を見たHistory/zipperの
 /// Focus更新（段⑥相当）を配線する。他ドメインが実装されるたびに該当する段を追加する
 /// （ADR-018：各ドメインは自分の状態だけを返し、他ドメインの状態を書かない）。
 ///
 /// Opusレビュー5-3：§7.1の段の順そのままではなく、今実装済みのドメインが処理できる入力の分だけ
-/// 素直に並べている（Placementが無い間は段③④⑦の配線先が無い。`MinimizedStateChanged`/`StyleChanged`も
-/// 同様に未配線、Windows.fsのファイル冒頭コメント参照）。表どおりの8段パイプラインへの完全な組み直しは
-/// Placement着手時まで持ち越す。
+/// 素直に並べている。PlacementはGeometryの信念だけが実装済みで、段③④⑦（Pending照合・Reconcile）の
+/// 配線先はまだ無い（`StyleChanged`も同様に未配線、Windows.fs/Placement.fsのファイル冒頭コメント参照）。
+/// 表どおりの8段パイプラインへの完全な組み直しは、PlacementのDesired/Pending着手時まで持ち越す。
 let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelope<InputEvent>) : StepResult =
     let now = envelope.MonotonicTime
     let focusedBefore = focused state
@@ -192,27 +197,38 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         { state with Windows = windowsRegistry' }
         |> fun s -> windowsEvents |> List.fold applyWindowsEvent s
 
-    // 段①相当：観測の信念反映（全入力について無条件に最初に行う、§7.1）。FocusのForegroundを配線する
-    // （Placementの観測反映はPlacementが実装されるまで未配線）。信念の値が変わったらForegroundChanged
-    // （§7.1表の段①が出すDomainEvent）を出す。
+    // 段①相当（Placement、Geometryの信念のみ）：WindowObservedはWindowsと同じ入力から自分の信念だけを
+    // 修正する（§7.1「Windows→Placement→Health→Focus」の順）。MinimizedStateChangedもここで初めて配線する
+    // （Placement.fsのファイル冒頭コメント参照。Desired/Pending等の本格的なReconcileはまだ無い）。
+    let placementState' =
+        match envelope.Input with
+        | WindowObserved snapshot -> Placement.onWindowObserved now snapshot stateAfterWindows.Placement
+        | MinimizedStateChanged (w, obs) -> Placement.onMinimizedStateChanged now w obs stateAfterWindows.Placement
+        | _ -> stateAfterWindows.Placement
+
+    let stateAfterPlacement = { stateAfterWindows with Placement = placementState' }
+
+    // 段①相当：観測の信念反映（全入力について無条件に最初に行う、§7.1）。FocusのForegroundを配線する。
+    // 信念の値が変わったらForegroundChanged（§7.1表の段①が出すDomainEvent）を出す。
     let focusAfterBelief, stage1Events =
         match envelope.Input with
         | ForegroundObserved obs ->
-            let revised = Focus.reviseForeground now stateAfterWindows.Focus.Foreground obs
-            let changed = LatestWins.value revised <> LatestWins.value stateAfterWindows.Focus.Foreground
-            { stateAfterWindows.Focus with Foreground = revised },
+            let revised = Focus.reviseForeground now stateAfterPlacement.Focus.Foreground obs
+            let changed = LatestWins.value revised <> LatestWins.value stateAfterPlacement.Focus.Foreground
+            { stateAfterPlacement.Focus with Foreground = revised },
             (if changed then [ ForegroundChanged (LatestWins.value revised |> Option.flatten) ] else [])
-        | _ -> stateAfterWindows.Focus, []
+        | _ -> stateAfterPlacement.Focus, []
 
     // 段②：Topologyの原因・コマンドの受付。
     let topologyState', topologyResponse, topologyEvents, traces =
-        Topology.update runtimePolicy.Topology now envelope.Input stateAfterWindows.Topology
+        Topology.update runtimePolicy.Topology now envelope.Input stateAfterPlacement.Topology
 
-    // Health：ResponsivenessReprobeタイマーの発火だけを配線する（証拠の供給元はPlacementが無いため未配線）。
+    // Health：ResponsivenessReprobeタイマーの発火だけを配線する（証拠の供給元はPlacementのPendingが
+    // 無いため未配線。Geometry以外のPlacementの信念と同じ既知のギャップ）。
     let healthState', healthTimerCmds =
         match envelope.Input with
-        | TimerElapsed (TimerId.Health (ResponsivenessReprobe w)) -> Health.onReprobeTimerFired now w stateAfterWindows.Health
-        | _ -> stateAfterWindows.Health, []
+        | TimerElapsed (TimerId.Health (ResponsivenessReprobe w)) -> Health.onReprobeTimerFired now w stateAfterPlacement.Health
+        | _ -> stateAfterPlacement.Health, []
 
     // Focus：SwitchSettleタイマーの発火。「再要求が必要な窓」はPlacement（RequestIdの採番元）が
     // 無いためEffectへ変換できず、既知のギャップとして捨てる（TimerCommand（CancelTimer）だけは反映する）。
@@ -222,7 +238,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         | _ -> focusAfterBelief, None, []
 
     let stateAfterBeliefs =
-        { stateAfterWindows with
+        { stateAfterPlacement with
             Topology = topologyState'
             Health = healthState'
             Focus = focusAfterTimer }
