@@ -4,8 +4,11 @@ module Wm.Core.Tests.PlacementReconcileTests
 
 open Xunit
 open Wm.Contracts.Identifiers
+open Wm.Contracts.ErrorTypes
 open Wm.Contracts.Observation
+open Wm.Contracts.Beliefs
 open Wm.Contracts.SharedVocabulary
+open Wm.Contracts.Timers
 open Wm.Contracts.CoreCommand
 open Wm.Layouts.LayoutRegistry
 open Wm.Core.Placement
@@ -171,3 +174,59 @@ let ``onWindowVanishedはPending・Desired・Epochsも除き、PendingDeadline�
     Assert.Equal(None, Map.tryFind w state'.Desired)
     Assert.Equal(None, Map.tryFind w state'.Epochs)
     Assert.NotEmpty(timerCmds)
+
+// ===== onEffectCallReturned（§7.2） =====
+
+let private pendingRidFor (state: PlacementState) (w: WindowId) : RequestId =
+    state.Pending |> Map.toSeq |> Seq.filter (fun (_, pr) -> pr.Window = w) |> Seq.map fst |> Seq.head
+
+[<Fact>]
+let ``Ok()はPendingを変えない(Satisfiedにするのは観測の一致だけ)`` () =
+    let w = WindowId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let state', failureInfo = onEffectCallReturned 20L 2L rid (Ok ()) afterReconcile
+    Assert.Equal<Map<RequestId, PendingRequest>>(afterReconcile.Pending, state'.Pending)
+    Assert.Equal(None, failureInfo)
+
+[<Fact>]
+let ``ERROR_INVALID_WINDOW_HANDLEはTargetGoneに分類され、PendingとDesiredを取り消す`` () =
+    let w = WindowId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let error: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 1400; ElapsedUs = 0L }
+    let state', failureInfo = onEffectCallReturned 20L 2L rid (Error error) afterReconcile
+    Assert.Empty(state'.Pending)
+    Assert.Equal(None, Map.tryFind w state'.Desired)
+    Assert.Equal(Some (w, TargetGone), failureInfo)
+
+[<Fact>]
+let ``ERROR_ACCESS_DENIEDはDenied OtherDenialに分類され、MovabilityをNotMovableへ修正する`` () =
+    let w = WindowId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let error: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 5; ElapsedUs = 0L }
+    let state', failureInfo = onEffectCallReturned 20L 2L rid (Error error) afterReconcile
+    Assert.Empty(state'.Pending)
+    Assert.Equal(Some (w, Denied OtherDenial), failureInfo)
+    match Map.tryFind w state'.Movability with
+    | Some { Value = NotMovable } -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+
+[<Fact>]
+let ``TargetHungと分類された場合、Movabilityは変えない(HealthのResponsiveness修正は呼び出し側の責務)`` () =
+    let w = WindowId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let error: NativeCallRecord = { Api = "SendMessageTimeout"; Space = Win32LastError; Code = 1460; ElapsedUs = 0L }
+    let state', failureInfo = onEffectCallReturned 20L 2L rid (Error error) afterReconcile
+    Assert.Empty(state'.Pending)
+    Assert.Equal(Some (w, TargetHung), failureInfo)
+    Assert.Equal(None, Map.tryFind w state'.Movability) // Movabilityはこの関数の対象外
+
+[<Fact>]
+let ``対応するPendingが無いRequestId(古い結果)は無害に無視する`` () =
+    let error: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 1400; ElapsedUs = 0L }
+    let state', failureInfo = onEffectCallReturned 20L 2L (RequestId 999L) (Error error) initial
+    Assert.Equal(initial, state')
+    Assert.Equal(None, failureInfo)

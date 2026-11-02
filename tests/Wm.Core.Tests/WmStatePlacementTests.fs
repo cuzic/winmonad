@@ -4,11 +4,13 @@ module Wm.Core.Tests.WmStatePlacementTests
 
 open Xunit
 open Wm.Contracts.Identifiers
+open Wm.Contracts.ErrorTypes
 open Wm.Contracts.Observation
 open Wm.Contracts.Beliefs
 open Wm.Contracts.GatedEffect
 open Wm.Contracts.CoreCommand
 open Wm.Core.Topology
+open Wm.Core.Placement
 open Wm.Core.WmState
 
 let private mkEnvelope (sequence: int64) (input: InputEvent) : EventEnvelope<InputEvent> =
@@ -76,6 +78,24 @@ let ``新規窓がTiledに分類されると、同じstepでReconcileがSetRect�
         | other -> other
     let afterSatisfied = step RuntimePolicy.defaults afterObserved.Next (mkEnvelope 2L snapshotWithRect)
     Assert.Empty(afterSatisfied.Next.Placement.Pending)
+
+[<Fact>]
+let ``EffectCallReturnedのTargetHungは同じstepでHealth.Responsivenessも修正する(ドメインをまたぐ配線)`` () =
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0 ]
+    let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+    let afterObserved = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved (WindowId 1L)))
+    let rid =
+        afterObserved.Next.Placement.Pending
+        |> Map.toSeq
+        |> Seq.filter (fun (_, (pr: PendingRequest)) -> pr.Window = WindowId 1L)
+        |> Seq.map fst
+        |> Seq.head
+    let hungError: NativeCallRecord = { Api = "SendMessageTimeout"; Space = Win32LastError; Code = 1460; ElapsedUs = 0L }
+    let afterHung = step RuntimePolicy.defaults afterObserved.Next (mkEnvelope 2L (EffectCallReturned (rid, Error hungError)))
+    match Map.tryFind (WindowId 1L) afterHung.Next.Health.Responsiveness with
+    | Some { Value = Hung; Confidence = Confirmed } -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+    Assert.Empty(afterHung.Next.Placement.Pending)
 
 [<Fact>]
 let ``WindowRemovedは同じstepでPlacement.Geometryも除く`` () =

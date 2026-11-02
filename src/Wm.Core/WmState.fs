@@ -4,6 +4,7 @@
 module Wm.Core.WmState
 
 open Wm.Contracts.Identifiers
+open Wm.Contracts.ErrorTypes
 open Wm.Contracts.CoreCommand
 open Wm.Contracts.Timers
 open Wm.Contracts.GatedEffect
@@ -211,16 +212,25 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
 
     // 段①相当（Placement）：WindowObservedはWindowsと同じ入力から自分の信念（Geometry/Movability/
     // TargetIntegrity）だけを修正する（§7.1「Windows→Placement→Health→Focus」の順）。TargetIntegrityの
-    // ProbeOnceタイマー（IntegrityReprobe）の発火もここで処理する。MinimizedStateChangedもここで配線する
-    // （Placement.fsのファイル冒頭コメント参照。Desired/Pending等の本格的なReconcileはまだ無い）。
-    let placementState', placementEffects, placementTimerCmds =
+    // ProbeOnceタイマー（IntegrityReprobe）の発火、`EffectCallReturned`（Pendingの終端遷移の一部）もここで
+    // 処理する。MinimizedStateChangedもここで配線する（Placement.fsのファイル冒頭コメント参照）。
+    // `effectCallFailure`は`EffectCallReturned`が`TargetHung`と判定した場合に、Health側の
+    // Responsiveness修正（Placementの管轄外）へ渡すための情報（下記）。
+    let placementState', placementEffects, placementTimerCmds, effectCallFailure =
         match envelope.Input with
-        | WindowObserved snapshot -> Placement.onWindowObserved now snapshot stateAfterWindows.Placement
-        | MinimizedStateChanged (w, obs) -> Placement.onMinimizedStateChanged now w obs stateAfterWindows.Placement, [], []
-        | TimerElapsed (TimerId.Placement (IntegrityReprobe w)) -> Placement.onIntegrityReprobeTimerFired now w stateAfterWindows.Placement
+        | WindowObserved snapshot ->
+            let s, e, t = Placement.onWindowObserved now snapshot stateAfterWindows.Placement
+            s, e, t, None
+        | MinimizedStateChanged (w, obs) -> Placement.onMinimizedStateChanged now w obs stateAfterWindows.Placement, [], [], None
+        | TimerElapsed (TimerId.Placement (IntegrityReprobe w)) ->
+            let s, e, t = Placement.onIntegrityReprobeTimerFired now w stateAfterWindows.Placement
+            s, e, t, None
         | TimerElapsed (TimerId.Placement (PendingDeadline rid)) ->
-            Placement.onPendingDeadlineTimerFired now rid stateAfterWindows.Placement, [], []
-        | _ -> stateAfterWindows.Placement, [], []
+            Placement.onPendingDeadlineTimerFired now rid stateAfterWindows.Placement, [], [], None
+        | EffectCallReturned (rid, result) ->
+            let s, failureInfo = Placement.onEffectCallReturned now envelope.Sequence rid result stateAfterWindows.Placement
+            s, [], [], failureInfo
+        | _ -> stateAfterWindows.Placement, [], [], None
 
     let stateAfterPlacement = { stateAfterWindows with Placement = placementState' }
 
@@ -239,11 +249,17 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     let topologyState', topologyResponse, topologyEvents, traces =
         Topology.update runtimePolicy.Topology now envelope.Input stateAfterPlacement.Topology
 
-    // Health：ResponsivenessReprobeタイマーの発火だけを配線する（証拠の供給元はPlacementのPendingが
-    // 無いため未配線。Geometry以外のPlacementの信念と同じ既知のギャップ）。
+    // Health：ResponsivenessReprobeタイマーの発火と、PlacementのEffectCallReturned処理が`TargetHung`と
+    // 判定した場合のResponsiveness修正（§7.2「EffectCallReturned(Error) → classify → TargetHung →
+    // Cancelled ＋ Responsiveness:=Hung」。この信念修正自体はHealthの管轄なのでPlacement.fsではなく
+    // ここで行う、ADR-018）を配線する。
     let healthState', healthTimerCmds =
         match envelope.Input with
         | TimerElapsed (TimerId.Health (ResponsivenessReprobe w)) -> Health.onReprobeTimerFired now w stateAfterPlacement.Health
+        | EffectCallReturned _ ->
+            match effectCallFailure with
+            | Some (w, TargetHung) -> Health.applyEvidence now w (FromEffectFailure TargetHung) stateAfterPlacement.Health
+            | _ -> stateAfterPlacement.Health, []
         | _ -> stateAfterPlacement.Health, []
 
     // Focus：SwitchSettleタイマーの発火。「再要求が必要な窓」はPlacement（RequestIdの採番元）が

@@ -67,10 +67,8 @@ let ``VirtualWorldに存在しない窓へのSetRectはERROR_INVALID_WINDOW_HAND
     let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
     Assert.Equal(1, Map.count reducer.State.Placement.Pending) // Reconcileが要求を出している
 
-    // applyEffectの戻り値そのもの（callReturns）を直接検査する——`settle`経由ではPlacementが
-    // `EffectCallReturned`をまだ消費しない（Placement.fsのファイル冒頭「対象外」参照）ため、
-    // Pendingの有無だけを見てもOk/Errorのどちらが返ったかは区別できない。GatedEffectは実際の
-    // Reducerパイプラインが生成した本物を使う（このファイルの冒頭コメント参照）。discovery.Effectsには
+    // applyEffectの戻り値そのもの（callReturns）を直接検査する。GatedEffectは実際のReducerパイプライン
+    // が生成した本物を使う（このファイルの冒頭コメント参照）。discovery.Effectsには
     // WindowsのTargetIntegrity probe要求（Reprobe）も混ざるので、SetRectだけを取り出す。
     let setRectEffects = discovery.Effects |> List.filter (fun g -> match GatedEffect.effect g with SetRect _ -> true | _ -> false)
     match setRectEffects with
@@ -88,9 +86,11 @@ let ``VirtualWorldに存在しない窓へのSetRectはERROR_INVALID_WINDOW_HAND
     let finalWorld = settle 1000L reducer worldWithoutTheWindow discovery.Effects
 
     Assert.Empty(finalWorld.Windows)
-    // PlacementはこのラウンドではEffectCallReturnedを消費しないので、PendingはTimeout
-    // （PendingDeadline）まで残り続ける。
-    Assert.Equal(1, Map.count reducer.State.Placement.Pending)
+    // v2.22でEffectCallReturnedを配線した：ERROR_INVALID_WINDOW_HANDLE(1400)はclassifyでTargetGoneに
+    // 分類され、Timeoutを待たずに即座にPendingがCancelledになる（§7.2「EffectCallReturned(Error) →
+    // classify → TargetGone → Cancelled」）。
+    Assert.Empty(reducer.State.Placement.Pending)
+    Assert.Equal(None, Map.tryFind w reducer.State.Placement.Desired)
 
 [<Fact>]
 let ``2つ目の窓が現れても、両方がMonocleで全画面に配置され両方Satisfiedになる`` () =

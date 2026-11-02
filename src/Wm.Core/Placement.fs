@@ -15,17 +15,30 @@
 /// `onPendingDeadlineTimerFired`（`Timeout`→単発の諦め）、`onGateRejected`（`GateRejected`→即時`Cancelled`）。
 /// `PendingRequest`に`RequestId`（Mapキー）/`Retry`/`Status`を持たせていない理由は型の直前のコメント参照。
 ///
+/// `EffectCallReturned`（v2.22追加）：Wm.Simulationが`GatedEffect`を実際に適用し`EffectCallReturned`を
+/// 返せるようになったので配線した。`onEffectCallReturned`は`classify`の結果に応じて`Cancelled`にし、
+/// `Denied OtherDenial`なら`Movability`を`NotMovable`へ修正する。`TargetHung`時の`Health.Responsiveness`
+/// 修正はPlacementの管轄外（Health.fsの責務）なので、呼び出し側（`WmState.step`）が
+/// `onEffectCallReturned`の戻り値（`(WindowId * EffectFailure) option`）を見て行う。
+///
 /// このラウンドで意図的に対象外にしたこと（いずれも「できればやる」ではなく、別の未実装の仕組みが
 /// 前提になっているため実装できない項目であり、専用のラウンドへ切り出す）：
-/// - **Retry/Backoff**（§7.2「Timeout → Retry/Backoff」、§7.3）：`onPendingDeadlineTimerFired`は
-///   1回で諦め、`Desired`も取り消す（次のReconcileが最初から再試行する、バックオフでの間隔調整は無い）。
+/// - **Retry/Backoff**（§7.2「Timeout → Retry/Backoff」、§7.3）：`onPendingDeadlineTimerFired`も
+///   `onEffectCallReturned`も1回で諦め、`Desired`も取り消す（次のReconcileが最初から再試行する、
+///   バックオフでの間隔調整は無い。`Transient`/`Unclassified`も同じ単発の諦めにする）。
 /// - **`Mismatch` → `Reevaluate`**：観測が`TargetRect`と一致しない場合、`checkPendingSatisfied`は
 ///   何もしない（Pendingはそのまま残り、`PendingDeadline`満了か次のReconcileに委ねる）。
-/// - **`EffectCallReturned`（`classify`の分岐：`TargetGone`/`TargetHung`/`Denied`/`Transient`/
-///   `Unclassified`）**：Shell/Simulationが実際にEffectを適用して結果を返す経路自体が
-///   Wm.Runtime/Wm.Simulation側にまだ無く、`InputEvent.EffectCallReturned`の配線先がまだ無い。
-///   `Movability`の`Denied OtherDenial`→`NotMovable`、`Satisfied`→`Movable`、ユーザー操作による
-///   1回だけの試し直しも、このEffect結果の反映が前提のため同じく対象外。
+/// - **`Movability`の`Satisfied`→`Movable`遷移、ユーザー操作による1回だけの試し直し**：前者は
+///   「試したかどうか」の判定にPendingの履歴照合が要り、後者はユーザーコマンド経由でPlacementへの
+///   新しい入口が要る——どちらも専用のラウンドへ切り出す。
+/// - **`Unplaced`への読み替え（既知のギャップ、v2.22で発見）**：`Denied OtherDenial`で`Movability`を
+///   `NotMovable`にしても、Windows側（`classificationView`）はまだ`Movability`を常に`Movable`として
+///   読む（Windows.fsのファイル冒頭コメント参照）ため、§4.4の「`NotMovable`の窓は`Unplaced`として
+///   Workspacesから外す」が起こらない。その窓は`Tiled`のままWorkspacesに残り、次のReconcileトリガーの
+///   たびに`Desired`が空（`onEffectCallReturned`が取り消したため）なので再試行し、ゲートに
+///   `TargetNotMovable`で弾かれ、`onGateRejected`が再び`Desired`を取り消す……という無駄な繰返しになる
+///   （安全だが非効率。クラッシュや誤動作にはならない）。Windows側がPlacementの`Movability`を読んで
+///   `EffUnplaced`を導く配線は、Core.Windowsの次のラウンドへ持ち越す。
 /// - **トポロジ確定（ScreenSettle満了）→`Superseded`**：`Topology`が出す`TopologySettled`
 ///   DomainEventはまだ`step`で捨てられている（Opusレビュー5-3）。配線すればPendingの一括失効も書ける。
 /// - **`MinWidth`/`DpiBehavior`（Accumulating規則）**：証拠（`SetRect`の`Mismatch`、DPI切替後の
@@ -39,6 +52,7 @@
 module Wm.Core.Placement
 
 open Wm.Contracts.Identifiers
+open Wm.Contracts.ErrorTypes
 open Wm.Contracts.Observation
 open Wm.Contracts.Beliefs
 open Wm.Contracts.Timers
@@ -315,6 +329,38 @@ let onGateRejected (rejectedRequestIds: RequestId list) (state: PlacementState) 
                 cmds @ [ CancelTimer (TimerId.Placement (PendingDeadline rid)) ]
             | None -> st, cmds)
         (state, [])
+
+/// `EffectCallReturned`：§7.2のPending終端遷移のうち、Coreが直接判断できる部分（ファイル冒頭コメント
+/// 参照）。`Ok ()`は「受付が成功した」だけを意味し、`Satisfied`にするのは観測の一致だけなので
+/// （§7.2「SetRectのネイティブAPI呼出が成功しても、目標矩形を観測するまではSatisfiedにしない」）、
+/// 何もしない。`Error`は`classify`で`EffectFailure`へ変換し、対応するPendingを`Cancelled`にする
+/// （`Desired`も取り消し、次のReconcileに最初からの再試行を委ねる——Timeout/GateRejectedと同じ簡略化）。
+/// `Denied OtherDenial`はさらに`Movability`を`NotMovable`へ修正する（§4.5）。戻り値の
+/// `(WindowId * EffectFailure) option`は、`TargetHung`時のHealth.Responsiveness修正（Placementの
+/// 管轄外）を呼び出し側（`WmState.step`）が行うために必要な情報を運ぶ。
+let onEffectCallReturned
+    (now: int64)
+    (evidenceSequence: int64)
+    (rid: RequestId)
+    (result: Result<unit, NativeCallRecord>)
+    (state: PlacementState)
+    : PlacementState * (WindowId * EffectFailure) option =
+    match result with
+    | Ok () -> state, None
+    | Error record ->
+        match Map.tryFind rid state.Pending with
+        | None -> state, None // 古い結果、またはこのPendingはすでに別の経路で終端済み
+        | Some pr ->
+            let failure = classify record
+            let cancelled = { state with Pending = Map.remove rid state.Pending; Desired = Map.remove pr.Window state.Desired }
+            let state' =
+                match failure with
+                | Denied OtherDenial ->
+                    { cancelled with
+                        Movability =
+                            Map.add pr.Window { Value = NotMovable; Confidence = Inferred [ Outcome (evidenceSequence, rid) ]; LastRevisedAt = now } cancelled.Movability }
+                | _ -> cancelled
+            state', Some (pr.Window, failure)
 
 /// 窓の消滅時、`Geometry`/`Movability`/`TargetIntegrity`/`IntegrityReprobes`/`Desired`/`Pending`/`Epochs`
 /// を除く（§4.4「各ドメインの信念は窓が消滅した時点でのみ除去する」）。動いている再probeタイマーと、
