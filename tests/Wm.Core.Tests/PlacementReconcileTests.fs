@@ -156,24 +156,65 @@ let ``観測された矩形がTargetRectと一致しなければPendingは残る
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w mismatchedRect 1L) afterReconcile
     Assert.Equal(1, Map.count afterObserved.Pending)
 
-// ===== Timeout（§7.2） =====
+// ===== Timeout（§7.2、v2.28でRetry実装） =====
 
 [<Fact>]
-let ``PendingDeadline満了はPendingとDesiredの両方を取り消す(次のReconcileで最初から再試行させる)`` () =
+let ``PendingDeadline満了は上限に達するまで同じTargetRectへSetRectを再発行し、Desiredは取り消さない`` () =
     let w = WindowId 1L
     let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
-    let rid = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
-    let afterTimeout = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid afterReconcile
-    Assert.Empty(afterTimeout.Pending)
-    Assert.Equal(None, Map.tryFind w afterTimeout.Desired)
+    let rid0 = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
+    let afterRetry1, effects1, timerCmds1 = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid0 afterReconcile
+    Assert.Equal(1, Map.count afterRetry1.Pending)
+    Assert.Equal(Some (Shown (Some workArea)), Map.tryFind w afterRetry1.Desired)
+    Assert.Equal(Some 1, Map.tryFind w afterRetry1.RetryAttempts)
+    let rid1 = afterRetry1.Pending |> Map.toSeq |> Seq.head |> fst
+    Assert.NotEqual(rid0, rid1) // 新しいRequestIdで再発行する
+    Assert.Equal<Effect list>([ SetRect (rid1, w, workArea) ], effects1)
+    Assert.NotEmpty(timerCmds1) // 新しいPendingDeadlineを始動する
+
+[<Fact>]
+let ``PendingDeadline満了が上限回数続くと、最終的にPendingとDesiredの両方を取り消す(次のReconcileで最初から再試行させる)`` () =
+    let w = WindowId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid0 = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
+    // pendingRetryMaxAttempts回（既定3回）Timeoutを発火させ続けると、最後は単発の諦めと同じ終端になる。
+    let rec driveToGiveUp (attemptsLeft: int) (now: int64) (rid: RequestId) (state: PlacementState) : PlacementState =
+        let state', _, _ = onPendingDeadlineTimerFired now rid state
+        if attemptsLeft <= 1 then
+            state'
+        else
+            let nextRid = state'.Pending |> Map.toSeq |> Seq.head |> fst
+            driveToGiveUp (attemptsLeft - 1) (now + pendingDeadlineMs) nextRid state'
+    let final = driveToGiveUp pendingRetryMaxAttempts (10L + pendingDeadlineMs) rid0 afterReconcile
+    Assert.Empty(final.Pending)
+    Assert.Equal(None, Map.tryFind w final.Desired)
+    Assert.Equal(None, Map.tryFind w final.RetryAttempts)
+
+[<Fact>]
+let ``新しい意図(Targetが変わったReconcile)はRetryの試行回数を引き継がない`` () =
+    let w = WindowId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid0 = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
+    let afterRetry, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid0 afterReconcile
+    Assert.Equal(Some 1, Map.tryFind w afterRetry.RetryAttempts)
+
+    // Reconcileのやり直し（例：別のモニターへ移った、Layoutが変わった）で新しいTargetが計算される——
+    // これは古いTargetへの再試行ではなく新しい意図なので、試行回数は0へ戻るべき。
+    let differentWorkArea: PixelRect = { X = 0; Y = 0; Width = 1280; Height = 720 }
+    let differentCtx: LayoutContext = { ctxWith [ w ] with WorkArea = differentWorkArea }
+    let afterNewIntent, effects, _ = reconcileWorkspace 20L registry monocleRef differentCtx (managementOf [ w ]) (aliveOf [ w ]) afterRetry
+    Assert.Equal<Effect list>([ SetRect (RequestId afterRetry.NextRequestId, w, differentWorkArea) ], effects)
+    Assert.Equal(None, Map.tryFind w afterNewIntent.RetryAttempts)
 
 [<Fact>]
 let ``古い発火(期限未到達)のPendingDeadlineは無視する`` () =
     let w = WindowId 1L
     let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
-    let stillPending = onPendingDeadlineTimerFired 10L rid afterReconcile // Now=IssuedAt、まだdeadline未到達
+    let stillPending, effects, timerCmds = onPendingDeadlineTimerFired 10L rid afterReconcile // Now=IssuedAt、まだdeadline未到達
     Assert.Equal(1, Map.count stillPending.Pending)
+    Assert.Empty(effects)
+    Assert.Empty(timerCmds)
 
 // ===== GateRejected（§7.2） =====
 

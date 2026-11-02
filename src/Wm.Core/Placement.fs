@@ -33,12 +33,24 @@
 /// Workspaceだけに適用していた。v2.26でこの制限を外し、現在表示中の全てのWorkspace（他モニターに
 /// 表示中の可視Workspaceも含む）を順にReconcileするようになった（呼び出し側のコメント参照）。
 ///
+/// `PendingDeadline`のRetry（v2.28追加）：`onPendingDeadlineTimerFired`が、上限（既定3回、
+/// `pendingRetryMaxAttempts`）に達するまで、同じ`TargetRect`/`Epoch`へ新しい`RequestId`で`SetRect`を
+/// 即座に再発行する（§7.2「Timeout → Retry/Backoff」のRetry部分）。Backoff（試行間隔を指数的に空ける）
+/// は依然対象外：`IntegrityReprobe`の間隔は「外部プロセスを急かさない」という明確な理由があったが、
+/// `SetRect`の再試行に同じ理由は無く、適切な遅延量をPhase 0の実測無しに決める根拠が無いため、
+/// 即座に再試行し試行回数だけを数える単純な形にする（`RetryAttempts`の型直前のコメント参照）。
+/// `onEffectCallReturned`側（`Transient`/`Unclassified`を含む）は依然単発の諦めのまま——Retryの対象を
+/// Timeoutだけに絞ったのは、`classify`の各分岐ごとに「リトライが安全か」を個別に検討する必要があり
+/// （`Denied`系はおそらく再試行しても無駄、`TargetHung`はHealthの管轄、等）、根拠の無い当てはめを
+/// 避けるため。
+///
 
 /// このラウンドで意図的に対象外にしたこと（いずれも「できればやる」ではなく、別の未実装の仕組みが
 /// 前提になっているため実装できない項目であり、専用のラウンドへ切り出す）：
-/// - **Retry/Backoff**（§7.2「Timeout → Retry/Backoff」、§7.3）：`onPendingDeadlineTimerFired`も
-///   `onEffectCallReturned`も1回で諦め、`Desired`も取り消す（次のReconcileが最初から再試行する、
-///   バックオフでの間隔調整は無い。`Transient`/`Unclassified`も同じ単発の諦めにする）。
+/// - **`PendingDeadline`のBackoff**（§7.2「Timeout → Retry/Backoff」のBackoff部分、§7.3）：Retry自体は
+///   v2.28で実装済み（上記）。試行間隔を空ける理由・適切な遅延量はPhase 0の実測が必要。
+/// - **`onEffectCallReturned`（`Transient`/`Unclassified`含む）のRetry**：`classify`の各分岐ごとに
+///   リトライの安全性を個別に検討する必要があるため、v2.28ではTimeoutだけに絞った（上記）。
 /// - **`Mismatch` → `Reevaluate`**：観測が`TargetRect`と一致しない場合、`checkPendingSatisfied`は
 ///   何もしない（Pendingはそのまま残り、`PendingDeadline`満了か次のReconcileに委ねる）。即座に
 ///   `Desired`を取り消して再試行させる実装も検討したが、`SetRect`完了前に届く無関係な観測
@@ -124,7 +136,14 @@ type PlacementState =
       NextRequestId: int64
       /// 窓ごとのIntentEpoch（§7.2「全体で単一のEpochにすると、1窓の新しい意図が他の全窓のPendingを
       /// 失効させてしまう」）。新しい`SetRect`を発行するたびに1つ進める。
-      Epochs: Map<WindowId, IntentEpoch> }
+      Epochs: Map<WindowId, IntentEpoch>
+      /// §7.2「Timeout → Retry/Backoff」のうち、このラウンド（v2.28）で実装するRetryの試行回数
+      /// （同じ`TargetRect`への再試行のみ。新しい意図（`dispatchPlacements`が`Desired`の変化を見て
+      /// 新しい`SetRect`を発行するとき）やSatisfied/GateRejected/vanishで0へ戻す）。Backoff（試行間隔を
+      /// 指数的に空ける`IntegrityReprobe`と同じ仕組み）は対象外のまま（下記）：`SetRect`の再試行には
+      /// `IntegrityReprobe`のような「外部プロセスを急かさないための間隔」という理由が無く、適切な遅延量を
+      /// Phase 0の実測無しに決める根拠が無いため、即座に再試行し試行回数だけを数える単純な形にする。
+      RetryAttempts: Map<WindowId, int> }
 
 let initial: PlacementState =
     { Geometry = Map.empty
@@ -134,7 +153,8 @@ let initial: PlacementState =
       Desired = Map.empty
       Pending = Map.empty
       NextRequestId = 0L
-      Epochs = Map.empty }
+      Epochs = Map.empty
+      RetryAttempts = Map.empty }
 
 /// `WmState.step`が、Placement自身のReconcile以外の理由（Focus.SwitchSettleの再要求、
 /// `MoveFocusedToWorkspace`のRequestForeground等、v2.27）で新しいRequestIdが要るときに呼ぶ最小の窓口。
@@ -145,6 +165,10 @@ let allocateRequestId (state: PlacementState) : RequestId * PlacementState =
 
 /// §7.2「PendingのDeadline」の既定値。実測未確定のため暫定値（他のタイムアウトと同様）。
 let pendingDeadlineMs = 2_000L
+
+/// §7.2「Timeout → Retry/Backoff」のRetryの上限試行回数（`integrityReprobeMaxAttempts`と同じ桁の
+/// 暫定値。`PlacementState.RetryAttempts`の型直前のコメント参照）。
+let pendingRetryMaxAttempts = 3
 
 // ===== TargetIntegrityのProbeOnce（§4.5）。既定値は未確定なので21章・HealthのResponsivenessReprobeと
 // 同じ桁の暫定値を使う（既定3回、指数バックオフ）。 =====
@@ -176,7 +200,8 @@ let private checkPendingSatisfied (now: int64) (w: WindowId) (state: PlacementSt
         | Some (rid, _) ->
             { state with
                 Pending = Map.remove rid state.Pending
-                Movability = Map.add w { Value = Movable; Confidence = Confirmed; LastRevisedAt = now } state.Movability },
+                Movability = Map.add w { Value = Movable; Confidence = Confirmed; LastRevisedAt = now } state.Movability
+                RetryAttempts = Map.remove w state.RetryAttempts },
             [ CancelTimer (TimerId.Placement (PendingDeadline rid)) ]
         | None -> state, []
 
@@ -294,7 +319,11 @@ let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: P
                         Desired = Map.add p.Window (Shown (Some p.Target)) st.Desired
                         Pending = Map.add rid pendingRequest pendingWithoutOld
                         NextRequestId = st.NextRequestId + 1L
-                        Epochs = Map.add p.Window epoch' st.Epochs }
+                        Epochs = Map.add p.Window epoch' st.Epochs
+                        // 新しい意図（Reconcileが計算した新しいTarget）なので、古いTargetへのRetryの
+                        // 試行回数は引き継がない（`RetryAttempts`はPendingDeadlineの再試行専用、型直前の
+                        // コメント参照）。
+                        RetryAttempts = Map.remove p.Window st.RetryAttempts }
                 st', effects @ [ SetRect (rid, p.Window, p.Target) ], cmds @ supersededCmds @ [ StartTimer (TimerId.Placement (PendingDeadline rid), pendingDeadlineMs) ])
         (state, [], [])
 
@@ -337,12 +366,30 @@ let reconcileWorkspace
                 | _ -> state, [], [] // 再計算してもダメなら諦める(既知のギャップ、Explain未実装)
 
 /// `TimerElapsed (Placement (PendingDeadline rid))`：§7.2「Timeout → Retry/Backoff、上限後は配置対象外」
-/// のうち、このラウンドでは単発の諦めだけを実装する（`Desired`も取り消すので、次にこの窓を含む
-/// Reconcileが走れば最初から再試行される——リトライ・バックオフそのものはファイル冒頭「対象外」参照）。
-let onPendingDeadlineTimerFired (now: int64) (rid: RequestId) (state: PlacementState) : PlacementState =
+/// （v2.28、Backoffは対象外のまま——`RetryAttempts`の型直前のコメント参照）。同じ`TargetRect`/`Epoch`へ
+/// 新しい`RequestId`で`SetRect`を即座に再発行し、新しい`PendingDeadline`を始動する。上限（既定3回）に
+/// 達したら単発の諦め（`Desired`も取り消すので、次にこの窓を含むReconcileが走れば最初から再試行される）。
+let onPendingDeadlineTimerFired (now: int64) (rid: RequestId) (state: PlacementState) : PlacementState * Effect list * TimerCommand<TimerId> list =
     match Map.tryFind rid state.Pending with
-    | Some pr when awaitDeadline (Some pr.Deadline) now -> { state with Pending = Map.remove rid state.Pending; Desired = Map.remove pr.Window state.Desired }
-    | _ -> state
+    | Some pr when awaitDeadline (Some pr.Deadline) now ->
+        let attemptsSoFar = Map.tryFind pr.Window state.RetryAttempts |> Option.defaultValue 0
+        if attemptsSoFar + 1 >= pendingRetryMaxAttempts then
+            { state with
+                Pending = Map.remove rid state.Pending
+                Desired = Map.remove pr.Window state.Desired
+                RetryAttempts = Map.remove pr.Window state.RetryAttempts },
+            [], []
+        else
+            let newRid = RequestId state.NextRequestId
+            let deadline = now + pendingDeadlineMs
+            let retried = { pr with IssuedAt = now; Deadline = deadline }
+            { state with
+                Pending = Map.add newRid retried (Map.remove rid state.Pending)
+                NextRequestId = state.NextRequestId + 1L
+                RetryAttempts = Map.add pr.Window (attemptsSoFar + 1) state.RetryAttempts },
+            [ SetRect (newRid, pr.Window, pr.TargetRect) ],
+            [ StartTimer (TimerId.Placement (PendingDeadline newRid), pendingDeadlineMs) ]
+    | _ -> state, [], []
 
 /// §7.2「GateRejected → Cancelled（Deadlineまで待たず同じstep内で即時に遷移する）」。
 /// `GatedEffect.gate`が返す拒否リストのうち、このstepでPlacementが発行したPendingに対応する
@@ -353,7 +400,10 @@ let onGateRejected (rejectedRequestIds: RequestId list) (state: PlacementState) 
         (fun (st: PlacementState, cmds) rid ->
             match Map.tryFind rid st.Pending with
             | Some pr ->
-                { st with Pending = Map.remove rid st.Pending; Desired = Map.remove pr.Window st.Desired },
+                { st with
+                    Pending = Map.remove rid st.Pending
+                    Desired = Map.remove pr.Window st.Desired
+                    RetryAttempts = Map.remove pr.Window st.RetryAttempts },
                 cmds @ [ CancelTimer (TimerId.Placement (PendingDeadline rid)) ]
             | None -> st, cmds)
         (state, [])
@@ -380,7 +430,11 @@ let onEffectCallReturned
         | None -> state, None // 古い結果、またはこのPendingはすでに別の経路で終端済み
         | Some pr ->
             let failure = classify record
-            let cancelled = { state with Pending = Map.remove rid state.Pending; Desired = Map.remove pr.Window state.Desired }
+            let cancelled =
+                { state with
+                    Pending = Map.remove rid state.Pending
+                    Desired = Map.remove pr.Window state.Desired
+                    RetryAttempts = Map.remove pr.Window state.RetryAttempts }
             let state' =
                 match failure with
                 | Denied OtherDenial ->
@@ -406,5 +460,6 @@ let onWindowVanished (w: WindowId) (state: PlacementState) : PlacementState * Ti
         IntegrityReprobes = Map.remove w state.IntegrityReprobes
         Desired = Map.remove w state.Desired
         Pending = pendingForWindow |> List.fold (fun p rid -> Map.remove rid p) state.Pending
-        Epochs = Map.remove w state.Epochs },
+        Epochs = Map.remove w state.Epochs
+        RetryAttempts = Map.remove w state.RetryAttempts },
     integrityCancel @ pendingCancel

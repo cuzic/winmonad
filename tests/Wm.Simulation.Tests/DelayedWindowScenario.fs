@@ -12,6 +12,7 @@ open Wm.Contracts.Beliefs
 open Wm.Contracts.SharedVocabulary
 open Wm.Contracts.CoreCommand
 open Wm.Core.Topology
+open Wm.Core.Placement
 open Wm.Core.WmState
 open Wm.Runtime.Reducer
 open Wm.Simulation.WindowBehaviors
@@ -85,7 +86,11 @@ let ``DelayedByMsの観測がPendingDeadlineより先に届けば、advanceClock
     | other -> Assert.True(false, sprintf "expected Movable/Confirmed after Satisfied, got %A" other)
 
 [<Fact>]
-let ``DelayedByMsの観測がPendingDeadlineより遅れると、AdvanceToNextTimerがTimeoutを先に発火してPendingを打ち切る`` () =
+let ``DelayedByMsの観測がPendingDeadlineより遅れ続けると、AdvanceToNextTimerが繰り返しTimeoutを発火し最終的にPendingを打ち切る`` () =
+    // v2.28でPendingDeadlineのRetryを実装したので、1回のTimeoutはもう諦めではなく再試行になった
+    // （Coreのタイマーキューの前進だけで、疑似OS側のScheduledとは無関係に、新しいPendingDeadlineが
+    // 繰り返し発火する——これもこのファイルが検証したい「2つの独立した時計」の一部）。
+    // pendingRetryMaxAttempts回続けて発火させると、最後は単発の諦めと同じ終端になる。
     let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
     settleTopology reducer [ mkMonitor 0 ]
     let w = WindowId 1L
@@ -97,10 +102,10 @@ let ``DelayedByMsの観測がPendingDeadlineより遅れると、AdvanceToNextTi
     let worldAfterSetRect = settle 1000L reducer world0 discovery.Effects
     Assert.Equal(1, Map.count reducer.State.Placement.Pending)
 
-    // Coreのタイマーキューを進める：疑似OS側のScheduledとは無関係に、PendingDeadlineが先に発火する。
-    match reducer.AdvanceToNextTimer () with
-    | Some _ -> ()
-    | None -> Assert.True(false, "expected PendingDeadline to be the next due timer")
+    for _ in 1 .. pendingRetryMaxAttempts do
+        match reducer.AdvanceToNextTimer () with
+        | Some _ -> ()
+        | None -> Assert.True(false, "expected a PendingDeadline to be the next due timer")
 
     Assert.Empty(reducer.State.Placement.Pending)
     Assert.Equal(None, Map.tryFind w reducer.State.Placement.Desired)

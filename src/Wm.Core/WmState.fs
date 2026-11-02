@@ -227,7 +227,8 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             let s, e, t = Placement.onIntegrityReprobeTimerFired now w stateAfterWindows.Placement
             s, e, t, None
         | TimerElapsed (TimerId.Placement (PendingDeadline rid)) ->
-            Placement.onPendingDeadlineTimerFired now rid stateAfterWindows.Placement, [], [], None
+            let s, e, t = Placement.onPendingDeadlineTimerFired now rid stateAfterWindows.Placement
+            s, e, t, None
         | EffectCallReturned (rid, result) ->
             let s, failureInfo = Placement.onEffectCallReturned now envelope.Sequence rid result stateAfterWindows.Placement
             s, [], [], failureInfo

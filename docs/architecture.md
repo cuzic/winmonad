@@ -1,5 +1,18 @@
 # Windows プログラマブル・ウィンドウマネージャー 統合設計書
 
+Version: 2.28（§7.2「Timeout → Retry/Backoff」のうちRetry部分を実装した。`onPendingDeadlineTimerFired`
+が、上限（既定3回、`pendingRetryMaxAttempts`）に達するまで、同じ`TargetRect`/`Epoch`へ新しい
+`RequestId`で`SetRect`を即座に再発行し新しい`PendingDeadline`を始動する。Backoff（試行間隔を指数的に
+空ける、`IntegrityReprobe`と同じ仕組み）は意図的に対象外のまま：`IntegrityReprobe`の間隔には「外部
+プロセスを急かさない」という明確な理由があったが、`SetRect`の再試行に同じ理由は無く、適切な遅延量を
+Phase 0の実測無しに決める根拠が無いため、即座に再試行し試行回数だけを数える単純な形にした。
+`PlacementState`に`RetryAttempts: Map<WindowId, int>`を追加し、Satisfied/GateRejected/`EffectCallReturned`
+の終端・窓の消滅・新しい意図（`Targetが変わったReconcile`）のいずれでも0へ戻す（古いTargetへの再試行
+回数を新しい意図へ引き継がない）。`onEffectCallReturned`側（`Transient`/`Unclassified`を含む）は
+依然単発の諦めのまま——`classify`の各分岐ごとにリトライの安全性を個別に検討する必要があるため
+（`Denied`系はおそらく再試行しても無駄、`TargetHung`はHealthの管轄）、Timeoutだけに絞った。
+`Wm.Simulation.Tests`の既存シナリオ（1回のTimeoutで即座に諦めることを前提にしていた）を、新しい
+Retry優先の挙動に合わせて更新した。
 Version: 2.27（§7.4のCoreCommand`MoveFocusedToWorkspace`を`WmState.step`へ配線した——xmonadの
 `delete`と同じ意味論で、フォーカス中の窓を別のWorkspaceへ送り、元のWorkspaceのzipperは送った窓を
 除いた隣の窓へ`RequestForeground`する。`WorkspaceSet.moveToWorkspace`が内部で呼ぶ`Zipper.remove`
@@ -70,7 +83,9 @@ Version: 2.23（v2.22で見つけ記録した既知のギャップ（`Denied Oth
 `checkNoMissingPlacement`が要求する「渡されたTiled×Aliveの集合は呼び出し先のWorkspaceに
 属する窓だけへ絞り込む」という既存の暗黙の前提を初めて踏んで修正した（v2.26）／§7.4の
 `MoveFocusedToWorkspace`を配線し、Focus/Workspaces発のEffectが安全にRequestIdを発行できる
-`Placement.allocateRequestId`という単一の共有採番元を新設した（v2.27）
+`Placement.allocateRequestId`という単一の共有採番元を新設した（v2.27）／§7.2の`Timeout → Retry`を
+実装し、`PendingDeadline`満了を上限回数まで同じTargetへの即座の再試行として扱うようにした
+（Backoffは実測値が無いため依然対象外）（v2.28）
 Version: 2.22（Wm.Simulationが`EffectCallReturned`を実際に返せるようになったので（v2.21）、
 `InputEvent.EffectCallReturned`をPlacement/Healthへ配線した。`Placement.onEffectCallReturned`は
 `Ok ()`では何もせず（§7.2「目標矩形を観測するまではSatisfiedにしない」）、`Error`は`classify`で
