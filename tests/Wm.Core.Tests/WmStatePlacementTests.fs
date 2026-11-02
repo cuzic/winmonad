@@ -95,7 +95,7 @@ let ``EffectCallReturnedのTargetHungは同じstepでHealth.Responsivenessも修
         |> Seq.map fst
         |> Seq.head
     let hungError: NativeCallRecord = { Api = "SendMessageTimeout"; Space = Win32LastError; Code = 1460; ElapsedUs = 0L }
-    let afterHung = step RuntimePolicy.defaults afterObserved.Next (mkEnvelope 2L (EffectCallReturned (rid, Error hungError)))
+    let afterHung = step RuntimePolicy.defaults afterObserved.Next (mkEnvelope 2L (EffectCallReturned (rid, Error hungError, None)))
     match Map.tryFind (WindowId 1L) afterHung.Next.Health.Responsiveness with
     | Some { Value = Hung; Confidence = Confirmed } -> ()
     | other -> Assert.True(false, sprintf "unexpected: %A" other)
@@ -115,7 +115,7 @@ let ``EffectCallReturnedのDenied OtherDenialは、同じstepでMovability修正
         |> Seq.map fst
         |> Seq.head
     let deniedError: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 5; ElapsedUs = 0L }
-    let afterDenied = step RuntimePolicy.defaults afterObserved.Next (mkEnvelope 2L (EffectCallReturned (rid, Error deniedError)))
+    let afterDenied = step RuntimePolicy.defaults afterObserved.Next (mkEnvelope 2L (EffectCallReturned (rid, Error deniedError, None)))
 
     // Movabilityの修正
     match Map.tryFind w afterDenied.Next.Placement.Movability with

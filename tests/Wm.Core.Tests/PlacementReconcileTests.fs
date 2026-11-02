@@ -436,13 +436,18 @@ let private pendingRidFor (state: PlacementState) (w: WindowId) : RequestId =
     state.Pending |> Map.toSeq |> Seq.filter (fun (_, pr) -> pr.Window = w) |> Seq.map fst |> Seq.head
 
 [<Fact>]
-let ``Ok()はPendingを変えない(Satisfiedにするのは観測の一致だけ)`` () =
+let ``Ok()はPendingをSatisfiedにしない(それは観測の一致だけ)が、DispatchSeqは記録する(v2.42)`` () =
     let w = WindowId 1L
     let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let state', _, _, failureInfo = onEffectCallReturned 20L 2L rid (Ok ()) afterReconcile
-    Assert.Equal<Map<RequestId, PendingRequest>>(afterReconcile.Pending, state'.Pending)
+    let state', _, _, failureInfo = onEffectCallReturned 20L 2L rid (Ok ()) (Some 42L) afterReconcile
     Assert.Equal(None, failureInfo)
+    match Map.tryFind rid state'.Pending with
+    | Some pr ->
+        Assert.Equal(Some 42L, pr.DispatchSeq)
+        // DispatchSeq以外は変わらない(Satisfiedにするのは観測の一致だけ、§7.2)。
+        Assert.Equal({ (Map.find rid afterReconcile.Pending) with DispatchSeq = Some 42L }, pr)
+    | None -> Assert.True(false, "expected the Pending to still exist")
 
 [<Fact>]
 let ``ERROR_INVALID_WINDOW_HANDLEはTargetGoneに分類され、PendingとDesiredを取り消す`` () =
@@ -450,7 +455,7 @@ let ``ERROR_INVALID_WINDOW_HANDLEはTargetGoneに分類され、PendingとDesire
     let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let error: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 1400; ElapsedUs = 0L }
-    let state', _, cmds, failureInfo = onEffectCallReturned 20L 2L rid (Error error) afterReconcile
+    let state', _, cmds, failureInfo = onEffectCallReturned 20L 2L rid (Error error) None afterReconcile
     // Retryしない分類でも、まだ生きているridのPendingDeadlineはCancelTimerする（v2.30で塞いだ既存の
     // 取りこぼし——以前はこの関数がTimerCommandを返せなかった）。
     Assert.Equal<TimerCommand<TimerId> list>([ CancelTimer (TimerId.Placement (PendingDeadline rid)) ], cmds)
@@ -464,7 +469,7 @@ let ``ERROR_ACCESS_DENIEDはDenied OtherDenialに分類され、MovabilityをNot
     let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let error: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 5; ElapsedUs = 0L }
-    let state', _, _, failureInfo = onEffectCallReturned 20L 2L rid (Error error) afterReconcile
+    let state', _, _, failureInfo = onEffectCallReturned 20L 2L rid (Error error) None afterReconcile
     Assert.Empty(state'.Pending)
     Assert.Equal(Some (w, Denied OtherDenial), failureInfo)
     match Map.tryFind w state'.Movability with
@@ -477,7 +482,7 @@ let ``TargetHungと分類された場合、Movabilityは変えない(HealthのRe
     let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let error: NativeCallRecord = { Api = "SendMessageTimeout"; Space = Win32LastError; Code = 1460; ElapsedUs = 0L }
-    let state', _, _, failureInfo = onEffectCallReturned 20L 2L rid (Error error) afterReconcile
+    let state', _, _, failureInfo = onEffectCallReturned 20L 2L rid (Error error) None afterReconcile
     Assert.Empty(state'.Pending)
     Assert.Equal(Some (w, TargetHung), failureInfo)
     Assert.Equal(None, Map.tryFind w state'.Movability) // Movabilityはこの関数の対象外
@@ -485,7 +490,7 @@ let ``TargetHungと分類された場合、Movabilityは変えない(HealthのRe
 [<Fact>]
 let ``対応するPendingが無いRequestId(古い結果)は無害に無視する`` () =
     let error: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 1400; ElapsedUs = 0L }
-    let state', _, _, failureInfo = onEffectCallReturned 20L 2L (RequestId 999L) (Error error) initial
+    let state', _, _, failureInfo = onEffectCallReturned 20L 2L (RequestId 999L) (Error error) None initial
     Assert.Equal(initial, state')
     Assert.Equal(None, failureInfo)
 
@@ -495,7 +500,7 @@ let ``Transient(ハング判定前のERROR_TIMEOUT)は即座に再試行し、De
     let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid0 = pendingRidFor afterReconcile w
     let error: NativeCallRecord = { Api = "SendMessageTimeout"; Space = Win32LastError; Code = 1460; ElapsedUs = 500L } // >0なのでTransient
-    let afterRetry, effects, cmds, failureInfo = onEffectCallReturned 20L 2L rid0 (Error error) afterReconcile
+    let afterRetry, effects, cmds, failureInfo = onEffectCallReturned 20L 2L rid0 (Error error) None afterReconcile
     Assert.Equal(Some (w, Transient), failureInfo)
     Assert.Equal(1, Map.count afterRetry.Pending)
     let rid1 = pendingRidFor afterRetry w
@@ -514,10 +519,107 @@ let ``Transientが上限回数続くと、最終的にPendingとDesiredを取り
     let error: NativeCallRecord = { Api = "SendMessageTimeout"; Space = Win32LastError; Code = 1460; ElapsedUs = 500L }
     let rec driveToGiveUp (attemptsLeft: int) (state: PlacementState) : PlacementState * TimerCommand<TimerId> list =
         let rid = pendingRidFor state w
-        let state', _, cmds, _ = onEffectCallReturned 20L 2L rid (Error error) state
+        let state', _, cmds, _ = onEffectCallReturned 20L 2L rid (Error error) None state
         if attemptsLeft <= 1 then state', cmds else driveToGiveUp (attemptsLeft - 1) state'
     let final, lastCmds = driveToGiveUp pendingRetryMaxAttempts afterReconcile
     Assert.Empty(final.Pending)
     Assert.Equal(None, Map.tryFind w final.Desired)
     Assert.Equal(None, Map.tryFind w final.RetryAttempts)
     Assert.NotEmpty(lastCmds) // 最後の諦めでも、まだ生きている古いPendingDeadlineはCancelTimerする
+
+// ===== Mismatch → Reevaluate（§7.2、v2.42。Opus敵対的レビューで設計、Reevaluate=「アプリと戦わない」
+// はオーナー確認済み） =====
+
+[<Fact>]
+let ``本当に異なる矩形が発行後に観測されたら、PendingDeadline時にMismatchとして終端し、Retryせず、Desiredは残す(v2.42)`` () =
+    let w = WindowId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let mismatchedRect = { workArea with X = workArea.X + 50 }
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w mismatchedRect 10L) afterDispatched
+    let afterDeadline, effects, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid afterObserved
+    Assert.Empty(afterDeadline.Pending)
+    Assert.Empty(effects) // Retryしない(同じTargetへSetRectを再発行しない)
+    Assert.Equal(Some (Shown (Some workArea)), Map.tryFind w afterDeadline.Desired) // Desiredは目標のまま残す
+    Assert.Equal(None, Map.tryFind w afterDeadline.RetryAttempts)
+
+[<Fact>]
+let ``DispatchSeqが未確認(EffectCallReturned Okがまだ届いていない)間は、異なる矩形を観測してもMismatchと判定せずTimeout/Retryのまま(v2.42)`` () =
+    let w = WindowId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let differentRect = { workArea with X = workArea.X + 50 }
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w differentRect 10L) afterReconcile
+    let afterDeadline, effects, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid afterObserved
+    Assert.Equal(1, Map.count afterDeadline.Pending)
+    Assert.NotEmpty(effects)
+
+[<Fact>]
+let ``DispatchSeqより古い(発行前に取得された)観測はMismatch判定に使わない、Timeout/Retryのまま(v2.42)`` () =
+    let w = WindowId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 10L) afterReconcile
+    let staleRect = { workArea with X = workArea.X + 999 }
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w staleRect 5L) afterDispatched // 5 < DispatchSeq(10)
+    let afterDeadline, effects, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid afterObserved
+    Assert.Equal(1, Map.count afterDeadline.Pending)
+    Assert.NotEmpty(effects)
+
+[<Fact>]
+let ``発行後も観測がBaselineのまま変わらなければMismatchにしない(要求への無反応はTimeout/Retryのまま、オーナー確認済み)(v2.42)`` () =
+    let w = WindowId 1L
+    let baselineRect = { X = 10; Y = 10; Width = 300; Height = 200 }
+    let afterDiscovered, _, _ = onWindowObserved 1L (observedSnapshot w baselineRect 0L) initial
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterDiscovered
+    let rid = pendingRidFor afterReconcile w
+    match Map.tryFind rid afterReconcile.Pending with
+    | Some pr -> Assert.Equal(Some baselineRect, pr.Baseline)
+    | None -> Assert.True(false, "expected a pending")
+    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w baselineRect 10L) afterDispatched // 発行後だが変化無し
+    let afterDeadline, effects, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid afterObserved
+    Assert.Equal(1, Map.count afterDeadline.Pending)
+    Assert.NotEmpty(effects)
+
+[<Fact>]
+let ``supersedeされた旧Epochの目標が遅れて観測されても、新しいPendingのMismatchとして扱わない(v2.42)`` () =
+    let w = WindowId 1L
+    let afterReconcile1, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid0 = pendingRidFor afterReconcile1 w
+    let oldTarget = workArea
+    let afterDispatched0, _, _, _ = onEffectCallReturned 11L 2L rid0 (Ok ()) (Some 5L) afterReconcile1
+    let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
+    let afterReconcile2, _, _ = reconcileWorkspace 15L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterDispatched0
+    let rid1 = pendingRidFor afterReconcile2 w
+    Assert.NotEqual(rid0, rid1)
+    match Map.tryFind w afterReconcile2.InFlightTargets with
+    | Some targets -> Assert.Contains((IntentEpoch 0L, oldTarget), targets)
+    | None -> Assert.True(false, "expected the superseded target to be tracked as in-flight")
+    let afterDispatched1, _, _, _ = onEffectCallReturned 16L 2L rid1 (Ok ()) (Some 20L) afterReconcile2
+    // 旧rid0のSetRectが遅れて適用され、旧Targetがそのまま観測される(新rid1のDispatchSeq(20)より新しい)。
+    let afterObserved, _, _ = onWindowObserved 30L (observedSnapshot w oldTarget 25L) afterDispatched1
+    let afterDeadline, effects, _ = onPendingDeadlineTimerFired (15L + pendingDeadlineMs) rid1 afterObserved
+    Assert.Equal(1, Map.count afterDeadline.Pending) // Mismatchではない(旧Epochの目標として除外)、Timeout/Retryのまま
+    Assert.NotEmpty(effects)
+
+[<Fact>]
+let ``onTopologySettledはInFlightTargetsも消す(v2.42)`` () =
+    let w = WindowId 1L
+    let afterReconcile1, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
+    let afterReconcile2, _, _ = reconcileWorkspace 15L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterReconcile1
+    Assert.NotEmpty(Map.tryFind w afterReconcile2.InFlightTargets |> Option.defaultValue [])
+    let afterSettled, _ = onTopologySettled afterReconcile2
+    Assert.Equal(None, Map.tryFind w afterSettled.InFlightTargets)
+
+[<Fact>]
+let ``onWindowVanishedはInFlightTargetsも消す(v2.42)`` () =
+    let w = WindowId 1L
+    let afterReconcile1, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
+    let afterReconcile2, _, _ = reconcileWorkspace 15L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterReconcile1
+    Assert.NotEmpty(Map.tryFind w afterReconcile2.InFlightTargets |> Option.defaultValue [])
+    let afterVanished, _ = onWindowVanished w afterReconcile2
+    Assert.Equal(None, Map.tryFind w afterVanished.InFlightTargets)

@@ -21,7 +21,8 @@ let maxSettleSteps = 100
 let private applyOneAndCollect (now: int64) (reducer: Reducer) (world: VirtualWorld) (effect: GatedEffect) : VirtualWorld * GatedEffect list =
     let world', events, callReturns = applyEffect now world effect
     let fromEvents = events |> List.map (fun ev -> (reducer.Submit now "virtual-world" ev).Effects)
-    let fromCallReturns = callReturns |> List.map (fun (rid, result) -> (reducer.Submit now "virtual-world" (EffectCallReturned (rid, result))).Effects)
+    let fromCallReturns =
+        callReturns |> List.map (fun (rid, result, dispatchSeq) -> (reducer.Submit now "virtual-world" (EffectCallReturned (rid, result, dispatchSeq))).Effects)
     world', (fromEvents @ fromCallReturns) |> List.collect id
 
 /// 外部入力が尽きるまで、Effect→観測の折り返しを繰り返す（固定点に収束するか`maxSettleSteps`に達するまで）。

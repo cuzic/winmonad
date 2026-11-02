@@ -42,7 +42,12 @@ type InputEvent =
     | WindowRemoved of WindowId
     | ForegroundObserved of Observation<WindowId option>
     | UserCommand of CoreCommand
-    | EffectCallReturned of RequestId * Result<unit, NativeCallRecord>
+    /// `dispatchSeq`（v2.42追加）：Shell（またはSimulationの`VirtualWorld`）がこのEffectを実際に
+    /// 呼び出した時点で、観測と同じ単調カウンタから採番する値（`Ok`のときだけ`Some`）。Placementの
+    /// `Mismatch → Reevaluate`（§7.2）が「この観測は要求の発行後に取得されたか」を判定するために使う
+    /// （`EventEnvelope.MonotonicTime`とは番号空間が別なので比較の根拠にならない、Placement.fsの
+    /// コメント参照）。
+    | EffectCallReturned of RequestId * Result<unit, NativeCallRecord> * dispatchSeq: int64 option
     | EffectBatchReturned of BatchId * (RequestId * Result<unit, NativeCallRecord>) list
     | InternalFault of componentName: string
     | JournalDegraded of since: int64

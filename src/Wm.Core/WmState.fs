@@ -240,8 +240,8 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         | TimerElapsed (TimerId.Placement (PresenceDeadline rid)) ->
             let s, t = Placement.onPresenceDeadlineTimerFired now rid stateAfterWindows.Placement
             s, [], t, None
-        | EffectCallReturned (rid, result) ->
-            let s, e, t, failureInfo = Placement.onEffectCallReturned now envelope.Sequence rid result stateAfterWindows.Placement
+        | EffectCallReturned (rid, result, dispatchSeq) ->
+            let s, e, t, failureInfo = Placement.onEffectCallReturned now envelope.Sequence rid result dispatchSeq stateAfterWindows.Placement
             s, e, t, failureInfo
         | _ -> stateAfterWindows.Placement, [], [], None
 

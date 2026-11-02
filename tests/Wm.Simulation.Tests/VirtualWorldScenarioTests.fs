@@ -76,9 +76,10 @@ let ``VirtualWorldに存在しない窓へのSetRectはERROR_INVALID_WINDOW_HAND
         let _, events, callReturns = applyEffect 1000L empty gated
         Assert.Empty(events)
         match callReturns with
-        | [ (rid, Error record) ] ->
+        | [ (_, Error record, dispatchSeq) ] ->
             Assert.Equal(1400, record.Code)
             Assert.Equal(Wm.Contracts.ErrorTypes.Win32LastError, record.Space)
+            Assert.Equal(None, dispatchSeq) // 対象窓が存在しない：発行自体が届いていない
         | other -> Assert.True(false, sprintf "unexpected callReturns: %A" other)
     | other -> Assert.True(false, sprintf "expected exactly 1 SetRect effect from Reconcile, got %A" other)
 

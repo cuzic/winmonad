@@ -64,19 +64,29 @@ let private emptySnapshot (w: WindowId) : WindowSnapshot =
       TitleMatches = None }
 
 /// §12.1「`applyEffect`」。`GatedEffect`を適用し、新しい`VirtualWorld`と、生じた観測（`InputEvent`、
-/// ファイル冒頭コメント参照）、Effect適用スレッドの戻り値（`EffectCallReturned`の元）を返す。
-let applyEffect (now: int64) (world: VirtualWorld) (gated: GatedEffect) : VirtualWorld * InputEvent list * (RequestId * Result<unit, NativeCallRecord>) list =
+/// ファイル冒頭コメント参照）、Effect適用スレッドの戻り値（`EffectCallReturned`の元。`Ok`の場合は
+/// 発行時点のSampleSequence＝`DispatchSeq`も載せる、v2.42。`Placement.fs`の`Mismatch → Reevaluate`
+/// コメント参照）を返す。`DispatchSeq`は観測と同じ`NextSampleSequence`カウンタから採番する
+/// （Core.Placementの契約「観測スレッドとEffect適用スレッドが同一の単調カウンタを共有する」を、
+/// ここでは1つのカウンタで素直に満たす）。
+let applyEffect
+    (now: int64)
+    (world: VirtualWorld)
+    (gated: GatedEffect)
+    : VirtualWorld * InputEvent list * (RequestId * Result<unit, NativeCallRecord> * int64 option) list =
     match GatedEffect.effect gated with
     | SetRect (rid, w, rect) ->
         match Map.tryFind w world.Windows with
         | None ->
             // 対象窓が疑似OS側に存在しない（消滅後の遅延Effect等）。ERROR_INVALID_WINDOW_HANDLEとして返す
-            // （8.1のclassify対応表と同じコード、§7.1「TargetGone」）。
-            world, [], [ rid, Error { Api = "SetWindowPos"; Space = Win32LastError; Code = 1400; ElapsedUs = 0L } ]
+            // （8.1のclassify対応表と同じコード、§7.1「TargetGone」）。dispatchSeqは無し（発行自体が
+            // 対象に届いていないので観測との照合対象にならない）。
+            world, [], [ rid, Error { Api = "SetWindowPos"; Space = Win32LastError; Code = 1400; ElapsedUs = 0L }, None ]
         | Some vw ->
             match vw.Behavior with
             | Immediate ->
-                let sampleSeq = world.NextSampleSequence
+                let dispatchSeq = world.NextSampleSequence
+                let sampleSeq = dispatchSeq + 1L
                 let world' =
                     { world with
                         Windows = Map.add w { vw with Rect = rect } world.Windows
@@ -85,15 +95,17 @@ let applyEffect (now: int64) (world: VirtualWorld) (gated: GatedEffect) : Virtua
                     WindowObserved
                         { emptySnapshot w with
                             VisibleFrameRect = Some { Value = Ok rect; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" } }
-                world', [ observed ], [ rid, Ok () ]
+                world', [ observed ], [ rid, Ok (), Some dispatchSeq ]
             | DelayedByMs delayMs ->
                 // 呼び出し自体は即座に成功する（SetWindowPosはOSに受理された時点で返る）。要求どおりの
                 // 矩形の観測だけが`FireAtMs`まで遅れる（`advanceClock`参照）。
+                let dispatchSeq = world.NextSampleSequence
                 let world' =
                     { world with
                         Windows = Map.add w { vw with Rect = rect } world.Windows
+                        NextSampleSequence = dispatchSeq + 1L
                         Scheduled = { FireAtMs = now + delayMs; Window = w; Rect = rect } :: world.Scheduled }
-                world', [], [ rid, Ok () ]
+                world', [], [ rid, Ok (), Some dispatchSeq ]
     | _ -> world, [], [] // このラウンドで対象外のEffect種別（ファイル冒頭参照）
 
 /// 疑似OSの仮想時計を`toMs`まで進め、`FireAtMs <= toMs`の予定観測を発火時刻の昇順で発火させる

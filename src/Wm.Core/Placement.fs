@@ -93,12 +93,16 @@
 ///   `SetPresence`呼出の`EffectCallReturned`（`Error`の場合）は依然`onEffectCallReturned`の対象外
 ///   （`PendingPresence`のRequestIdには対応するGeometryのPendingが無いため「対応するPendingが
 ///   無い＝無害に無視」されるだけで、失敗を検知しない——専用のラウンドへ切り出す、既知のギャップ）。
-/// - **`Mismatch` → `Reevaluate`**：観測が`TargetRect`と一致しない場合、`checkPendingSatisfied`は
-///   何もしない（Pendingはそのまま残り、`PendingDeadline`満了か次のReconcileに委ねる）。即座に
-///   `Desired`を取り消して再試行させる実装も検討したが、`SetRect`完了前に届く無関係な観測
-///   （他の属性変化による全体Snapshot等）が、まだ反映されていない古い矩形を運んで「不一致」と
-///   誤判定し、実際には進行中のPendingを早まって取り消してしまう危険がある（`IntentEpoch`照合や
-///   観測の鮮度判定が無いこのラウンドでは安全に区別できない）。安全側に倒して対象外のままにする。
+/// - ~~**`Mismatch` → `Reevaluate`**~~：v2.42でOpus敵対的レビューの設計（段階1、プロジェクトオーナー
+///   確認済み）どおりに実装。`isMismatch`/`onPendingDeadlineTimerFired`、`PendingRequest.DispatchSeq`/
+///   `Baseline`、`PlacementState.InFlightTargets`の各型直前のコメント参照。`PendingDeadline`満了時点
+///   でだけ判定するため、進行中のPendingを早まって取り消す経路は構造的に無い（v2.24〜の懸念はこれで
+///   コードの論理として塞がる）。早期（`checkPendingSatisfied`内での即時）判定は段階2として対象外の
+///   ままにする——DPIの2段リサイズ等の多段変化が実機でどの程度の間隔で起きるかの実測（CIスパイクS5/
+///   S11参照）が無いと、中間状態を偽陽性のMismatchと誤判定する危険が残るため（Opus敵対的レビュー
+///   `/tmp/.../opus-review-mismatch-reevaluate.md`、段階2の節参照）。「ユーザーのドラッグ」「最小化・
+///   非表示中の除外」（同レビューの条件5・6）も、下記`MinWidth`/`DpiBehavior`のAccumulatingが実際に
+///   このMismatch証拠を消費するようになってから、消費側と合わせて設計する専用のラウンドへ持ち越す。
 /// - **ユーザー操作による1回だけの試し直し**：ユーザーコマンド経由でPlacementへの新しい入口が要る
 ///   ——専用のラウンドへ切り出す。
 /// - **`MinWidth`/`DpiBehavior`（Accumulating規則）**：証拠（`SetRect`の`Mismatch`、DPI切替後の
@@ -158,7 +162,18 @@ type DesiredPresence =
 /// `Status`（Idle/Planned/Dispatched/AwaitingObservation/…）も実装しない：このラウンドでは
 /// 「Pendingマップに存在する＝AwaitingObservation、存在しない＝終端状態」という、HealthのReprobes/
 /// WindowsのAwaitingEvidenceと同じ「存在で状態を表す」規約で足りる。
-type PendingRequest = { Window: WindowId; Epoch: IntentEpoch; TargetRect: PixelRect; IssuedAt: int64; Deadline: int64 }
+/// `DispatchSeq`/`Baseline`（v2.42追加、`Mismatch → Reevaluate`。ファイル冒頭コメント参照）：
+/// `DispatchSeq`は`EffectCallReturned (rid, Ok (), dispatchSeq)`で受け取った、発行が実際に受け付けられた
+/// 時点のSampleSequence（まだ届いていなければ`None`）。`Baseline`は発行時点の`VisibleFrameRect`信念の
+/// 値（無ければ`None`）——Mismatch判定の「何も変わっていない」除外に使う。
+type PendingRequest =
+    { Window: WindowId
+      Epoch: IntentEpoch
+      TargetRect: PixelRect
+      IssuedAt: int64
+      Deadline: int64
+      DispatchSeq: int64 option
+      Baseline: PixelRect option }
 
 /// `PendingRequest`と同じ考え方（§7.2「待ちをデータで表す」）を`SetPresence`へ適用した最小形
 /// （v2.41新設、ファイル冒頭「`SetPresence`の観測による確認」参照）。`Epoch`/`Retry`は持たない——
@@ -198,7 +213,14 @@ type PlacementState =
       /// 指数的に空ける`IntegrityReprobe`と同じ仕組み）は対象外のまま（下記）：`SetRect`の再試行には
       /// `IntegrityReprobe`のような「外部プロセスを急かさないための間隔」という理由が無く、適切な遅延量を
       /// Phase 0の実測無しに決める根拠が無いため、即座に再試行し試行回数だけを数える単純な形にする。
-      RetryAttempts: Map<WindowId, int> }
+      RetryAttempts: Map<WindowId, int>
+      /// `Mismatch → Reevaluate`（v2.42、ファイル冒頭コメント参照）：窓ごとに、`supersede`された
+      /// （まだ応答が来るかもしれない）旧Epochの目標矩形を短期保持する。`IntentEpoch`は観測に載らない
+      /// ため（Win32に要求↔応答の対応付けプリミティブが無い、§9章）、Epochの使い道はここだけ——
+      /// 旧Epochの`SetRect`が遅れて適用された結果の観測を、新Epochの不一致と取り違えないための除外に
+      /// 使う。`dispatchPlacements`が新しいPendingで古いPendingを失効させる際にここへ移し、該当の
+      /// 矩形が観測された時・窓の消滅・`TopologySettled`で消す。
+      InFlightTargets: Map<WindowId, (IntentEpoch * PixelRect) list> }
 
 let initial: PlacementState =
     { Geometry = Map.empty
@@ -210,7 +232,8 @@ let initial: PlacementState =
       PendingPresence = Map.empty
       NextRequestId = 0L
       Epochs = Map.empty
-      RetryAttempts = Map.empty }
+      RetryAttempts = Map.empty
+      InFlightTargets = Map.empty }
 
 /// `WmState.step`が、Placement自身のReconcile以外の理由（Focus.SwitchSettleの再要求、
 /// `MoveFocusedToWorkspace`のRequestForeground等、v2.27）で新しいRequestIdが要るときに呼ぶ最小の窓口。
@@ -382,26 +405,35 @@ let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: P
             if not desiredChanged then
                 st, effects, cmds
             else
-                let supersededCmds =
-                    st.Pending
-                    |> Map.toSeq
-                    |> Seq.filter (fun (_, pr) -> pr.Window = p.Window)
-                    |> Seq.map (fun (rid, _) -> CancelTimer (TimerId.Placement (PendingDeadline rid)))
-                    |> List.ofSeq
+                let superseded = st.Pending |> Map.toSeq |> Seq.filter (fun (_, pr) -> pr.Window = p.Window) |> List.ofSeq
+                let supersededCmds = superseded |> List.map (fun (rid, _) -> CancelTimer (TimerId.Placement (PendingDeadline rid)))
                 let pendingWithoutOld = st.Pending |> Map.filter (fun _ pr -> pr.Window <> p.Window)
+                // `Mismatch → Reevaluate`（v2.42）：失効させる旧Pendingの(Epoch, TargetRect)を
+                // `InFlightTargets`へ移す——まだ遅れて適用されるかもしれない旧要求の結果を、新しい
+                // Pendingの不一致と取り違えないため（型直前のコメント参照）。
+                let inFlightTargets' =
+                    let old = Map.tryFind p.Window st.InFlightTargets |> Option.defaultValue []
+                    let moved = superseded |> List.map (fun (_, pr) -> pr.Epoch, pr.TargetRect)
+                    Map.add p.Window (old @ moved) st.InFlightTargets
                 let epoch' =
                     match Map.tryFind p.Window st.Epochs with
                     | Some (IntentEpoch e) -> IntentEpoch (e + 1L)
                     | None -> IntentEpoch 0L
                 let rid = RequestId st.NextRequestId
                 let deadline = now + pendingDeadlineMs
-                let pendingRequest = { Window = p.Window; Epoch = epoch'; TargetRect = p.Target; IssuedAt = now; Deadline = deadline }
+                // `Baseline`（v2.42）：発行時点の`VisibleFrameRect`信念。Mismatch判定の「何も変わって
+                // いない」除外に使う（型直前のコメント参照）。`DispatchSeq`は`EffectCallReturned`が
+                // 届くまで`None`。
+                let baseline = Map.tryFind p.Window st.Geometry |> Option.bind (fun g -> LatestWins.value g.VisibleFrameRect)
+                let pendingRequest =
+                    { Window = p.Window; Epoch = epoch'; TargetRect = p.Target; IssuedAt = now; Deadline = deadline; DispatchSeq = None; Baseline = baseline }
                 let st' =
                     { st with
                         Desired = Map.add p.Window (Shown (Some p.Target)) st.Desired
                         Pending = Map.add rid pendingRequest pendingWithoutOld
                         NextRequestId = st.NextRequestId + 1L
                         Epochs = Map.add p.Window epoch' st.Epochs
+                        InFlightTargets = inFlightTargets'
                         // 新しい意図（Reconcileが計算した新しいTarget）なので、古いTargetへのRetryの
                         // 試行回数は引き継がない（`RetryAttempts`はPendingDeadlineの再試行専用、型直前の
                         // コメント参照）。
@@ -465,7 +497,10 @@ let private retryOrGiveUp (now: int64) (rid: RequestId) (pr: PendingRequest) (st
     else
         let newRid = RequestId state.NextRequestId
         let deadline = now + pendingDeadlineMs
-        let retried = { pr with IssuedAt = now; Deadline = deadline }
+        // `DispatchSeq`は新しい`rid`専用の確認待ちなのでリセットする（v2.42）——古い`rid`の
+        // `DispatchSeq`をそのまま引き継ぐと、まだ届いていない新しい`EffectCallReturned`より前の
+        // 観測をMismatch判定に使ってしまう。`Baseline`（同じ目標への再試行なので）はそのまま引き継ぐ。
+        let retried = { pr with IssuedAt = now; Deadline = deadline; DispatchSeq = None }
         { state with
             Pending = Map.add newRid retried (Map.remove rid state.Pending)
             NextRequestId = state.NextRequestId + 1L
@@ -473,11 +508,52 @@ let private retryOrGiveUp (now: int64) (rid: RequestId) (pr: PendingRequest) (st
         [ SetRect (newRid, pr.Window, pr.TargetRect) ],
         [ StartTimer (TimerId.Placement (PendingDeadline newRid), pendingDeadlineMs) ]
 
+/// `Mismatch → Reevaluate`（§7.2、v2.42。Opus敵対的レビューで設計、ファイル冒頭コメント参照）：
+/// `PendingDeadline`満了時点で、発行後に取得された新鮮な観測が、発行前の状態（`Baseline`）とも、
+/// まだ応答が来るかもしれない旧Epochの目標（`InFlightTargets`）とも異なるなら、要求は実際にOSへ
+/// 届いたが別の矩形へ適用された（アプリの自己再配置・最小幅等での丸め）とみなしてMismatchとする。
+/// 条件（全てAND）：
+/// 1. `DispatchSeq`が既に分かっている（`EffectCallReturned Ok`が届いている）
+/// 2. 観測の`ValueSeq`が`DispatchSeq`より新しい（発行前に取得された観測で判定しない）
+/// 3. 観測が`TargetRect`と異なる
+/// 4. 観測が`Baseline`と異なる（「何も変わっていない」＝要求が無反応の可能性を、不一致と呼ばない）
+/// 5. 観測が`InFlightTargets`のどの旧目標とも異なる（旧Epochの遅延適用を新Epochの不一致と取り違えない）
+/// 「ユーザーのドラッグ」「最小化・非表示中」の除外（Opusレビューの条件5・6）は、MinWidth Accumulating
+/// （§4.5、未実装）が実際にこのMismatch証拠を消費するようになってから、その消費側と合わせて設計する
+/// 専用のラウンドへ持ち越す——今は証拠として使う消費者が無いので、取り違えても実害はまだ無い。
+let private isMismatch (pr: PendingRequest) (state: PlacementState) : bool =
+    match pr.DispatchSeq with
+    | None -> false
+    | Some dispatchSeq ->
+        match Map.tryFind pr.Window state.Geometry with
+        | None -> false
+        | Some g ->
+            match LatestWins.value g.VisibleFrameRect, g.VisibleFrameRect.ValueSeq with
+            | Some observed, Some valueSeq when valueSeq > dispatchSeq ->
+                let matchesBaseline = Some observed = pr.Baseline
+                let matchesInFlight =
+                    Map.tryFind pr.Window state.InFlightTargets |> Option.defaultValue [] |> List.exists (fun (_, r) -> r = observed)
+                observed <> pr.TargetRect && not matchesBaseline && not matchesInFlight
+            | _ -> false
+
 /// `TimerElapsed (Placement (PendingDeadline rid))`：§7.2「Timeout → Retry/Backoff、上限後は配置対象外」
-/// （v2.28）。`retryOrGiveUp`参照。
+/// （v2.28）に加え、v2.42で`isMismatch`を満たす場合の`Mismatch → Reevaluate`を分岐させる。
+/// Reevaluate＝「アプリと戦わない」（オーナー確認済み）：Pendingを終端し`Desired`は目標のまま残す
+/// （`dispatchPlacements`の`desiredChanged`判定が同じ目標の再発行を止める、v2.41のPendingPresence版
+/// Reevaluateと同じ考え方）、Retryしない。`RetryAttempts`は次に本当に新しい意図が来たときのために
+/// クリアする。`retryOrGiveUp`とは違いDesiredを取り消さない点が非対称だが、理由が異なる——Timeoutの
+/// 諦めは「無反応で判断材料が無い」、Mismatchは「要求は届いたが決定的に拒否された」なので、後者で
+/// 同じTargetを諦めても`Desired`自体は変える理由が無い（Layoutの入力が変われば自然に新しい意図になる）。
 let onPendingDeadlineTimerFired (now: int64) (rid: RequestId) (state: PlacementState) : PlacementState * Effect list * TimerCommand<TimerId> list =
     match Map.tryFind rid state.Pending with
-    | Some pr when awaitDeadline (Some pr.Deadline) now -> retryOrGiveUp now rid pr state
+    | Some pr when awaitDeadline (Some pr.Deadline) now ->
+        if isMismatch pr state then
+            { state with
+                Pending = Map.remove rid state.Pending
+                RetryAttempts = Map.remove pr.Window state.RetryAttempts },
+            [], []
+        else
+            retryOrGiveUp now rid pr state
     | _ -> state, [], []
 
 /// §7.2「GateRejected → Cancelled（Deadlineまで待たず同じstep内で即時に遷移する）」。
@@ -519,10 +595,18 @@ let onEffectCallReturned
     (evidenceSequence: int64)
     (rid: RequestId)
     (result: Result<unit, NativeCallRecord>)
+    (dispatchSeq: int64 option)
     (state: PlacementState)
     : PlacementState * Effect list * TimerCommand<TimerId> list * (WindowId * EffectFailure) option =
     match result with
-    | Ok () -> state, [], [], None
+    | Ok () ->
+        // `Mismatch → Reevaluate`（v2.42）：発行が実際に受け付けられた時点のSampleSequenceを記録する
+        // （`isMismatch`の条件1・2）。「受付が成功した」こと自体はSatisfiedにしない、という既存の規約
+        // は変えない（§7.2「SetRectのネイティブAPI呼出が成功しても、目標矩形を観測するまではSatisfied
+        // にしない」）。
+        match Map.tryFind rid state.Pending with
+        | Some pr -> { state with Pending = Map.add rid { pr with DispatchSeq = dispatchSeq } state.Pending }, [], [], None
+        | None -> state, [], [], None
     | Error record ->
         match Map.tryFind rid state.Pending with
         | None -> state, [], [], None // 古い結果、またはこのPendingはすでに別の経路で終端済み
@@ -564,7 +648,9 @@ let onTopologySettled (state: PlacementState) : PlacementState * TimerCommand<Ti
     let affectedWindows = state.Pending |> Map.toSeq |> Seq.map (fun (_, pr) -> pr.Window) |> Set.ofSeq
     { state with
         Pending = Map.empty
-        RetryAttempts = affectedWindows |> Set.fold (fun m w -> Map.remove w m) state.RetryAttempts },
+        RetryAttempts = affectedWindows |> Set.fold (fun m w -> Map.remove w m) state.RetryAttempts
+        // Pendingを全て取り消すので、旧Epochの目標を覚えておく理由も消える（v2.42）。
+        InFlightTargets = affectedWindows |> Set.fold (fun m w -> Map.remove w m) state.InFlightTargets },
     cancelCmds
 
 /// 窓`w`を指す既存の`PendingPresence`があれば取り除き`CancelTimer`する（§7.2「同じ窓へ新しい意図が
@@ -645,5 +731,6 @@ let onWindowVanished (w: WindowId) (state: PlacementState) : PlacementState * Ti
         Pending = pendingForWindow |> List.fold (fun p rid -> Map.remove rid p) state.Pending
         PendingPresence = pendingPresenceForWindow |> List.fold (fun p rid -> Map.remove rid p) state.PendingPresence
         Epochs = Map.remove w state.Epochs
-        RetryAttempts = Map.remove w state.RetryAttempts },
+        RetryAttempts = Map.remove w state.RetryAttempts
+        InFlightTargets = Map.remove w state.InFlightTargets },
     integrityCancel @ pendingCancel @ pendingPresenceCancel
