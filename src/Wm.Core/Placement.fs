@@ -86,6 +86,10 @@
 /// `MinWidth`信念をDIP正規化して蓄積する。`MinWidth`を実際にPolicy/Layoutが読むところ（消費側）は
 /// まだ無い——このラウンドは信念を蓄積するところまで。
 ///
+/// `DpiBehavior`の発見時既定値（v2.44追加）：`DpiAwareness`の申告（`PerMonitorV2`→`RescalesItself`、
+/// それ以外→`OsBitmapScaled`）を`Inferred`の初期値とする（`Movability`の発見時既定値と同じパターン）。
+/// 異なるDPIのモニター間移動後の2段目自己リサイズの有無による修正はまだ無い（下記「対象外」参照）。
+///
 
 /// このラウンドで意図的に対象外にしたこと（いずれも「できればやる」ではなく、別の未実装の仕組みが
 /// 前提になっているため実装できない項目であり、専用のラウンドへ切り出す）：
@@ -119,8 +123,13 @@
 ///   （`MinWidthAtLeast`、§5.4）やLayoutの`LayoutWindow.MinWidthDip`へまだ結線していない——
 ///   値を蓄積するところまでがこのラウンドの範囲で、実際に配置・分類へ反映する消費側は専用のラウンドへ
 ///   持ち越す（信念が無いと配置を変えようにも読む側が無いため、まずここから）。
-/// - **`DpiBehavior`（Accumulating規則）**：証拠（DPI切替後の2段目観測）は収集できるようになったが、
-///   信念として蓄積する修正関数はまだ書いていない。
+/// - ~~**`DpiBehavior`（Accumulating規則）**~~：v2.44で発見時の申告による初期値だけ実装
+///   （`reviseDpiBehaviorDeclaration`、型直前のコメント参照）。異なるDPIのモニター間を移動した後の
+///   2段目の自己リサイズの有無による修正（申告と実際の挙動の食い違いの検出）は、モニター間移動自体の
+///   検出（窓のMonitor信念が別のDPIのモニターへ変わったことを捉える仕組み）がこのラウンドでは未実装の
+///   ため対象外のまま——既知のギャップ、専用のラウンドへ持ち越す。これが無いと、`MinWidth`の
+///   `DpiBehavior = RescalesItself`の2段目待ち除外（§4.5）も実装できない（`MinWidth`の型直前の
+///   コメント参照）。
 /// - **`TargetIntegrity`のProbeOnce規則が述べる「同じProcessKeyの間は再probeしない」の明示的な検査**：
 ///   このラウンドの実装では、確定（`Believed`）した窓を再probeする経路自体が無い（`WindowObserved`が
 ///   `TargetIntegrity = None`で届いても、既に`TargetIntegrity`マップにエントリがあれば何もしない）ため、
@@ -237,7 +246,9 @@ type PlacementState =
       InFlightTargets: Map<WindowId, (IntentEpoch * PixelRect) list>
       /// §4.5「最小幅」（Accumulating）。`Map`に無い＝まだ証拠が無い（他のAccumulating信念と同じ規約、
       /// §4.5「`Map`に無いことを『まだ証拠が無い』の意味に使う」）。`reviseMinWidth`参照。
-      MinWidth: Map<WindowId, Belief<int>> }
+      MinWidth: Map<WindowId, Belief<int>>
+      /// §4.5「DPIの振る舞い」（Accumulating、S11）。`reviseDpiBehaviorDeclaration`の型直前のコメント参照。
+      DpiBehavior: Map<WindowId, Belief<DpiBehavior>> }
 
 let initial: PlacementState =
     { Geometry = Map.empty
@@ -251,7 +262,8 @@ let initial: PlacementState =
       Epochs = Map.empty
       RetryAttempts = Map.empty
       InFlightTargets = Map.empty
-      MinWidth = Map.empty }
+      MinWidth = Map.empty
+      DpiBehavior = Map.empty }
 
 /// `WmState.step`が、Placement自身のReconcile以外の理由（Focus.SwitchSettleの再要求、
 /// `MoveFocusedToWorkspace`のRequestForeground等、v2.27）で新しいRequestIdが要るときに呼ぶ最小の窓口。
@@ -330,10 +342,32 @@ let private checkPendingPresenceSatisfied (w: WindowId) (state: PlacementState) 
 /// `WindowObserved`：§7.1段①「Windows→Placement→Health→Focus」のPlacement分。Windowsと同じ入力から
 /// 自分の信念（Geometry/Movability/TargetIntegrity）だけを修正する（ADR-018：ドメインは自分の状態だけを
 /// 返す）。`Reprobe`Effectの発行、再probeタイマーの開始・取消も、この入力の処理に含める。
+/// §4.5「DPIの振る舞い」（Accumulating、S11）：`DpiAwareness`の申告（`PerMonitorV2`なら
+/// `RescalesItself`、それ以外なら`OsBitmapScaled`）を`Inferred [Sample …]`の初期値とする
+/// （窓の発見時だけ——`Movability`の発見時既定値と同じ「最初の1回だけ書く」パターン）。異なるDPIの
+/// モニター間を移動した後、`WM_DPICHANGED`に応じた2段目の自己リサイズが実際に観測されたかどうかで
+/// この信念を修正する規則（申告と実際の挙動の食い違いを検出する）は、モニター間移動の検出自体が
+/// このラウンドでは未実装のため対象外のまま（ファイル冒頭「対象外」参照、既知のギャップ）——今は
+/// 申告をそのまま初期値として採用するだけ。
+let private reviseDpiBehaviorDeclaration (now: int64) (declared: Observation<DpiAwarenessDeclared>) : Belief<DpiBehavior> =
+    let value = match declared.Value with Ok PerMonitorV2 -> RescalesItself | _ -> OsBitmapScaled
+    { Value = value; Confidence = Inferred [ Sample declared.SampleSequence ]; LastRevisedAt = now }
+
 let onWindowObserved (now: int64) (snapshot: WindowSnapshot) (state: PlacementState) : PlacementState * Effect list * TimerCommand<TimerId> list =
     let w = snapshot.Id
     let geometry' =
         Map.add w (reviseGeometryFromSnapshot now (Map.tryFind w state.Geometry |> Option.defaultValue geometryInitial) snapshot) state.Geometry
+
+    // DpiBehaviorの発見時の既定値（§4.5、型直前のコメント参照）。既にエントリがあれば変えない
+    // （「申告は初期値」——その後の修正は実際の挙動の観測からのみ行う、というspecの区別を保つ）。
+    // `Error`観測（Shellが問い合わせられなかった等）は証拠が無いので何もしない。
+    let dpiBehavior' =
+        if Map.containsKey w state.DpiBehavior then
+            state.DpiBehavior
+        else
+            match snapshot.DpiAwareness with
+            | Some ({ Value = Ok _ } as obs) -> Map.add w (reviseDpiBehaviorDeclaration now obs) state.DpiBehavior
+            | _ -> state.DpiBehavior
 
     // Movabilityの発見時の楽観的既定値（§4.5）。既にエントリがあれば変えない。
     let isFirstSeen = not (Map.containsKey w state.Movability)
@@ -382,7 +416,8 @@ let onWindowObserved (now: int64) (snapshot: WindowSnapshot) (state: PlacementSt
             Geometry = geometry'
             Movability = movability'
             TargetIntegrity = targetIntegrity'
-            IntegrityReprobes = integrityReprobes' }
+            IntegrityReprobes = integrityReprobes'
+            DpiBehavior = dpiBehavior' }
 
     // §7.2「SetRectのネイティブAPI呼出が成功しても、目標矩形を観測するまではSatisfiedにしない」：
     // ここでGeometryが今まさに更新されたVisibleFrameRectと、窓宛てのPendingのTargetRectを照合する。
@@ -795,5 +830,6 @@ let onWindowVanished (w: WindowId) (state: PlacementState) : PlacementState * Ti
         Epochs = Map.remove w state.Epochs
         RetryAttempts = Map.remove w state.RetryAttempts
         InFlightTargets = Map.remove w state.InFlightTargets
-        MinWidth = Map.remove w state.MinWidth },
+        MinWidth = Map.remove w state.MinWidth
+        DpiBehavior = Map.remove w state.DpiBehavior },
     integrityCancel @ pendingCancel @ pendingPresenceCancel

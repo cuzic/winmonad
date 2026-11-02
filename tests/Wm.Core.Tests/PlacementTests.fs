@@ -199,3 +199,53 @@ let ``onWindowVanishedは再probe待ちが無ければCancelTimerを出さない
     let afterObserved, _, _ = onWindowObserved 10L snapshot initial
     let _, timerCmds = onWindowVanished (WindowId 1L) afterObserved
     Assert.Empty(timerCmds)
+
+// ===== DpiBehavior（Accumulating、§4.5 S11、v2.44：発見時の申告による初期値のみ） =====
+
+let private snapshotWithDpiAwareness (declared: Observation<DpiAwarenessDeclared> option) : WindowSnapshot =
+    { snapshotWith (Some (obs 1L rect)) None None None None with DpiAwareness = declared }
+
+[<Fact>]
+let ``PerMonitorV2の申告はDpiBehaviorをRescalesItselfの初期値にする(v2.44)`` () =
+    let state', _, _ = onWindowObserved 10L (snapshotWithDpiAwareness (Some (obs 1L PerMonitorV2))) initial
+    match Map.tryFind (WindowId 1L) state'.DpiBehavior with
+    | Some { Value = RescalesItself; Confidence = Inferred _ } -> ()
+    | other -> Assert.True(false, sprintf "expected Inferred RescalesItself, got %A" other)
+
+[<Theory>]
+[<InlineData(0)>] // Unaware
+[<InlineData(1)>] // SystemAware
+[<InlineData(2)>] // PerMonitor
+let ``PerMonitorV2以外の申告はDpiBehaviorをOsBitmapScaledの初期値にする(v2.44)`` (case: int) =
+    let declared = match case with 0 -> Unaware | 1 -> SystemAware | _ -> PerMonitor
+    let state', _, _ = onWindowObserved 10L (snapshotWithDpiAwareness (Some (obs 1L declared))) initial
+    match Map.tryFind (WindowId 1L) state'.DpiBehavior with
+    | Some { Value = OsBitmapScaled; Confidence = Inferred _ } -> ()
+    | other -> Assert.True(false, sprintf "expected Inferred OsBitmapScaled, got %A" other)
+
+[<Fact>]
+let ``DpiAwarenessの申告が無い(未観測)場合はDpiBehaviorの証拠を作らない(v2.44)`` () =
+    let state', _, _ = onWindowObserved 10L (snapshotWithDpiAwareness None) initial
+    Assert.Equal(None, Map.tryFind (WindowId 1L) state'.DpiBehavior)
+
+[<Fact>]
+let ``DpiAwarenessの問い合わせが失敗(Error)した場合もDpiBehaviorの証拠を作らない(v2.44)`` () =
+    let state', _, _ = onWindowObserved 10L (snapshotWithDpiAwareness (Some (failedObs 1L))) initial
+    Assert.Equal(None, Map.tryFind (WindowId 1L) state'.DpiBehavior)
+
+[<Fact>]
+let ``DpiBehaviorは申告を初期値とするだけで、2回目以降の申告では変えない(v2.44)`` () =
+    let afterFirst, _, _ = onWindowObserved 10L (snapshotWithDpiAwareness (Some (obs 1L PerMonitorV2))) initial
+    // 2回目の観測で(矛盾する)別の申告が届いても、発見時の初期値から変えない
+    // (このラウンドでは「実際の2段目リサイズの有無」だけが修正の根拠、型直前のコメント参照)。
+    let afterSecond, _, _ = onWindowObserved 20L (snapshotWithDpiAwareness (Some (obs 2L SystemAware))) afterFirst
+    match Map.tryFind (WindowId 1L) afterSecond.DpiBehavior with
+    | Some { Value = RescalesItself } -> ()
+    | other -> Assert.True(false, sprintf "expected the first declaration (RescalesItself) to stick, got %A" other)
+
+[<Fact>]
+let ``onWindowVanishedはDpiBehaviorも消す(v2.44)`` () =
+    let afterObserved, _, _ = onWindowObserved 10L (snapshotWithDpiAwareness (Some (obs 1L PerMonitorV2))) initial
+    Assert.True(Map.containsKey (WindowId 1L) afterObserved.DpiBehavior)
+    let afterVanished, _ = onWindowVanished (WindowId 1L) afterObserved
+    Assert.False(Map.containsKey (WindowId 1L) afterVanished.DpiBehavior)
