@@ -1881,7 +1881,10 @@ let spikeS22_SetRectDispatchDelay () =
         log (sprintf "- SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE) failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
     else
         try
-            use form = new Form(Text = "S22", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(100, 100, 400, 300))
+            // 初期位置をどのtargetとも異なる値にする（同じ値だと移動が無く、LOCATIONCHANGE自体が
+            // 発火しない「無変化」のno-opを「遅延」と誤認してしまう——実際に最初の実行で踏んだ、
+            // 既知のギャップとして記録）。
+            use form = new Form(Text = "S22", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(900, 900, 200, 150))
             form.Show()
             pump 5
             targetHwnd <- form.Handle
@@ -1910,7 +1913,11 @@ type private MinWidthForm(minTrackWidthPx: int) as this =
     do
         this.Text <- "S23"
         this.StartPosition <- FormStartPosition.Manual
-        this.Bounds <- Rectangle(100, 100, 400, 300)
+        // 初期幅をminTrackWidthPxと異ならせる（同じ値だと後続の「狭い幅への要求→丸めでminTrackWidthPx
+        // へ戻る」が実際には無変化のno-opになり、LOCATIONCHANGE自体が発火しない——実際に最初の実行で
+        // 踏んだ、既知のギャップとして記録。600pxなら200pxへの要求もminTrackWidthPx=400pxへの丸めも
+        // 両方とも本当の変化になる）。
+        this.Bounds <- Rectangle(100, 100, 600, 300)
     override this.WndProc(m: Message byref) =
         let WM_GETMINMAXINFO = 0x0024
         if m.Msg = WM_GETMINMAXINFO then
