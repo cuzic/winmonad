@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <!-- Wm.Policyは外部パッケージ依存を持たない（architecture.md §17「依存の例外」） -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 最小実装（ADR-019表の実装順8: PolicyTypes.fs/PolicyEvaluator.fs/PolicyAnalyzer.fs/PolicyArtifact.fsは
+         本ADRの最初の縦切り（決定8）の対象外。ここではCore.TopologyのTopologyState.Assignmentsが必要とする
+         MonitorSelectorだけを前倒しで置く（§17の依存方向：Wm.Core→Wm.Policyは常に成立する固定関係であり、
+         MonitorSelector自体は基準(0)〜(4)を満たさずWm.Policyに残る、ADR-019決定3）。 -->
+    <Compile Include="MonitorSelector.fs" />
+  </ItemGroup>
+
+</Project>
