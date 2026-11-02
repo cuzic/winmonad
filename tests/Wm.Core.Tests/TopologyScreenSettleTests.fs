@@ -88,6 +88,24 @@ let private settleFully (t0: int64) (snapshots: MonitorSnapshot list) (state: To
         deadline, state2
     | _ -> t0, state1
 
+/// round2レビューT-3：3-2の回帰テストが「NoMonitorsに`[]`が来る」という自明なケースしか見ておらず、
+/// 無限周回の本体である「Graceの間に、同じ構成が再び届く」ケースを検査していなかった（M5で旧実装に戻しても
+/// 検出できないことを確認済み、修正後は失敗する）。Stable→観測T→settle（Grace）→同じT、と進めたとき、
+/// Phaseが`Grace`のままであり、タイマー指令が空であることを検査する。
+[<Property>]
+let ``T-3 Graceの間に同じトポロジが再び届いてもSettlingへ戻らない`` (now: int) (rawIds: int list) =
+    let snapshots = mkSnapshots rawIds
+    let graceDeadline, state1 = settleFully (int64 now) snapshots (initial Map.empty)
+    match phase state1 with
+    | Grace _ ->
+        let state2, response, events, trace = update config (graceDeadline + 1L) (MonitorTopologyObserved snapshots) state1
+        (phase state2 = phase state1)
+        && (response.Actions = [])
+        && (response.TimerCommands = [])
+        && (events = [])
+        && (trace = [])
+    | _ -> false // settleFullyの直後はGraceのはず
+
 /// round2レビューT-2：3-1（blocking）の回帰を実際に捕まえるため、Reconfiguring区間を実際に通す。
 /// 「Stable/Settlingから、ScreenReconfigurationInProgress trueに入り、0回以上のMonitorTopologyObserved
 /// を経て、false／UserCommand／ReconfigurationCap満了のいずれかで解除し、ScreenSettleの発火まで進めたとき、
