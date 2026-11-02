@@ -155,8 +155,10 @@ let ``2台のモニターそれぞれにWorkspaceが表示されていると、R
         // w1は新規発見なのでActiveWorkspace（current.Workspace）に分類・配置される。
         Assert.Equal(Some current.Workspace, WorkspaceSet.workspaceOf w1 afterW1.Next.Workspaces)
 
-        // w2は、まだ配線されていないWorkspace切替コマンドの代わりに、表示中だがアクティブでない方の
-        // Workspaceに属するTiled窓として直接投入する（前回セッションから引き続き存在する窓を模す）。
+        // w2は、UserCommand経由の正規の入口（ClassificationのActiveWorkspace割当かMoveFocusedToWorkspace）
+        // ではなく、表示中だがアクティブでない方のWorkspaceに属するTiled窓として直接投入する
+        // （前回セッションから引き続き存在する窓を模す。このテストの主眼はReconcileのWorkspace横断動作
+        // であって窓の配置経路ではないため、最短で状態を作る）。
         let windows2 =
             { afterW1.Next.Windows with
                 Records = Map.add w2 { WindowRecord.initial with Classification = Classified (EffTiled, ByUserOverride) } afterW1.Next.Windows.Records }
@@ -171,6 +173,35 @@ let ``2台のモニターそれぞれにWorkspaceが表示されていると、R
         // アクティブなWorkspaceのw1はDesiredが既に一致しているので、同じstepで重複SetRectは発行されない。
         let rectsForW1 = effects |> List.choose (function SetRect (_, target, rect) when target = w1 -> Some rect | _ -> None)
         Assert.Empty(rectsForW1)
+    | other -> Assert.True(false, sprintf "expected exactly 1 visible (non-active) screen, got %A" other)
+
+[<Fact>]
+let ``SwitchWorkspaceで既にvisibleなWorkspaceへ切り替えると、currentが入れ替わりそのzipperのFocusへRequestForegroundする(v2.32)`` () =
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0; mkMonitor 1 ]
+    let current, visible =
+        match displays topology with
+        | Displays (c, v) -> c, v
+        | NoMonitors -> failwith "expected 2 monitors to settle into Displays"
+    match visible with
+    | [ visibleScreen ] ->
+        let w1, w2 = WindowId 1L, WindowId 2L
+        let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+        let afterW1 = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved w1))
+        let windows2 =
+            { afterW1.Next.Windows with
+                Records = Map.add w2 { WindowRecord.initial with Classification = Classified (EffTiled, ByUserOverride) } afterW1.Next.Windows.Records }
+        let workspaces2 = WorkspaceSet.addWindow visibleScreen.Workspace w2 false afterW1.Next.Workspaces
+        let seeded2 = { afterW1.Next with Windows = windows2; Workspaces = workspaces2 }
+
+        let afterSwitch = step RuntimePolicy.defaults seeded2 (mkEnvelope 2L (UserCommand (SwitchWorkspace visibleScreen.Workspace)))
+        match displays afterSwitch.Next.Topology with
+        | Displays (newCurrent, [ newVisible ]) ->
+            Assert.Equal(visibleScreen.Workspace, newCurrent.Workspace)
+            Assert.Equal(current.Workspace, newVisible.Workspace)
+        | other -> failwithf "expected current/visible to swap, got %A" other
+
+        let effects = afterSwitch.Effects |> List.map GatedEffect.effect
+        Assert.Contains(effects, function RequestForeground (_, target) -> target = w2 | _ -> false)
     | other -> Assert.True(false, sprintf "expected exactly 1 visible (non-active) screen, got %A" other)
 
 let private mkForegroundObserved (sequence: int64) (w: WindowId) : InputEvent =
@@ -298,6 +329,35 @@ let ``モニターの切断はWorkspaceHiddenを経てHiddenByWm+SetPresence(fal
     Assert.Equal(Some (Shown (Some (mkMonitor 0).WorkArea)), Map.tryFind w afterReconnectSettle.Next.Placement.Desired)
     let showEffects = afterReconnectSettle.Effects |> List.map GatedEffect.effect
     Assert.Contains(showEffects, function SetPresence (_, target, true) -> target = w | _ -> false)
+    // モニター再接続による表示（ShownBy = Reconcile）はユーザー操作ではないので、フォーカスは要求しない
+    // （§4.4、v2.32。RequestForegroundを要求するのはShownBy = UserView/CurrentChangedだけ）。
+    Assert.DoesNotContain(showEffects, function RequestForeground (_, target) -> target = w | _ -> false)
+
+[<Fact>]
+let ``SwitchWorkspaceでhiddenなWorkspaceへ切り替えると、新しくcurrentになったWorkspaceのzipperのFocusへRequestForegroundする(v2.32)`` () =
+    let w1 = WindowId 1L
+    let afterW1 = settleOneMonitorThenDiscoverWindow w1
+    let ws0 = WorkspaceSet.workspaceOf w1 afterW1.Next.Workspaces |> Option.get
+
+    // w2を、まだ表示されたことの無いWorkspace(hiddenWs)に直接投入する（前回セッションから引き続き
+    // 存在する窓を模す。このテストの主眼はSwitchWorkspace後のRequestForeground配線であって
+    // 窓の配置経路ではないため、最短で状態を作る——他のテストと同じ理由）。
+    let hiddenWs = WorkspaceId 999
+    let w2 = WindowId 2L
+    let windows2 =
+        { afterW1.Next.Windows with
+            Records = Map.add w2 { WindowRecord.initial with Classification = Classified (EffTiled, ByUserOverride) } afterW1.Next.Windows.Records }
+    let workspaces2 = WorkspaceSet.addWindow hiddenWs w2 false afterW1.Next.Workspaces
+    let seeded2 = { afterW1.Next with Windows = windows2; Workspaces = workspaces2 }
+
+    let afterSwitch = step RuntimePolicy.defaults seeded2 (mkEnvelope 200L (UserCommand (SwitchWorkspace hiddenWs)))
+    match displays afterSwitch.Next.Topology with
+    | Displays (current, []) -> Assert.Equal(hiddenWs, current.Workspace)
+    | other -> failwithf "expected the previously-hidden workspace to become current, got %A" other
+    Assert.Equal(Some ws0, WorkspaceSet.workspaceOf w1 afterSwitch.Next.Workspaces) // w1はws0に残る(非表示化)
+
+    let effects = afterSwitch.Effects |> List.map GatedEffect.effect
+    Assert.Contains(effects, function RequestForeground (_, target) -> target = w2 | _ -> false)
 
 [<Fact>]
 let ``WindowRemovedは同じstepでPlacement.Geometryも除く`` () =

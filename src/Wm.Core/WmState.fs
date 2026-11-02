@@ -298,11 +298,10 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         else
             stateAfterMovability, []
 
-    // `WorkspaceHidden`/`WorkspaceShown`（v2.31で消費を開始。`CurrentChanged`は`SwitchWorkspace`自体が
-    // 未配線のため依然捨てる）：現時点でこれらを出すのは`MonitorLifecycle.reconcile`（モニター接続・
-    // 切断、`settle`の中で`TopologySettled`と同時に発行される）だけだが、将来`SwitchWorkspace`を
-    // 配線しても同じ受け口を再利用できる。該当Workspaceに属する窓を`Placement.onWorkspaceHidden`/
-    // `onWorkspaceShown`へ渡し、`Desired`/`SetPresence`を更新する（Placement.fsのコメント参照）。
+    // `WorkspaceHidden`/`WorkspaceShown`（v2.31で消費を開始。モニター接続・切断経由の`MonitorLifecycle.
+    // reconcile`に加え、v2.32で`SwitchWorkspace`も同じ受け口を共有する）：該当Workspaceに属する窓を
+    // `Placement.onWorkspaceHidden`/`onWorkspaceShown`へ渡し、`Desired`/`SetPresence`を更新する
+    // （Placement.fsのコメント参照）。
     let windowsOfWorkspace (ws: WorkspaceId) : WindowId list =
         (WorkspaceSet.stateOf ws stateAfterMovability.Workspaces).Stack |> Option.map Zipper.toList |> Option.defaultValue []
     let hiddenWindows = topologyEvents |> List.choose (function WorkspaceHidden ws -> Some ws | _ -> None) |> List.collect windowsOfWorkspace
@@ -311,6 +310,30 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         let placementSt1, e1 = Placement.onWorkspaceHidden hiddenWindows stateAfterMovability.Placement
         let placementSt2, e2 = Placement.onWorkspaceShown shownWindows placementSt1
         { stateAfterMovability with Placement = placementSt2 }, e1 @ e2
+
+    // `CurrentChanged`/`WorkspaceShown (_, UserView)`（v2.32で消費を開始）：ユーザーが`SwitchWorkspace`で
+    // 明示的に切り替えた先のWorkspaceへ、そのzipperのFocus（Stack=NoneならNone、RequestForegroundは
+    // 発行しない）へ一度だけRequestForegroundする（§4.4「ユーザーの操作でWorkspaceが表示されたとき…
+    // フォーカスを渡す窓はそのWorkspaceのzipperのFocus」）。アプリの自己アクティブ化
+    // （`ForegroundFollow`）やモニター再接続（`Reconcile`）による表示ではフォーカスを要求しない
+    // （§4.4、同じ理由はPlacement.fsのコメント参照）。切替直後の揺れを吸収する`SwitchSettle`は
+    // このラウンドの対象外（Topology.fsのコメント参照）——ここでは一度だけ要求する。
+    let userSwitchedWorkspaces =
+        topologyEvents
+        |> List.choose (function
+            | CurrentChanged ws -> Some ws
+            | WorkspaceShown (ws, UserView) -> Some ws
+            | _ -> None)
+    let stateAfterMovability, switchForegroundEffects =
+        userSwitchedWorkspaces
+        |> List.fold
+            (fun (s: WmState, effects) ws ->
+                match (WorkspaceSet.stateOf ws s.Workspaces).Stack with
+                | None -> s, effects
+                | Some z ->
+                    let rid, placementSt' = Placement.allocateRequestId s.Placement
+                    { s with Placement = placementSt' }, effects @ [ RequestForeground (rid, z.Focus) ])
+            (stateAfterMovability, [])
 
     // Health：ResponsivenessReprobeタイマーの発火と、PlacementのEffectCallReturned処理が`TargetHung`と
     // 判定した場合のResponsiveness修正（§7.2「EffectCallReturned(Error) → classify → TargetHung →
@@ -438,7 +461,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
           HiddenByWm = Set.empty
           NeedsRestore = Set.empty }
 
-    let gated, rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects)
+    let gated, rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects @ switchForegroundEffects)
 
     // §7.2「GateRejected → Cancelled（Deadlineまで待たず同じstep内で即時に遷移する）」。
     let rejectedRequestIds = rejected |> List.choose fst
@@ -447,8 +470,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
 
     // 段①のDomainEventは、消費する後続の段（Topologyの`current`追従等）がまだ無いため捨てる
     // （Opusレビュー5-3）。段②のDomainEventのうち`TopologySettled`（v2.29）/`WorkspaceShown`/
-    // `WorkspaceHidden`（v2.31）は上で消費するようになった。`CurrentChanged`は`SwitchWorkspace`
-    // 自体が未配線のため依然捨てる。
+    // `WorkspaceHidden`/`CurrentChanged`（v2.31・v2.32）は全て上で消費するようになった。
     ignore stage1Events
     ignore topologyEvents
 

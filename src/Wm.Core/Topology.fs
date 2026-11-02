@@ -1,6 +1,17 @@
 /// Core.Topology（ADR-019実装順14）。architecture.md §4.4/§7.3。
 /// モニター構成、各モニターに表示中のWorkspace、アクティブなモニター、画面構成変化の待ち。
 /// `MonitorLifecycle.reconcile`を同梱する（§19）。
+///
+/// `SwitchWorkspace`のview semantics（v2.32追加）：xmonadのviewと同じ意味論（§4.4）。
+/// `WorkspaceShown`/`WorkspaceHidden`/`CurrentChanged`はこれで初めて`UserCommand`からも発行される
+/// ようになった（これまでは`MonitorLifecycle.reconcile`、つまりモニター接続・切断だけが発行元だった）。
+/// `WmState.step`はv2.31でこれらのうち`WorkspaceShown`/`WorkspaceHidden`の消費（Placement側の
+/// `HiddenByWm`/`Shown None`反映）を始めており、`CurrentChanged`の消費（フォーカスを渡す窓への
+/// `RequestForeground`）はこのラウンドで追加する（WmState.fsのコメント参照）。`SwitchSettle`
+/// （切替直後の揺れの吸収、§4.4「Workspace切替は「待ち」を伴う」）はこのラウンドの対象外のまま——
+/// `Focus.startSwitchSettle`/`onSwitchSettleTimerFired`は既に実装されているが、実際のOS側の
+/// タイミング挙動（揺れの幅・頻度）の実測がまだ無く、適切なSettleMsや再要求の発火条件を決める
+/// 根拠が無いため、専用のラウンドへ切り出す。
 module Wm.Core.Topology
 
 open Wm.Contracts.Identifiers
@@ -266,6 +277,45 @@ let update (config: TopologyConfig) (now: int64) (input: InputEvent) (state: Top
             events,
             trace
         | _ -> state, noResponse, [], []
+    | UserCommand (SwitchWorkspace ws) ->
+        match state.Phase with
+        | Reconfiguring _ ->
+            // 抑止区間中はSwitchWorkspaceを含むどのUserCommandも、強制的にSettlingへ入らせる
+            // （下の`UserCommand _`と同じ規則。抑止区間中は安定したDisplaysが無いのでview自体が無意味）。
+            let state', response, events, trace = enterSettling state (latestForForcedSettle ()) (now + config.HardDeadlineMs)
+            state',
+            { response with TimerCommands = CancelTimer (TimerId.Topology ReconfigurationCap) :: response.TimerCommands },
+            events,
+            trace
+        | _ ->
+            // §4.4「SwitchWorkspaceの意味」：xmonadのview。`ws`が既にvisibleなモニターnに表示されていれば
+            // currentをnへ入れ替えるだけ（画面の中身は変わらない）。hiddenなら（未知のwsも含む——
+            // WorkspaceSetは全域なので空のWorkspaceとして扱える）、currentの画面の表示をwsへ入れ替え、
+            // それまで表示していたWorkspaceがhiddenになる。NoMonitorsなら何もしない。greedyView
+            // （2画面の表示を交換する）は既定にしない（§4.4、ユーザーが見ていない側まで入れ替わるため）。
+            match state.Displays with
+            | NoMonitors -> state, noResponse, [], []
+            | Displays (current, visible) when current.Workspace = ws -> state, noResponse, [], [] // 既にcurrent
+            | Displays (current, visible) ->
+                match visible |> List.tryFind (fun sc -> sc.Workspace = ws) with
+                | Some targetScreen ->
+                    let visible' = current :: (visible |> List.filter (fun sc -> sc.Workspace <> ws))
+                    // ユーザーの明示操作（SwitchWorkspace）は、自動復帰より優先し`ReturnMonitor`を解除する
+                    // （§4.4のReturns更新規則(3)）。既にvisibleなwsは、表示された時点で
+                    // `MonitorLifecycle.reconcile`が`chosen`の予約を既に解除しているはずなので、この分岐で
+                    // 実際に取り除く対象がある状況は到達しにくい（下のhiddenな分岐の方が主な対象）。
+                    // 対称性のための防御的な記述として残す。
+                    { state with Displays = Displays (targetScreen, visible'); Returns = Map.remove ws state.Returns },
+                    noResponse,
+                    [ CurrentChanged ws ],
+                    []
+                | None ->
+                    let oldWorkspace = current.Workspace
+                    let newCurrent = { current with Workspace = ws }
+                    { state with Displays = Displays (newCurrent, visible); Returns = Map.remove ws state.Returns },
+                    noResponse,
+                    [ WorkspaceHidden oldWorkspace; WorkspaceShown (ws, UserView) ],
+                    []
     | UserCommand _ ->
         match state.Phase with
         | Reconfiguring _ ->
