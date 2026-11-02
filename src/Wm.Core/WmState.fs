@@ -107,14 +107,27 @@ let private removeFromWorkspacesAndFocus (w: WindowId) (state: WmState) : WmStat
 /// 意図的に分けている（`unmanageWindow`、下記）。後者はHealth等の信念を消さない（Excludedの窓も信念を
 /// 持ち続け再分類に備える、§4.4）。この2つを同じ関数に融合すると、片方を書き換えたときにもう片方が壊れる
 /// 取りこぼしが起きやすい。
-let private vanishWindow (w: WindowId) (state: WmState) : WmState =
+///
+/// Opusレビュー4-3（docs/review-phase-a-round1.md、v2.15でCore.Windows着手時に反映）：除去するMapに
+/// 対応する待ちのタイマーが動いていれば`CancelTimer`を返す。Reprobes（Health）とAwaitingEvidenceの
+/// ClassificationDeadline（Windows）の両方が対象——`Map.remove`だけではタイマー実行器側のエントリが
+/// 残り、消滅した窓へ向けて後から（二度と意味を持たない）発火が起こり得る。
+let private vanishWindow (w: WindowId) (state: WmState) : WmState * TimerCommand<TimerId> list =
     let state' = removeFromWorkspacesAndFocus w state
-    { state' with
-        Health =
-            { state'.Health with
-                Responsiveness = Map.remove w state'.Health.Responsiveness
-                Reprobes = Map.remove w state'.Health.Reprobes }
-        Windows = Windows.onWindowVanished w state'.Windows }
+    let reprobeCancel =
+        if Map.containsKey w state'.Health.Reprobes then [ CancelTimer (TimerId.Health (ResponsivenessReprobe w)) ] else []
+    let classificationCancel =
+        match Map.tryFind w state'.Windows.Records with
+        | Some { Classification = ClassificationState.AwaitingEvidence _ } -> [ CancelTimer (TimerId.Windows (ClassificationDeadline w)) ]
+        | _ -> []
+    let next =
+        { state' with
+            Health =
+                { state'.Health with
+                    Responsiveness = Map.remove w state'.Health.Responsiveness
+                    Reprobes = Map.remove w state'.Health.Reprobes }
+            Windows = Windows.onWindowVanished w state'.Windows }
+    next, reprobeCancel @ classificationCancel
 
 /// 窓の「管理外化」（Excluded化。消滅はしていない）。Workspaces/Focus.History/SwitchSettleからだけ除き、
 /// 各ドメインの信念（Health/Windows）は保持する（§4.4、`WindowUnmanaged`DomainEventの契機）。
@@ -157,10 +170,10 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     let focusedBefore = focused state
 
     // 窓の消滅（vanished）のクリーンアップ。今はWindowRemovedだけが引き金になる。
-    let state =
+    let state, vanishTimerCmds =
         match envelope.Input with
         | WindowRemoved w -> vanishWindow w state
-        | _ -> state
+        | _ -> state, []
 
     // 段①⑤相当（Windows）：WindowObserved/VisibilityChanged/CloakChangedからの信念反映と、
     // ClassificationDeadlineタイマー・ユーザーコマンド（ToggleFloating/SetManagement/ClearUserOverride）
@@ -264,5 +277,5 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
 
     { Next = next
       Effects = gated
-      Timers = topologyResponse.TimerCommands @ healthTimerCmds @ switchSettleTimerCmds @ windowsTimerCmds
+      Timers = topologyResponse.TimerCommands @ healthTimerCmds @ switchSettleTimerCmds @ windowsTimerCmds @ vanishTimerCmds
       Trace = traces }

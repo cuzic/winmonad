@@ -6,6 +6,7 @@ open Xunit
 open Wm.Contracts.Identifiers
 open Wm.Contracts.Observation
 open Wm.Contracts.SharedVocabulary
+open Wm.Contracts.Timers
 open Wm.Contracts.CoreCommand
 open Wm.Core.Windows
 open Wm.Core.Workspaces
@@ -87,3 +88,31 @@ let ``SetManagement Excludedは同じstepでWorkspacesから除くが、Windows.
     match (Map.find (WindowId 1L) afterExcluded.Windows.Records).Classification with
     | Classified (EffExcluded, ByUserOverride) -> ()
     | other -> Assert.True(false, sprintf "unexpected: %A" other)
+
+// ===== Opusレビュー4-3（docs/review-phase-a-round1.md）：消滅時、動いている待ちのタイマーをCancelする =====
+
+[<Fact>]
+let ``WindowRemovedはHealthのReprobe待ちがあればCancelTimerを出す`` () =
+    let state = seedState ()
+    let withReprobe =
+        { state with
+            Health = { state.Health with Reprobes = Map.ofList [ WindowId 1L, ({ AttemptCount = 1; LastAttemptAt = 0L }, 1_000L) ] } }
+    let result = step runtimePolicy withReprobe (mkEnvelope 1L (WindowRemoved (WindowId 1L)))
+    Assert.Contains(CancelTimer (TimerId.Health (ResponsivenessReprobe (WindowId 1L))), result.Timers)
+
+let private awaitingDialogPolicy: PolicyIR =
+    { PolicyIR.defaults with WindowRules = [ { Id = PolicyRuleId "needs-dialog"; Priority = 10; When = DialogIs true; Apply = Tiled } ] }
+
+let private awaitingRuntimePolicy: RuntimePolicy =
+    { RuntimePolicy.defaults with Policy = awaitingDialogPolicy; PatternSet = Wm.Policy.PolicyEvaluator.buildTitlePatternSet awaitingDialogPolicy }
+
+[<Fact>]
+let ``WindowRemovedはAwaitingEvidence中のClassificationDeadlineタイマーをCancelする`` () =
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0 ]
+    let state = { initial awaitingRuntimePolicy with Topology = topology }
+    let afterObserved = (step awaitingRuntimePolicy state (mkEnvelope 1L (visibleWindowObserved (WindowId 1L)))).Next
+    match (Map.find (WindowId 1L) afterObserved.Windows.Records).Classification with
+    | AwaitingEvidence _ -> ()
+    | other -> Assert.True(false, sprintf "expected AwaitingEvidence, got %A" other)
+    let result = step awaitingRuntimePolicy afterObserved (mkEnvelope 2L (WindowRemoved (WindowId 1L)))
+    Assert.Contains(CancelTimer (TimerId.Windows (ClassificationDeadline (WindowId 1L))), result.Timers)
