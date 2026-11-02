@@ -1,5 +1,20 @@
 # Windows プログラマブル・ウィンドウマネージャー 統合設計書
 
+Version: 2.26（Placement.fsのファイル冒頭「対象外」が挙げていた「複数の可視Workspaceへの拡張」を
+閉じた。`WmState.step`の段⑦（Reconcile）が、アクティブなWorkspace1つだけでなく、現在表示中の
+全Workspace（他モニターに表示中の可視Workspaceも含む）を`Topology.displays`の`current :: visible`
+の順に`Placement.reconcileWorkspace`へ渡すようになった。実装中、`PlanValidator.checkNoMissingPlacement`
+（§6.2「`TiledWindows ⊆ Alive ∩ Managed(Tiled)`」、実際にはこの呼び出しでは等号を要求する）が、
+渡された`Management`/`Alive`のドメイン全体に含まれるTiled×Aliveな窓が、この1回の`placements`に
+必ず現れることを要求する既存の実装を初めて踏んだ：単一のアクティブWorkspaceしか呼んでいなかった
+これまでは、たまたま全てのTiled×Alive窓が同じWorkspaceに属していたため表面化していなかったが、
+2つ目のWorkspaceを同じグローバルな`managementByWindow`/`aliveWindows`で呼ぶと、他のWorkspaceの
+窓が「この計画に無い」という誤検知で`RejectWholePlan`になり、無言で何も配置されなくなる既存の
+潜在的な設計上の誤り（新規に導入した不具合ではない）を見つけて修正した。`WmState.step`が
+`reconcileWorkspace`を呼ぶたびに、そのWorkspaceのStack（Tiled∪Floating、`WindowClassified`の
+反映先と一致）に属する窓だけへ`Management`/`Alive`を絞り込むようにした。「WorkspaceShown/Hidden
+経由のReconcileトリガー」はまだ無い（`shouldReconcile`は依然`windowsEvents`/`WindowRemoved`だけが
+引き金で、モニター接続等でWorkspaceが新たに表示されただけではReconcileされない——対象外のまま）。
 Version: 2.25（`Wm.Simulation`の`WindowBehavior`に`DelayedByMs`（§12.1の`ScheduledSimEvent`相当：
 `SetRect`の呼び出し自体は即座に成功するが、要求どおりの矩形の観測は指定ミリ秒だけ遅れて届く）を追加し、
 `VirtualWorld`に`Scheduled`（未発火の予定観測）と`advanceClock`（仮想時計を進め期限到達分だけ発火する）
@@ -38,7 +53,10 @@ Version: 2.23（v2.22で見つけ記録した既知のギャップ（`Denied Oth
 とすることを明文化した（v2.24）／`Wm.Simulation`の`WindowBehavior`に`DelayedByMs`と
 `VirtualWorld.advanceClock`を実装し、疑似OS側の遅延観測とCoreの`PendingDeadline`タイマーという
 2つの独立した時計が絡むシナリオを初めて専用テストとして書いた。既存シナリオには影響しない
-`settleTopology`の`ScreenGrace`タイマー取りこぼしを発見・修正した（v2.25）
+`settleTopology`の`ScreenGrace`タイマー取りこぼしを発見・修正した（v2.25）／段⑦のReconcileを
+アクティブなWorkspace1つだけでなく現在表示中の全Workspaceへ拡張し、`PlanValidator`の
+`checkNoMissingPlacement`が要求する「渡されたTiled×Aliveの集合は呼び出し先のWorkspaceに
+属する窓だけへ絞り込む」という既存の暗黙の前提を初めて踏んで修正した（v2.26）
 Version: 2.22（Wm.Simulationが`EffectCallReturned`を実際に返せるようになったので（v2.21）、
 `InputEvent.EffectCallReturned`をPlacement/Healthへ配線した。`Placement.onEffectCallReturned`は
 `Ok ()`では何もせず（§7.2「目標矩形を観測するまではSatisfiedにしない」）、`Error`は`classify`で

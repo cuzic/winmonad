@@ -315,34 +315,51 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         |> Map.ofSeq
 
     // 段⑦相当（Placement、Reconcile）：WindowClassified/WindowUnmanaged（windowsEvents）かWindowRemovedで
-    // アクティブなWorkspaceの構成が変わった可能性がある場合に限り、そのWorkspaceだけをReconcileする
-    // （Placement.fsのファイル冒頭「対象外」：複数の可視Workspaceへの拡張、WorkspaceShown/Hidden経由の
-    // トリガーはまだ無い）。
+    // Workspaceの構成が変わった可能性がある場合に限り、現在表示されている全てのWorkspace（アクティブな
+    // ものだけでなく、他モニターに表示中の可視Workspaceも含む）を順にReconcileする（v2.26。
+    // Placement.fsのファイル冒頭「対象外」が挙げていた2項目のうち「複数の可視Workspaceへの拡張」を
+    // 閉じた。「WorkspaceShown/Hidden経由のReconcileトリガー」はまだ無い——`shouldReconcile`は依然
+    // windowsEvents/WindowRemovedだけが引き金で、あるWorkspaceが新たに表示された（モニター接続等）
+    // だけではReconcileされない）。
     let shouldReconcile =
         not (List.isEmpty windowsEvents)
         || (match envelope.Input with WindowRemoved _ -> true | _ -> false)
+
+    let reconcileOneScreen (placementSt: PlacementState, effects, cmds) (screen: Screen) =
+        let wsState = WorkspaceSet.stateOf screen.Workspace next.Workspaces
+        let stackList = wsState.Stack |> Option.map Zipper.toList |> Option.defaultValue []
+        let tiledIds = stackList |> List.filter (fun w -> not (Set.contains w wsState.Floating))
+        let focusedTiled =
+            wsState.Stack
+            |> Option.bind (fun z -> if Set.contains z.Focus wsState.Floating then None else Some z.Focus)
+        let ctx: LayoutContext =
+            { WorkArea = screen.Monitor.WorkArea
+              Dpi = screen.Monitor.Dpi
+              TiledWindows = tiledIds |> List.map (fun w -> { Id = w; MinWidthDip = None })
+              Focused = focusedTiled }
+        let monitorWidthDip = screen.Monitor.WorkArea.Width * 96 / screen.Monitor.Dpi
+        let layoutRef = selectLayout (List.length tiledIds) monitorWidthDip runtimePolicy.Policy
+        // PlanValidator.checkNoMissingPlacement（§6.2「TiledWindows ⊆ Alive ∩ Managed(Tiled)」、
+        // 実際にはこの呼び出しでは等号が要求される）は、渡された`Management`/`Alive`に含まれる
+        // 全てのTiled×Aliveな窓がこの`placements`に現れることを要求する。複数のWorkspaceを順に
+        // Reconcileする今、グローバルな`managementByWindow`/`aliveWindows`をそのまま渡すと、
+        // 他のWorkspaceに属する窓が「このWorkspaceの計画に無い」という誤検知でRejectWholePlanになる
+        // ——このWorkspaceのStack（Tiled∪Floating、WindowClassifiedの反映先と一致）に属する窓だけへ
+        // 絞り込む（単一のアクティブWorkspaceしか無かった前ラウンドまでは、たまたま全窓が同じ
+        // Workspaceに属していたため表面化していなかった誤り）。
+        let windowsInThisWorkspace = Set.ofList stackList
+        let managementForScreen = managementByWindow |> Map.filter (fun w _ -> Set.contains w windowsInThisWorkspace)
+        let aliveForScreen = Set.intersect aliveWindows windowsInThisWorkspace
+        let st', e', t' = Placement.reconcileWorkspace now runtimePolicy.LayoutRegistry layoutRef ctx managementForScreen aliveForScreen placementSt
+        st', effects @ e', cmds @ t'
 
     let placementAfterReconcile, reconcileEffects, reconcileTimerCmds =
         if not shouldReconcile then
             next.Placement, [], []
         else
-            match activeWorkspace next, Topology.displays next.Topology with
-            | Some ws, Displays (current, _) ->
-                let wsState = WorkspaceSet.stateOf ws next.Workspaces
-                let stackList = wsState.Stack |> Option.map Zipper.toList |> Option.defaultValue []
-                let tiledIds = stackList |> List.filter (fun w -> not (Set.contains w wsState.Floating))
-                let focusedTiled =
-                    wsState.Stack
-                    |> Option.bind (fun z -> if Set.contains z.Focus wsState.Floating then None else Some z.Focus)
-                let ctx: LayoutContext =
-                    { WorkArea = current.Monitor.WorkArea
-                      Dpi = current.Monitor.Dpi
-                      TiledWindows = tiledIds |> List.map (fun w -> { Id = w; MinWidthDip = None })
-                      Focused = focusedTiled }
-                let monitorWidthDip = current.Monitor.WorkArea.Width * 96 / current.Monitor.Dpi
-                let layoutRef = selectLayout (List.length tiledIds) monitorWidthDip runtimePolicy.Policy
-                Placement.reconcileWorkspace now runtimePolicy.LayoutRegistry layoutRef ctx managementByWindow aliveWindows next.Placement
-            | _ -> next.Placement, [], [] // モニター0台。Layout計算もEffect発行も行わない（§4.4）
+            match Topology.displays next.Topology with
+            | Displays (current, visible) -> (current :: visible) |> List.fold reconcileOneScreen (next.Placement, [], [])
+            | NoMonitors -> next.Placement, [], [] // モニター0台。Layout計算もEffect発行も行わない（§4.4）
 
     let next = { next with Placement = placementAfterReconcile }
 

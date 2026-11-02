@@ -28,6 +28,12 @@
 /// 無条件に「配置できた」という直接の証拠であり、既にMovableの窓に対しても確度を`Inferred []`から
 /// `Confirmed`へ進める意味を持つ）。
 ///
+/// 複数の可視Workspaceへの拡張（v2.26追加）：`reconcileWorkspace`自体はこのラウンドより前から
+/// 可視Workspace1つにつき1回呼ぶ設計だったが、呼び出し側（`WmState.step`）はアクティブな
+/// Workspaceだけに適用していた。v2.26でこの制限を外し、現在表示中の全てのWorkspace（他モニターに
+/// 表示中の可視Workspaceも含む）を順にReconcileするようになった（呼び出し側のコメント参照）。
+///
+
 /// このラウンドで意図的に対象外にしたこと（いずれも「できればやる」ではなく、別の未実装の仕組みが
 /// 前提になっているため実装できない項目であり、専用のラウンドへ切り出す）：
 /// - **Retry/Backoff**（§7.2「Timeout → Retry/Backoff」、§7.3）：`onPendingDeadlineTimerFired`も
@@ -45,8 +51,6 @@
 ///   DomainEventはまだ`step`で捨てられている（Opusレビュー5-3）。配線すればPendingの一括失効も書ける。
 /// - **`MinWidth`/`DpiBehavior`（Accumulating規則）**：証拠（`SetRect`の`Mismatch`、DPI切替後の
 ///   2段目観測）は収集できるようになったが、信念として蓄積する修正関数はまだ書いていない。
-/// - **複数の可視Workspaceへの拡張**：このラウンドは`reconcileWorkspace`をアクティブなWorkspace1つに
-///   だけ適用する（呼び出し側のコメント参照）。マルチモニターでの複数Workspace同時Reconcileは次の課題。
 /// - **`TargetIntegrity`のProbeOnce規則が述べる「同じProcessKeyの間は再probeしない」の明示的な検査**：
 ///   このラウンドの実装では、確定（`Believed`）した窓を再probeする経路自体が無い（`WindowObserved`が
 ///   `TargetIntegrity = None`で届いても、既に`TargetIntegrity`マップにエントリがあれば何もしない）ため、
@@ -285,8 +289,12 @@ let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: P
 /// 登録済みのLayoutを呼び、PlanValidatorで検証し、差分だけを`SetRect`として発行する。`ctx`/`management`/
 /// `alive`は呼び出し側（`WmState.step`）がこのstepの状態から組み立てる読み取り専用の投影であり
 /// （`Windows.ClassificationCtx`と同じ位置づけ、ADR-019「ドメインは互いの型を参照しない」）、
-/// PlacementはWorkspaces/Windowsの型を一切知らない。可視Workspace1つにつき1回呼ぶ想定（このラウンドは
-/// アクティブなWorkspaceだけを対象にする、呼び出し側のコメント参照）。
+/// PlacementはWorkspaces/Windowsの型を一切知らない。可視Workspace1つにつき1回呼ぶ想定（v2.26で
+/// アクティブなWorkspaceだけという制限を外し、現在表示中の全Workspaceについて呼ぶようになった）。
+/// `management`/`alive`は呼び出し側がこのWorkspaceに属する窓だけへ絞り込んで渡す必要がある
+/// （PlanValidator.checkNoMissingPlacementが「渡されたTiled×Aliveな窓は全てこの`placements`に
+/// 現れる」ことを要求するため——グローバルな集合をそのまま渡すと、他のWorkspaceの窓が「この計画に
+/// 無い」という誤検知でRejectWholePlanになる。呼び出し側のコメント参照）。
 let reconcileWorkspace
     (now: int64)
     (registry: Registry)

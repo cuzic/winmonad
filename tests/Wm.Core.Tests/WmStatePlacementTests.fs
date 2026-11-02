@@ -139,6 +139,40 @@ let ``EffectCallReturnedのDenied OtherDenialは、同じstepでMovability修正
     Assert.Empty(setRectsForW)
 
 [<Fact>]
+let ``2台のモニターそれぞれにWorkspaceが表示されていると、Reconcileはアクティブでない方の窓も配置する`` () =
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0; mkMonitor 1 ]
+    let current, visible =
+        match displays topology with
+        | Displays (c, v) -> c, v
+        | NoMonitors -> failwith "expected 2 monitors to settle into Displays"
+    match visible with
+    | [ visibleScreen ] ->
+        Assert.NotEqual(current.Workspace, visibleScreen.Workspace)
+        let w1, w2 = WindowId 1L, WindowId 2L
+        let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+        let afterW1 = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved w1))
+        // w1は新規発見なのでActiveWorkspace（current.Workspace）に分類・配置される。
+        Assert.Equal(Some current.Workspace, WorkspaceSet.workspaceOf w1 afterW1.Next.Workspaces)
+
+        // w2は、まだ配線されていないWorkspace切替コマンドの代わりに、表示中だがアクティブでない方の
+        // Workspaceに属するTiled窓として直接投入する（前回セッションから引き続き存在する窓を模す）。
+        let windows2 =
+            { afterW1.Next.Windows with
+                Records = Map.add w2 { WindowRecord.initial with Classification = Classified (EffTiled, ByUserOverride) } afterW1.Next.Windows.Records }
+        let workspaces2 = WorkspaceSet.addWindow visibleScreen.Workspace w2 false afterW1.Next.Workspaces
+        let seeded2 = { afterW1.Next with Windows = windows2; Workspaces = workspaces2 }
+
+        // Reconcileの引き金は、shouldReconcileの条件を満たすだけでよい無関係な窓の消滅で十分。
+        let afterReconcile = step RuntimePolicy.defaults seeded2 (mkEnvelope 2L (WindowRemoved (WindowId 999L)))
+        let effects = afterReconcile.Effects |> List.map GatedEffect.effect
+        let rectsForW2 = effects |> List.choose (function SetRect (_, target, rect) when target = w2 -> Some rect | _ -> None)
+        Assert.Equal<PixelRect list>([ visibleScreen.Monitor.WorkArea ], rectsForW2)
+        // アクティブなWorkspaceのw1はDesiredが既に一致しているので、同じstepで重複SetRectは発行されない。
+        let rectsForW1 = effects |> List.choose (function SetRect (_, target, rect) when target = w1 -> Some rect | _ -> None)
+        Assert.Empty(rectsForW1)
+    | other -> Assert.True(false, sprintf "expected exactly 1 visible (non-active) screen, got %A" other)
+
+[<Fact>]
 let ``WindowRemovedは同じstepでPlacement.Geometryも除く`` () =
     let state = initial RuntimePolicy.defaults
     let obs: Observation<bool> = { Value = Ok true; SampleSequence = 1L; MonotonicTime = 1L; Source = "test" }
