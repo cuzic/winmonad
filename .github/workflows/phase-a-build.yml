@@ -1,0 +1,39 @@
+name: Phase A build & test (Linux, OS非依存層)
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "winmonad.sln"
+      - ".github/workflows/phase-a-build.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "winmonad.sln"
+      - ".github/workflows/phase-a-build.yml"
+
+jobs:
+  build-and-test:
+    # architecture.md §17.1：Linuxで Core, Policy, Layout, PlanValidator, Journal, Runtime, Normalization
+    # のビルドとテストを行う（Windows固有の層はWindows側の統合試験で別途検証する）。
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Restore
+        run: dotnet restore winmonad.sln
+
+      - name: Build
+        run: dotnet build winmonad.sln -c Release --no-restore
+
+      - name: Test
+        run: dotnet test winmonad.sln -c Release --no-build
