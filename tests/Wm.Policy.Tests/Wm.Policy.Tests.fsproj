@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="TestHelpers.fs" />
+    <Compile Include="PolicyEvaluatorTests.fs" />
+    <Compile Include="PolicyAnalyzerTests.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+    <PackageReference Include="FsCheck" Version="2.16.6" />
+    <PackageReference Include="FsCheck.Xunit" Version="2.16.6" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Wm.Contracts/Wm.Contracts.fsproj" />
+    <ProjectReference Include="../../src/Wm.Policy/Wm.Policy.fsproj" />
+  </ItemGroup>
+
+</Project>

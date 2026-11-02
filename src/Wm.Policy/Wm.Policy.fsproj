@@ -6,11 +6,20 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- 最小実装（ADR-019表の実装順8: PolicyTypes.fs/PolicyEvaluator.fs/PolicyAnalyzer.fs/PolicyArtifact.fsは
-         本ADRの最初の縦切り（決定8）の対象外。ここではCore.TopologyのTopologyState.Assignmentsが必要とする
-         MonitorSelectorだけを前倒しで置く（§17の依存方向：Wm.Core→Wm.Policyは常に成立する固定関係であり、
-         MonitorSelector自体は基準(0)〜(4)を満たさずWm.Policyに残る、ADR-019決定3）。 -->
+    <!-- MonitorSelectorは本ADRの最初の縦切り（決定8）より前倒しで置かれた（Core.TopologyのAssignmentsが
+         必要とするため。§17の依存方向：Wm.Core→Wm.Policyは常に成立する固定関係であり、MonitorSelector自体は
+         基準(0)〜(4)を満たさずWm.Policyに残る、ADR-019決定3）。 -->
     <Compile Include="MonitorSelector.fs" />
+    <!-- ADR-019実装順8。PolicyArtifact.fs（PinnedPolicy/DeployablePolicy、§14のArtifact識別基盤を要する
+         より大きな増分）はまだ実装していない——意図的に次の増分へ分離した。 -->
+    <Compile Include="PolicyTypes.fs" />
+    <Compile Include="PolicyEvaluator.fs" />
+    <Compile Include="PolicyAnalyzer.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- §17依存方向：Wm.Policy（Contractsのみ。PolicyとLayoutsは互いに依存しない） -->
+    <ProjectReference Include="../Wm.Contracts/Wm.Contracts.fsproj" />
   </ItemGroup>
 
 </Project>
