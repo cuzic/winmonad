@@ -37,45 +37,69 @@ type BeliefSlot<'T> =
 
 /// LatestWins規則（§4.5）専用の水位つきスロット。
 ///
-/// Opusレビュー（2026-11-01）で、`Belief<'T>.LastRevisedAt`の単位がドメインごとに食い違う問題が見つかった：
-/// LatestWinsの新旧比較には`Observation<'T>.SampleSequence`（§4.2「EventEnvelopeのSequenceとは別の番号空間」）
-/// が必要だが、`Belief<'T>`にはその専用フィールドが無い。これを`LastRevisedAt`で代用すると、
+/// Opusレビュー（2026-11-01、1-1）で、`Belief<'T>.LastRevisedAt`の単位がドメインごとに食い違う問題が
+/// 見つかった：LatestWinsの新旧比較には`Observation<'T>.SampleSequence`（§4.2「EventEnvelopeのSequenceとは
+/// 別の番号空間」）が必要だが、`Belief<'T>`にはその専用フィールドが無い。これを`LastRevisedAt`で代用すると、
 /// Accumulating規則（Health等、`now`=`EventEnvelope.MonotonicTime`を使う）と同じフィールドに
 /// 異なる番号空間が混在し、`combineAll`/`combineAnyOf`の`max LastRevisedAt`が意味を失う
 /// （例：`All [IsDialog; MovableIs Movable]`でSampleSequenceとmsの`max`を取ってしまう）。
+/// 解決：`Belief<'T>.LastRevisedAt`は全ドメインで常に`now`に固定し、LatestWinsの水位はこの型で別に持つ。
 ///
-/// 解決：`Belief<'T>.LastRevisedAt`は全ドメインで常に`now`（Opusレビュー1-1の提案）に固定し、
-/// LatestWinsの水位（処理済みの最大`SampleSequence`）は、この型の`Watermark`で別に持つ。
-type LatestWins<'T> = { Slot: BeliefSlot<'T>; Watermark: int64 option }
+/// 水位は1本（`Watermark`）ではなく`ValueSeq`/`ErrorSeq`の2本に分ける（round2レビューN-1/N-2の修正）。
+/// 1本の`Watermark`をOk/Errorどちらでも進める設計は、Believed状態では正しい（Errorが水位を進めると、
+/// それより古いが現在の値より新しいOk観測を誤って捨てる、1-2）が、Unformed状態では逆に必要
+/// （Errorの到着を水位に残さないと、より新しい失敗を知っているのに後から届いた古いOkをConfirmedにしてしまう、
+/// 1-3）——1本の水位に2つの矛盾する要件を同時に満たすことはできない。2本に分けると、Okの採用判定は
+/// 常に`ValueSeq`だけで行い（Errorがあっても値の更新を妨げない）、Errorは値の確度だけを`ErrorSeq`との
+/// 比較で決める、という1つの規則で両方を満たせる。
+type LatestWins<'T> = { Slot: BeliefSlot<'T>; ValueSeq: int64 option; ErrorSeq: int64 option }
 
 module LatestWins =
-    let unformed: LatestWins<'T> = { Slot = Unformed []; Watermark = None }
+    let unformed: LatestWins<'T> = { Slot = Unformed []; ValueSeq = None; ErrorSeq = None }
 
     /// LatestWins規則の修正関数（§4.5）。ドメインごとに個別実装せず、Contractsに1つだけ置く
     /// （Windows/PlacementのClassInputBeliefs/GeometryBeliefsが実装される際も、Focusのように
     /// コピーして再実装せず、この関数を直接使うこと。Opusレビュー1-1）。
     ///
-    /// より新しいSampleSequenceのOk観測で置き換える（Confirmed）。Errorの観測は値を保ったまま
-    /// Staleにする（ただしWatermarkは、すでに値が確定している間は進めない——これがOpusレビュー1-2の
-    /// 修正点：Watermarkを無条件に進めると、Errorより古いが現在の値より新しいOk観測を誤って
-    /// 捨ててしまう。まだ値が無い(Unformed)間だけ、Errorの到着でWatermarkを進める——これにより、
-    /// 「より新しい失敗を知っているのに古いOkをConfirmedにする」という1-3の問題も併せて防ぐ）。
+    /// Ok観測は、`ValueSeq`より新しければ常に採用する（Errorの有無に関わらず値を更新する——これが
+    /// 1-2/N-1の修正点）。採用した値の確度は、`ErrorSeq`がその観測より新しければ`Stale`、そうでなければ
+    /// `Confirmed`にする（「より新しい失敗を知っているのに古いOkをConfirmedにする」1-3/N-2を防ぐ）。
+    /// Error観測は、`ValueSeq`より新しければ既存の値を保ったまま確度を`Stale`にし、`ErrorSeq`を進める
+    /// （値がまだ無い(Unformed)間は確度を落とす対象が無いので`Slot`はそのまま、`ErrorSeq`だけ進める）。
     let revise (now: int64) (current: LatestWins<'T>) (observation: Observation<'T>) : LatestWins<'T> =
-        let isNewer =
-            match current.Watermark with
-            | Some wm -> observation.SampleSequence > wm
-            | None -> true
-
-        if not isNewer then
-            current
-        else
-            match observation.Value, current.Slot with
-            | Ok v, _ ->
-                { Slot = Believed { Value = v; Confidence = Confirmed; LastRevisedAt = now }
-                  Watermark = Some observation.SampleSequence }
-            | Error _, Believed b ->
-                { Slot = Believed { b with Confidence = Stale now }; Watermark = current.Watermark }
-            | Error _, Unformed gaps -> { Slot = Unformed gaps; Watermark = Some observation.SampleSequence }
+        match observation.Value with
+        | Ok v ->
+            let isNewer =
+                match current.ValueSeq with
+                | Some vs -> observation.SampleSequence > vs
+                | None -> true
+            if not isNewer then
+                current
+            else
+                let confidence =
+                    match current.ErrorSeq with
+                    | Some es when es > observation.SampleSequence -> Stale now
+                    | _ -> Confirmed
+                { current with
+                    Slot = Believed { Value = v; Confidence = confidence; LastRevisedAt = now }
+                    ValueSeq = Some observation.SampleSequence }
+        | Error _ ->
+            let errorSeq' =
+                match current.ErrorSeq with
+                | Some es -> Some (max es observation.SampleSequence)
+                | None -> Some observation.SampleSequence
+            let isNewerThanValue =
+                match current.ValueSeq with
+                | Some vs -> observation.SampleSequence > vs
+                | None -> false // 値がまだ無いので、確度を落とす対象が無い（Unformedのまま）
+            let slot' =
+                if isNewerThanValue then
+                    match current.Slot with
+                    | Believed b -> Believed { b with Confidence = Stale now }
+                    | Unformed gaps -> Unformed gaps // ValueSeqがNoneのときは到達しない
+                else
+                    current.Slot
+            { current with Slot = slot'; ErrorSeq = errorSeq' }
 
     /// 現在の値（`Unformed`ならNone）。
     let value (lw: LatestWins<'T>) : 'T option =

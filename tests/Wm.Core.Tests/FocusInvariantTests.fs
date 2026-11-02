@@ -47,18 +47,35 @@ let ``reviseForeground: Errorの観測は値を保ったままStaleにする`` (
     | _ -> false
 
 /// Opusレビュー1-2の回帰テスト：値が既に確定した後にErrorが届いても、Errorより古いが現在の値より
-/// 新しいOk観測は正しく採用される（旧実装は`LastRevisedAt`をErrorのSampleSequenceまで進めてしまい、
-/// この後続のOk観測を誤って「古い」と判定して捨てていた）。
+/// 新しいOk観測は値として正しく採用される（旧実装は`LastRevisedAt`をErrorのSampleSequenceまで進めてしまい、
+/// この後続のOk観測を誤って「古い」と判定して捨てていた）。確度は、Errorがこの観測より新しければ
+/// `Stale`、そうでなければ`Confirmed`になる（round2レビューN-2：「より新しい失敗を知っているのに
+/// 古いOkをConfirmedにする」ことを防ぐ——旧テストはここを無条件`Confirmed`と誤って固定していた）。
 [<Property>]
-let ``reviseForeground: Errorの後でも値より新しいOk観測は採用される（1-2回帰）`` (sARaw: int) (gapToError: int) (gapToOkB: int) (wA: int) (wB: int) =
+let ``reviseForeground: Errorの後でも値より新しいOk観測は採用される（1-2/N-2回帰）`` (sARaw: int) (gapToError: int) (gapToOkB: int) (wA: int) (wB: int) =
     let sA = int64 (abs sARaw)
     let sError = sA + int64 (abs gapToError) + 1L
     let sOkB = sA + int64 (abs gapToOkB) + 1L // sAより厳密に新しい（sErrorより古いか新しいかは問わない）
     let afterA = reviseForeground 0L LatestWins.unformed (mkObservation sA (Ok (Some (WindowId (int64 wA)))))
     let afterError = reviseForeground 1L afterA (mkObservation sError (Error sampleErr))
     let afterB = reviseForeground 2L afterError (mkObservation sOkB (Ok (Some (WindowId (int64 wB)))))
+    let expectedConfidence = if sError > sOkB then Stale 2L else Confirmed
     match afterB.Slot with
-    | Believed b -> b.Value = Some (WindowId (int64 wB)) && b.Confidence = Confirmed
+    | Believed b -> b.Value = Some (WindowId (int64 wB)) && b.Confidence = expectedConfidence
+    | Unformed _ -> false
+
+/// round2レビューN-1の回帰テスト：値が未確定(Unformed)の間にErrorを受けた後、Errorより古いOk観測
+/// （それでも「初めて届いた値」であることに変わりはない）が、値そのものとしては正しく採用される
+/// （確度はStale）。旧実装（Watermarkを1本だけ持つ設計）は、Unformedの間はErrorの到着でWatermarkを
+/// 進めていたため、この場合に値を永久に採用できず`focused`がElsewhereに固定され続けた。
+[<Property>]
+let ``reviseForeground: Unformedの間にErrorを受けても、後続のOk観測は値として採用される（N-1回帰）`` (sErrorRaw: int) (gapToOkC: int) (w: int) =
+    let sError = int64 (abs sErrorRaw)
+    let sOkC = sError - int64 (abs gapToOkC) - 1L // sErrorより厳密に古い
+    let afterError = reviseForeground 0L LatestWins.unformed (mkObservation sError (Error sampleErr))
+    let afterC = reviseForeground 1L afterError (mkObservation sOkC (Ok (Some (WindowId (int64 w)))))
+    match afterC.Slot with
+    | Believed b -> b.Value = Some (WindowId (int64 w)) && b.Confidence = Stale 1L
     | Unformed _ -> false
 
 [<Property>]
