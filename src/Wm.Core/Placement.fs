@@ -80,6 +80,12 @@
 /// `onTopologySettled`は意図的に対象外のまま（下記）：Geometry Pendingと違い、表示状態はモニター配置に
 /// 依存しないため、トポロジ確定で失効させる理由が無い。
 ///
+/// `Mismatch → Reevaluate`（v2.42追加）、`MinWidth`Accumulating（v2.43追加）：詳細は下記「対象外に
+/// したこと」の該当項目（取り消し線付き、実装済みに更新）参照。要約：`Mismatch`は`PendingDeadline`
+/// 満了時点でだけ判定し（段階1）、確定した不一致（`observed.Width > TargetRect.Width`）を証拠に
+/// `MinWidth`信念をDIP正規化して蓄積する。`MinWidth`を実際にPolicy/Layoutが読むところ（消費側）は
+/// まだ無い——このラウンドは信念を蓄積するところまで。
+///
 
 /// このラウンドで意図的に対象外にしたこと（いずれも「できればやる」ではなく、別の未実装の仕組みが
 /// 前提になっているため実装できない項目であり、専用のラウンドへ切り出す）：
@@ -94,19 +100,27 @@
 ///   （`PendingPresence`のRequestIdには対応するGeometryのPendingが無いため「対応するPendingが
 ///   無い＝無害に無視」されるだけで、失敗を検知しない——専用のラウンドへ切り出す、既知のギャップ）。
 /// - ~~**`Mismatch` → `Reevaluate`**~~：v2.42でOpus敵対的レビューの設計（段階1、プロジェクトオーナー
-///   確認済み）どおりに実装。`isMismatch`/`onPendingDeadlineTimerFired`、`PendingRequest.DispatchSeq`/
+///   確認済み）どおりに実装。`tryMismatchObservation`/`onPendingDeadlineTimerFired`、`PendingRequest.DispatchSeq`/
 ///   `Baseline`、`PlacementState.InFlightTargets`の各型直前のコメント参照。`PendingDeadline`満了時点
 ///   でだけ判定するため、進行中のPendingを早まって取り消す経路は構造的に無い（v2.24〜の懸念はこれで
 ///   コードの論理として塞がる）。早期（`checkPendingSatisfied`内での即時）判定は段階2として対象外の
 ///   ままにする——DPIの2段リサイズ等の多段変化が実機でどの程度の間隔で起きるかの実測（CIスパイクS5/
 ///   S11参照）が無いと、中間状態を偽陽性のMismatchと誤判定する危険が残るため（Opus敵対的レビュー
 ///   `/tmp/.../opus-review-mismatch-reevaluate.md`、段階2の節参照）。「ユーザーのドラッグ」「最小化・
-///   非表示中の除外」（同レビューの条件5・6）も、下記`MinWidth`/`DpiBehavior`のAccumulatingが実際に
-///   このMismatch証拠を消費するようになってから、消費側と合わせて設計する専用のラウンドへ持ち越す。
+///   非表示中の除外」（同レビューの条件5・6）は、下記`MinWidth`の消費実装（v2.43）に合わせて見直す
+///   機会があったが、まだ実装していない——専用のラウンドへ持ち越す。
 /// - **ユーザー操作による1回だけの試し直し**：ユーザーコマンド経由でPlacementへの新しい入口が要る
 ///   ——専用のラウンドへ切り出す。
-/// - **`MinWidth`/`DpiBehavior`（Accumulating規則）**：証拠（`SetRect`の`Mismatch`、DPI切替後の
-///   2段目観測）は収集できるようになったが、信念として蓄積する修正関数はまだ書いていない。
+/// - ~~**`MinWidth`（Accumulating規則）**~~：v2.43で実装（`reviseMinWidth`、型直前のコメント参照）。
+///   `Mismatch`（`observed.Width > TargetRect.Width`）を証拠に、観測時の窓のモニターDPIでDIPへ
+///   正規化した値を`Inferred`の最小幅とする。`DpiBehavior = RescalesItself`の2段目リサイズ待ちを
+///   除外する規則（§4.5）は、**`DpiBehavior`信念自体がまだ実装されていない**ため対象外のまま
+///   （今は証拠としてそのまま採用する、既知のギャップ）。信念自体は`MinWidth`を読む`Policy`述語
+///   （`MinWidthAtLeast`、§5.4）やLayoutの`LayoutWindow.MinWidthDip`へまだ結線していない——
+///   値を蓄積するところまでがこのラウンドの範囲で、実際に配置・分類へ反映する消費側は専用のラウンドへ
+///   持ち越す（信念が無いと配置を変えようにも読む側が無いため、まずここから）。
+/// - **`DpiBehavior`（Accumulating規則）**：証拠（DPI切替後の2段目観測）は収集できるようになったが、
+///   信念として蓄積する修正関数はまだ書いていない。
 /// - **`TargetIntegrity`のProbeOnce規則が述べる「同じProcessKeyの間は再probeしない」の明示的な検査**：
 ///   このラウンドの実装では、確定（`Believed`）した窓を再probeする経路自体が無い（`WindowObserved`が
 ///   `TargetIntegrity = None`で届いても、既に`TargetIntegrity`マップにエントリがあれば何もしない）ため、
@@ -220,7 +234,10 @@ type PlacementState =
       /// 旧Epochの`SetRect`が遅れて適用された結果の観測を、新Epochの不一致と取り違えないための除外に
       /// 使う。`dispatchPlacements`が新しいPendingで古いPendingを失効させる際にここへ移し、該当の
       /// 矩形が観測された時・窓の消滅・`TopologySettled`で消す。
-      InFlightTargets: Map<WindowId, (IntentEpoch * PixelRect) list> }
+      InFlightTargets: Map<WindowId, (IntentEpoch * PixelRect) list>
+      /// §4.5「最小幅」（Accumulating）。`Map`に無い＝まだ証拠が無い（他のAccumulating信念と同じ規約、
+      /// §4.5「`Map`に無いことを『まだ証拠が無い』の意味に使う」）。`reviseMinWidth`参照。
+      MinWidth: Map<WindowId, Belief<int>> }
 
 let initial: PlacementState =
     { Geometry = Map.empty
@@ -233,7 +250,8 @@ let initial: PlacementState =
       NextRequestId = 0L
       Epochs = Map.empty
       RetryAttempts = Map.empty
-      InFlightTargets = Map.empty }
+      InFlightTargets = Map.empty
+      MinWidth = Map.empty }
 
 /// `WmState.step`が、Placement自身のReconcile以外の理由（Focus.SwitchSettleの再要求、
 /// `MoveFocusedToWorkspace`のRequestForeground等、v2.27）で新しいRequestIdが要るときに呼ぶ最小の窓口。
@@ -521,39 +539,83 @@ let private retryOrGiveUp (now: int64) (rid: RequestId) (pr: PendingRequest) (st
 /// 「ユーザーのドラッグ」「最小化・非表示中」の除外（Opusレビューの条件5・6）は、MinWidth Accumulating
 /// （§4.5、未実装）が実際にこのMismatch証拠を消費するようになってから、その消費側と合わせて設計する
 /// 専用のラウンドへ持ち越す——今は証拠として使う消費者が無いので、取り違えても実害はまだ無い。
-let private isMismatch (pr: PendingRequest) (state: PlacementState) : bool =
+let private tryMismatchObservation (pr: PendingRequest) (state: PlacementState) : (PixelRect * int64) option =
     match pr.DispatchSeq with
-    | None -> false
+    | None -> None
     | Some dispatchSeq ->
         match Map.tryFind pr.Window state.Geometry with
-        | None -> false
+        | None -> None
         | Some g ->
             match LatestWins.value g.VisibleFrameRect, g.VisibleFrameRect.ValueSeq with
             | Some observed, Some valueSeq when valueSeq > dispatchSeq ->
                 let matchesBaseline = Some observed = pr.Baseline
                 let matchesInFlight =
                     Map.tryFind pr.Window state.InFlightTargets |> Option.defaultValue [] |> List.exists (fun (_, r) -> r = observed)
-                observed <> pr.TargetRect && not matchesBaseline && not matchesInFlight
-            | _ -> false
+                if observed <> pr.TargetRect && not matchesBaseline && not matchesInFlight then Some (observed, valueSeq) else None
+            | _ -> None
+
+/// §4.5「最小幅」（Accumulating）：`SetRect`で幅`r`を要求して幅`o > r`が観測された（`Mismatch`）ことを
+/// 証拠に、`o`を物理ピクセルからDIPへ正規化した値（`o × 96 / dpi`）を`Inferred`の最小幅とする
+/// （`MinWidth`の型直前のコメント参照）。より小さい幅が観測されたら値を下げる——最新の証拠をそのまま
+/// 採用する単純な規則とし、具体的な閾値（何回観測されたら配置に反映するか）は実機Journalでの
+/// チューニングを待つ専用のラウンドへ持ち越す（§21）。`DpiBehavior = RescalesItself`の窓がモニター間を
+/// 移った直後の2段目リサイズ待ちを除外する規則（§4.5）は、`DpiBehavior`信念自体が未実装のため対象外
+/// のまま（ファイル冒頭「対象外」参照）——今は証拠としてそのまま採用する、既知のギャップ。
+let private toDip (dpi: int) (physicalPx: int) : int = physicalPx * 96 / dpi
+
+let private reviseMinWidth (now: int64) (evidence: EvidenceRef) (observedWidthDip: int) (current: Belief<int> option) : Belief<int> =
+    match current with
+    | Some b when b.Value = observedWidthDip ->
+        // 同じ値が繰り返し観測された：「同じ結果が繰り返されれば根拠が増える」（§4.5）——
+        // 既存の根拠へ追加するだけで値は変えない。
+        match b.Confidence with
+        | Inferred refs -> { b with Confidence = Inferred (refs @ [ evidence ]); LastRevisedAt = now }
+        | _ -> { b with Confidence = Inferred [ evidence ]; LastRevisedAt = now }
+    | _ ->
+        // 値が変わった（上がる/下がる、どちらも）：最新の証拠から作り直す（§4.5「より小さい幅が
+        // 観測されたら値を下げる」——単調増加のratchetにはしない）。
+        { Value = observedWidthDip; Confidence = Inferred [ evidence ]; LastRevisedAt = now }
 
 /// `TimerElapsed (Placement (PendingDeadline rid))`：§7.2「Timeout → Retry/Backoff、上限後は配置対象外」
-/// （v2.28）に加え、v2.42で`isMismatch`を満たす場合の`Mismatch → Reevaluate`を分岐させる。
+/// （v2.28）に加え、v2.42で`tryMismatchObservation`がSomeを返す場合の`Mismatch → Reevaluate`を分岐させる（v2.43で
+/// 併せてMinWidthの証拠収集も配線した）。
 /// Reevaluate＝「アプリと戦わない」（オーナー確認済み）：Pendingを終端し`Desired`は目標のまま残す
 /// （`dispatchPlacements`の`desiredChanged`判定が同じ目標の再発行を止める、v2.41のPendingPresence版
 /// Reevaluateと同じ考え方）、Retryしない。`RetryAttempts`は次に本当に新しい意図が来たときのために
 /// クリアする。`retryOrGiveUp`とは違いDesiredを取り消さない点が非対称だが、理由が異なる——Timeoutの
 /// 諦めは「無反応で判断材料が無い」、Mismatchは「要求は届いたが決定的に拒否された」なので、後者で
 /// 同じTargetを諦めても`Desired`自体は変える理由が無い（Layoutの入力が変われば自然に新しい意図になる）。
-let onPendingDeadlineTimerFired (now: int64) (rid: RequestId) (state: PlacementState) : PlacementState * Effect list * TimerCommand<TimerId> list =
+/// `dpiOf`：不一致の窓が今いるモニターのDPIを引く読み取り専用の投影（`WmState.step`が`Topology.displays`
+/// から組み立てて渡す、`LayoutContext.Dpi`と同じ考え方——Placementは他ドメインの状態を直接読まない、
+/// ADR-018）。最小幅の証拠をDIPへ正規化するために使う（型直前のコメント参照）。窓の`Monitor`信念が
+/// 無い、または`dpiOf`がそのモニターを引けない（トポロジが変わった直後等）場合は証拠を記録しない
+/// （安全側：誤った正規化で不正確な最小幅を蓄積するより、今回分を見送る方を選ぶ）。
+let onPendingDeadlineTimerFired
+    (now: int64)
+    (rid: RequestId)
+    (dpiOf: MonitorId -> int option)
+    (state: PlacementState)
+    : PlacementState * Effect list * TimerCommand<TimerId> list =
     match Map.tryFind rid state.Pending with
     | Some pr when awaitDeadline (Some pr.Deadline) now ->
-        if isMismatch pr state then
+        match tryMismatchObservation pr state with
+        | Some (observed, valueSeq) ->
+            let minWidth' =
+                if observed.Width > pr.TargetRect.Width then
+                    match Map.tryFind pr.Window state.Geometry |> Option.bind (fun g -> LatestWins.value g.Monitor) |> Option.bind dpiOf with
+                    | Some dpi ->
+                        let observedWidthDip = toDip dpi observed.Width
+                        let evidence = Outcome (valueSeq, rid)
+                        Map.add pr.Window (reviseMinWidth now evidence observedWidthDip (Map.tryFind pr.Window state.MinWidth)) state.MinWidth
+                    | None -> state.MinWidth
+                else
+                    state.MinWidth
             { state with
                 Pending = Map.remove rid state.Pending
-                RetryAttempts = Map.remove pr.Window state.RetryAttempts },
+                RetryAttempts = Map.remove pr.Window state.RetryAttempts
+                MinWidth = minWidth' },
             [], []
-        else
-            retryOrGiveUp now rid pr state
+        | None -> retryOrGiveUp now rid pr state
     | _ -> state, [], []
 
 /// §7.2「GateRejected → Cancelled（Deadlineまで待たず同じstep内で即時に遷移する）」。
@@ -601,7 +663,7 @@ let onEffectCallReturned
     match result with
     | Ok () ->
         // `Mismatch → Reevaluate`（v2.42）：発行が実際に受け付けられた時点のSampleSequenceを記録する
-        // （`isMismatch`の条件1・2）。「受付が成功した」こと自体はSatisfiedにしない、という既存の規約
+        // （`tryMismatchObservation`の条件1・2）。「受付が成功した」こと自体はSatisfiedにしない、という既存の規約
         // は変えない（§7.2「SetRectのネイティブAPI呼出が成功しても、目標矩形を観測するまではSatisfied
         // にしない」）。
         match Map.tryFind rid state.Pending with
@@ -732,5 +794,6 @@ let onWindowVanished (w: WindowId) (state: PlacementState) : PlacementState * Ti
         PendingPresence = pendingPresenceForWindow |> List.fold (fun p rid -> Map.remove rid p) state.PendingPresence
         Epochs = Map.remove w state.Epochs
         RetryAttempts = Map.remove w state.RetryAttempts
-        InFlightTargets = Map.remove w state.InFlightTargets },
+        InFlightTargets = Map.remove w state.InFlightTargets
+        MinWidth = Map.remove w state.MinWidth },
     integrityCancel @ pendingCancel @ pendingPresenceCancel

@@ -225,6 +225,16 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     // 処理する。MinimizedStateChangedもここで配線する（Placement.fsのファイル冒頭コメント参照）。
     // `effectCallFailure`は`EffectCallReturned`が`TargetHung`と判定した場合に、Health側の
     // Responsiveness修正（Placementの管轄外）へ渡すための情報（下記）。
+    // `dpiOf`（v2.43）：窓のMonitor信念からDPIを引く読み取り専用の投影。`Placement.onPendingDeadlineTimerFired`
+    // がMinWidthの証拠をDIPへ正規化するために使う（Placementは他ドメインの状態を直接読まない、ADR-018。
+    // `reconcileOneScreen`が`LayoutContext.Dpi`を`screen.Monitor.Dpi`から組み立てるのと同じ考え方）。
+    // この入力（`TimerElapsed (Placement (PendingDeadline _))`）はTopologyを更新しないので、まだこの
+    // stepのTopology更新（下記、段②）を経ていない`state.Topology`（関数引数そのもの）を読んでよい。
+    let dpiOf (m: MonitorId) : int option =
+        match Topology.displays state.Topology with
+        | NoMonitors -> None
+        | Displays (current, visible) -> (current :: visible) |> List.tryFind (fun sc -> sc.Monitor.Id = m) |> Option.map (fun sc -> sc.Monitor.Dpi)
+
     let placementState', placementEffects, placementTimerCmds, effectCallFailure =
         match envelope.Input with
         | WindowObserved snapshot ->
@@ -235,7 +245,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             let s, e, t = Placement.onIntegrityReprobeTimerFired now w stateAfterWindows.Placement
             s, e, t, None
         | TimerElapsed (TimerId.Placement (PendingDeadline rid)) ->
-            let s, e, t = Placement.onPendingDeadlineTimerFired now rid stateAfterWindows.Placement
+            let s, e, t = Placement.onPendingDeadlineTimerFired now rid dpiOf stateAfterWindows.Placement
             s, e, t, None
         | TimerElapsed (TimerId.Placement (PresenceDeadline rid)) ->
             let s, t = Placement.onPresenceDeadlineTimerFired now rid stateAfterWindows.Placement
