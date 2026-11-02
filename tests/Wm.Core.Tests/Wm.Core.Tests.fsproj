@@ -12,6 +12,7 @@
     <Compile Include="FocusInvariantTests.fs" />
     <Compile Include="WmStateFocusTests.fs" />
     <Compile Include="CrossDomainInvariantTests.fs" />
+    <Compile Include="GatedEffectTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
