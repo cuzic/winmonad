@@ -335,6 +335,29 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
                     { s with Placement = placementSt' }, effects @ [ RequestForeground (rid, z.Focus) ])
             (stateAfterMovability, [])
 
+    // `UserCommand FocusNext`/`FocusPrevious`（§4.4「アクティブなWorkspaceのzipperを回す」、v2.33）：
+    // `WorkspaceSet.rotateNext`/`rotatePrevious`は既にTiled/Floating両方を巡回する意味で実装済み
+    // （Floatingだけを外すフィルタはしない）。`focused`が`Elsewhere`でも、このzipper自身の`Focus`を
+    // 基準に次/前へ移る（`focused`の値を経由しない——zipperが唯一の基準）。ユーザーが最小化した窓を
+    // 巡回から外す規則（R7-5、`ObservedPresence`の信念が必要）はまだ対象外：FocusドメインはPlacementの
+    // 信念を読む経路を持っていないため、専用のラウンドへ切り出す。回転後の新しいFocusへ一度だけ
+    // RequestForegroundする。
+    let stateAfterMovability, focusRotateEffects =
+        match envelope.Input, activeWorkspace stateAfterMovability with
+        | UserCommand FocusNext, Some ws | UserCommand FocusPrevious, Some ws ->
+            let rotate = match envelope.Input with UserCommand FocusNext -> WorkspaceSet.rotateNext | _ -> WorkspaceSet.rotatePrevious
+            let oldFocus = (WorkspaceSet.stateOf ws stateAfterMovability.Workspaces).Stack |> Option.map (fun z -> z.Focus)
+            let workspaces' = rotate ws stateAfterMovability.Workspaces
+            match (WorkspaceSet.stateOf ws workspaces').Stack with
+            | Some z when Some z.Focus <> oldFocus ->
+                // 窓が1つしかない等で回転してもFocusが変わらない場合は、無意味なRequestForegroundを
+                // 発行しない（既にフォアグラウンドのはずの窓へ再要求しても害は無いはずだが、
+                // 変化が無い入力には何もしないのがこのstepの他の反応と一貫する）。
+                let rid, placementSt' = Placement.allocateRequestId stateAfterMovability.Placement
+                { stateAfterMovability with Workspaces = workspaces'; Placement = placementSt' }, [ RequestForeground (rid, z.Focus) ]
+            | _ -> { stateAfterMovability with Workspaces = workspaces' }, []
+        | _ -> stateAfterMovability, []
+
     // Health：ResponsivenessReprobeタイマーの発火と、PlacementのEffectCallReturned処理が`TargetHung`と
     // 判定した場合のResponsiveness修正（§7.2「EffectCallReturned(Error) → classify → TargetHung →
     // Cancelled ＋ Responsiveness:=Hung」。この信念修正自体はHealthの管轄なのでPlacement.fsではなく
@@ -461,7 +484,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
           HiddenByWm = Set.empty
           NeedsRestore = Set.empty }
 
-    let gated, rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects @ switchForegroundEffects)
+    let gated, rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects @ switchForegroundEffects @ focusRotateEffects)
 
     // §7.2「GateRejected → Cancelled（Deadlineまで待たず同じstep内で即時に遷移する）」。
     let rejectedRequestIds = rejected |> List.choose fst

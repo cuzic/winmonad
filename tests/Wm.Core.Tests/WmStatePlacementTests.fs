@@ -360,6 +360,48 @@ let ``SwitchWorkspaceでhiddenなWorkspaceへ切り替えると、新しくcurre
     Assert.Contains(effects, function RequestForeground (_, target) -> target = w2 | _ -> false)
 
 [<Fact>]
+let ``FocusNext/FocusPreviousはアクティブなWorkspaceのzipperを回し、新しいFocusへRequestForegroundする(v2.33)`` () =
+    // 3窓にする——2窓だと「次」と「前」が同じ結果になり、方向を取り違えるmutationを区別できない
+    // （最初のmutation testingの試行で実際に踏んだ）。
+    let w1, w2, w3 = WindowId 1L, WindowId 2L, WindowId 3L
+    let afterW1 = settleOneMonitorThenDiscoverWindow w1
+    let afterW2 = step RuntimePolicy.defaults afterW1.Next (mkEnvelope 101L (visibleWindowObserved w2))
+    let afterW3 = step RuntimePolicy.defaults afterW2.Next (mkEnvelope 102L (visibleWindowObserved w3))
+    let ws0 = WorkspaceSet.workspaceOf w1 afterW3.Next.Workspaces |> Option.get
+    match (WorkspaceSet.stateOf ws0 afterW3.Next.Workspaces).Stack with
+    | Some z -> Assert.Equal(w1, z.Focus) // 新規windowの追加はFocusを動かさない（Stack = [w1(Focus); w2; w3]）
+    | None -> Assert.True(false, "expected a non-empty stack")
+
+    let afterNext = step RuntimePolicy.defaults afterW3.Next (mkEnvelope 103L (UserCommand FocusNext))
+    match (WorkspaceSet.stateOf ws0 afterNext.Next.Workspaces).Stack with
+    | Some z -> Assert.Equal(w2, z.Focus) // w1 → w2（Afterの先頭）
+    | None -> Assert.True(false, "expected a non-empty stack")
+    let nextEffects = afterNext.Effects |> List.map GatedEffect.effect
+    Assert.Contains(nextEffects, function RequestForeground (_, target) -> target = w2 | _ -> false)
+
+    let afterPrevious = step RuntimePolicy.defaults afterNext.Next (mkEnvelope 104L (UserCommand FocusPrevious))
+    match (WorkspaceSet.stateOf ws0 afterPrevious.Next.Workspaces).Stack with
+    | Some z -> Assert.Equal(w1, z.Focus) // w2 → w1（Beforeの先頭。w3へではない——方向の確認）
+    | None -> Assert.True(false, "expected a non-empty stack")
+    let previousEffects = afterPrevious.Effects |> List.map GatedEffect.effect
+    Assert.Contains(previousEffects, function RequestForeground (_, target) -> target = w1 | _ -> false)
+
+[<Fact>]
+let ``FocusNextは窓が1つしか無くFocusが変わらない場合、無意味なRequestForegroundを発行しない(v2.33)`` () =
+    let w1 = WindowId 1L
+    let afterW1 = settleOneMonitorThenDiscoverWindow w1
+    let afterNext = step RuntimePolicy.defaults afterW1.Next (mkEnvelope 102L (UserCommand FocusNext))
+    let effects = afterNext.Effects |> List.map GatedEffect.effect
+    Assert.DoesNotContain(effects, function RequestForeground _ -> true | _ -> false)
+
+[<Fact>]
+let ``FocusNextはアクティブなモニターが無い(NoMonitors)場合、何もしない`` () =
+    let state = initial RuntimePolicy.defaults
+    let afterNext = step RuntimePolicy.defaults state (mkEnvelope 1L (UserCommand FocusNext))
+    Assert.Equal(WorkspaceSet.empty, afterNext.Next.Workspaces)
+    Assert.Empty(afterNext.Effects)
+
+[<Fact>]
 let ``WindowRemovedは同じstepでPlacement.Geometryも除く`` () =
     let state = initial RuntimePolicy.defaults
     let obs: Observation<bool> = { Value = Ok true; SampleSequence = 1L; MonotonicTime = 1L; Source = "test" }
