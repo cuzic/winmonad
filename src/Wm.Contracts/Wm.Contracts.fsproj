@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <!-- Wm.Contractsは外部パッケージ依存を持たない（architecture.md §17「依存の例外」） -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="AssemblyInfo.fs" />
+    <Compile Include="Identifiers.fs" />
+    <Compile Include="ErrorTypes.fs" />
+    <Compile Include="Observation.fs" />
+    <Compile Include="Beliefs.fs" />
+    <Compile Include="SharedVocabulary.fs" />
+    <Compile Include="Timers.fs" />
+    <Compile Include="CoreCommand.fs" />
+    <Compile Include="GatedEffect.fs" />
+    <Compile Include="JournalTypes.fs" />
+    <Compile Include="Dto.fs" />
+  </ItemGroup>
+
+</Project>
