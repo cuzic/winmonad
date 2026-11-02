@@ -286,6 +286,18 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     let topologyState', topologyResponse, topologyEvents, traces =
         Topology.update runtimePolicy.Topology now envelope.Input stateAfterMovability.Topology
 
+    // `TopologySettled`（Opusレビュー5-3、v2.29で配線）：モニター構成が確定したので、古い配置に基づく
+    // 全Pendingを`Superseded`として一括で取り消す（`Placement.onTopologySettled`のコメント参照）。
+    // 取り消した代わりを同じstepで必ず発行させるため、`shouldReconcile`（下記）もこのイベントで
+    // 真にする——そうしないと取り消しただけで何も再配置されない空白が生まれる。
+    let topologySettled = topologyEvents |> List.exists (function TopologySettled _ -> true | _ -> false)
+    let stateAfterMovability, topologySettledTimerCmds =
+        if topologySettled then
+            let placementSt', cmds = Placement.onTopologySettled stateAfterMovability.Placement
+            { stateAfterMovability with Placement = placementSt' }, cmds
+        else
+            stateAfterMovability, []
+
     // Health：ResponsivenessReprobeタイマーの発火と、PlacementのEffectCallReturned処理が`TargetHung`と
     // 判定した場合のResponsiveness修正（§7.2「EffectCallReturned(Error) → classify → TargetHung →
     // Cancelled ＋ Responsiveness:=Hung」。この信念修正自体はHealthの管轄なのでPlacement.fsではなく
@@ -337,16 +349,17 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         |> Seq.choose (fun (w, r) -> match r.Classification with Classified (eff, _) -> Some (w, eff) | _ -> None)
         |> Map.ofSeq
 
-    // 段⑦相当（Placement、Reconcile）：WindowClassified/WindowUnmanaged（windowsEvents）かWindowRemovedで
-    // Workspaceの構成が変わった可能性がある場合に限り、現在表示されている全てのWorkspace（アクティブな
-    // ものだけでなく、他モニターに表示中の可視Workspaceも含む）を順にReconcileする（v2.26。
-    // Placement.fsのファイル冒頭「対象外」が挙げていた2項目のうち「複数の可視Workspaceへの拡張」を
-    // 閉じた。「WorkspaceShown/Hidden経由のReconcileトリガー」はまだ無い——`shouldReconcile`は依然
-    // windowsEvents/WindowRemovedだけが引き金で、あるWorkspaceが新たに表示された（モニター接続等）
-    // だけではReconcileされない）。
+    // 段⑦相当（Placement、Reconcile）：WindowClassified/WindowUnmanaged（windowsEvents）・WindowRemoved・
+    // TopologySettled（v2.29。上で一括取り消したPendingの代わりを同じstepで発行する必要があるため）の
+    // いずれかでWorkspaceの構成が変わった可能性がある場合に限り、現在表示されている全てのWorkspace
+    // （アクティブなものだけでなく、他モニターに表示中の可視Workspaceも含む）を順にReconcileする
+    // （v2.26。Placement.fsのファイル冒頭「対象外」が挙げていた2項目のうち「複数の可視Workspaceへの
+    // 拡張」を閉じた）。「WorkspaceShown/Hidden経由のReconcileトリガー」はまだ無い——`SwitchWorkspace`
+    // 自体が未配線のため、個々のWorkspaceの表示/非表示だけでの引き金はまだ無い。
     let shouldReconcile =
         not (List.isEmpty windowsEvents)
         || (match envelope.Input with WindowRemoved _ -> true | _ -> false)
+        || topologySettled
 
     let reconcileOneScreen (placementSt: PlacementState, effects, cmds) (screen: Screen) =
         let wsState = WorkspaceSet.stateOf screen.Workspace next.Workspaces
@@ -418,8 +431,10 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     let placementAfterGateRejection, gateRejectionTimerCmds = Placement.onGateRejected rejectedRequestIds next.Placement
     let finalNext = { next with Placement = placementAfterGateRejection }
 
-    // 段①・段②のDomainEventは、消費する後続の段（Topologyの`current`追従等）がまだ無いため捨てる
-    // （Opusレビュー5-3。段⑦自体はPlacementのReconcileとして配線済みになった）。
+    // 段①のDomainEventは、消費する後続の段（Topologyの`current`追従等）がまだ無いため捨てる
+    // （Opusレビュー5-3）。段②のDomainEventのうち`TopologySettled`はv2.29で消費するようになった
+    // （上記）。`WorkspaceShown`/`WorkspaceHidden`/`CurrentChanged`は`SwitchWorkspace`自体が未配線の
+    // ため依然捨てる。
     ignore stage1Events
     ignore topologyEvents
 
@@ -432,6 +447,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         @ windowsTimerCmds
         @ vanishTimerCmds
         @ placementTimerCmds
+        @ topologySettledTimerCmds
         @ reconcileTimerCmds
         @ gateRejectionTimerCmds
       Trace = traces }

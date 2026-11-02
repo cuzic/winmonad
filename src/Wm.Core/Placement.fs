@@ -44,6 +44,12 @@
 /// （`Denied`系はおそらく再試行しても無駄、`TargetHung`はHealthの管轄、等）、根拠の無い当てはめを
 /// 避けるため。
 ///
+/// `TopologySettled` → `Superseded`（v2.29追加）：`onTopologySettled`が、モニター構成が確定した
+/// （§7.3のScreenSettle→Grace）瞬間に既存の全Pendingを観測を待たず`CancelTimer`付きで一括取り消す
+/// （古いモニター配置に基づく目標なので当てにできない）。呼び出し側（`WmState.step`）が同じstepで
+/// 必ずReconcileも走らせる（`shouldReconcile`を拡張した）ので、取り消した代わりが即座に発行し直される
+/// （窓のモニターが変わらなければ`dispatchPlacements`のdesiredChanged判定により無駄な再発行はしない）。
+///
 
 /// このラウンドで意図的に対象外にしたこと（いずれも「できればやる」ではなく、別の未実装の仕組みが
 /// 前提になっているため実装できない項目であり、専用のラウンドへ切り出す）：
@@ -59,8 +65,6 @@
 ///   観測の鮮度判定が無いこのラウンドでは安全に区別できない）。安全側に倒して対象外のままにする。
 /// - **ユーザー操作による1回だけの試し直し**：ユーザーコマンド経由でPlacementへの新しい入口が要る
 ///   ——専用のラウンドへ切り出す。
-/// - **トポロジ確定（ScreenSettle満了）→`Superseded`**：`Topology`が出す`TopologySettled`
-///   DomainEventはまだ`step`で捨てられている（Opusレビュー5-3）。配線すればPendingの一括失効も書ける。
 /// - **`MinWidth`/`DpiBehavior`（Accumulating規則）**：証拠（`SetRect`の`Mismatch`、DPI切替後の
 ///   2段目観測）は収集できるようになったが、信念として蓄積する修正関数はまだ書いていない。
 /// - **`TargetIntegrity`のProbeOnce規則が述べる「同じProcessKeyの間は再probeしない」の明示的な検査**：
@@ -443,6 +447,22 @@ let onEffectCallReturned
                             Map.add pr.Window { Value = NotMovable; Confidence = Inferred [ Outcome (evidenceSequence, rid) ]; LastRevisedAt = now } cancelled.Movability }
                 | _ -> cancelled
             state', Some (pr.Window, failure)
+
+/// `DomainEvents.TopologySettled`（§7.3のScreenSettle→Grace。モニター構成が確定した）：既存の全Pendingは
+/// 古いモニター配置に基づく目標なので、観測を待たず即座に`Superseded`（Cancelled）にする（§7.2
+/// 「TopologySettled → Superseded」）。`Desired`はあえて取り消さない——新しい配置でも偶然同じ座標に
+/// なる窓があれば、`dispatchPlacements`の`desiredChanged`判定が無駄なSetRectの再発行を防ぐ。
+/// 呼び出し側（`WmState.step`）は、この呼び出しと同じstepで必ずReconcileも走らせる責務を負う
+/// （そうしないと、ここで取り消したPendingの代わりが二度と発行されない。呼び出し側のコメント参照）。
+/// どの窓のPendingも、変わったモニターに属するかに関わらず一律で取り消す簡略化（個々のPendingが
+/// 実際に影響を受けたかを判定する根拠が今は無いため、安全側に広く取り消す）。
+let onTopologySettled (state: PlacementState) : PlacementState * TimerCommand<TimerId> list =
+    let cancelCmds = state.Pending |> Map.toSeq |> Seq.map (fun (rid, _) -> CancelTimer (TimerId.Placement (PendingDeadline rid))) |> List.ofSeq
+    let affectedWindows = state.Pending |> Map.toSeq |> Seq.map (fun (_, pr) -> pr.Window) |> Set.ofSeq
+    { state with
+        Pending = Map.empty
+        RetryAttempts = affectedWindows |> Set.fold (fun m w -> Map.remove w m) state.RetryAttempts },
+    cancelCmds
 
 /// 窓の消滅時、`Geometry`/`Movability`/`TargetIntegrity`/`IntegrityReprobes`/`Desired`/`Pending`/`Epochs`
 /// を除く（§4.4「各ドメインの信念は窓が消滅した時点でのみ除去する」）。動いている再probeタイマーと、

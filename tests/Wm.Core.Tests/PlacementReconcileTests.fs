@@ -216,6 +216,26 @@ let ``古い発火(期限未到達)のPendingDeadlineは無視する`` () =
     Assert.Empty(effects)
     Assert.Empty(timerCmds)
 
+// ===== TopologySettled → Superseded（§7.2、v2.29） =====
+
+[<Fact>]
+let ``onTopologySettledは全PendingをCancelTimer付きで取り消し、RetryAttemptsも消す`` () =
+    let w1, w2 = WindowId 1L, WindowId 2L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w1 ]) (managementOf [ w1 ]) (aliveOf [ w1 ]) initial
+    let rid1 = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
+    let afterRetry, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid1 afterReconcile
+    Assert.Equal(Some 1, Map.tryFind w1 afterRetry.RetryAttempts)
+
+    let afterSecondWindow, _, _ = reconcileWorkspace 20L registry (masterStackRef 0.5m) (ctxWith [ w1; w2 ]) (managementOf [ w1; w2 ]) (aliveOf [ w1; w2 ]) afterRetry
+    Assert.Equal(2, Map.count afterSecondWindow.Pending)
+    let expectedCancelCmds =
+        afterSecondWindow.Pending |> Map.toSeq |> Seq.map (fun (rid, _) -> CancelTimer (TimerId.Placement (PendingDeadline rid))) |> List.ofSeq |> List.sort
+
+    let afterSettled, cancelCmds = onTopologySettled afterSecondWindow
+    Assert.Empty(afterSettled.Pending)
+    Assert.Equal(None, Map.tryFind w1 afterSettled.RetryAttempts)
+    Assert.Equal<TimerCommand<TimerId> list>(expectedCancelCmds, cancelCmds |> List.sort)
+
 // ===== GateRejected（§7.2） =====
 
 [<Fact>]

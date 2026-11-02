@@ -10,6 +10,7 @@ open Wm.Contracts.Beliefs
 open Wm.Contracts.SharedVocabulary
 open Wm.Contracts.GatedEffect
 open Wm.Contracts.CoreCommand
+open Wm.Contracts.Timers
 open Wm.Core.Topology
 open Wm.Core.Workspaces
 open Wm.Core.Windows
@@ -216,6 +217,52 @@ let ``MoveFocusedToWorkspaceは、フォーカスが無い(Elsewhere)なら何�
     let seeded = initial RuntimePolicy.defaults
     let afterMove = step RuntimePolicy.defaults seeded (mkEnvelope 1L (UserCommand (MoveFocusedToWorkspace (WorkspaceId 7))))
     Assert.Equal(WorkspaceSet.empty, afterMove.Next.Workspaces)
+
+let private settleTwoMonitors (afterFirstWindow: StepResult) (monitor1: MonitorSnapshot) (now: int64) : StepResult =
+    let settleMs = TopologyConfig.defaults.SettleMs
+    let afterMonitors = step RuntimePolicy.defaults afterFirstWindow.Next (mkEnvelope now (MonitorTopologyObserved [ mkMonitor 0; monitor1 ]))
+    step RuntimePolicy.defaults afterMonitors.Next (mkEnvelope (now + settleMs) (TimerElapsed (TimerId.Topology ScreenSettle)))
+
+let private settleOneMonitorThenDiscoverWindow (w: WindowId) : StepResult =
+    let settleMs = TopologyConfig.defaults.SettleMs
+    let afterMonitor0 = step RuntimePolicy.defaults (initial RuntimePolicy.defaults) (mkEnvelope 1L (MonitorTopologyObserved [ mkMonitor 0 ]))
+    let afterSettle0 = step RuntimePolicy.defaults afterMonitor0.Next (mkEnvelope (1L + settleMs) (TimerElapsed (TimerId.Topology ScreenSettle)))
+    match displays afterSettle0.Next.Topology with
+    | Displays _ -> ()
+    | NoMonitors -> failwith "expected the first monitor to settle"
+    step RuntimePolicy.defaults afterSettle0.Next (mkEnvelope 100L (visibleWindowObserved w))
+
+[<Fact>]
+let ``TopologySettledは、窓のモニターが変わらない場合は古いPendingを取り消すだけで新しいPendingを作らない(v2.29)`` () =
+    let w = WindowId 1L
+    let afterW = settleOneMonitorThenDiscoverWindow w
+    Assert.Equal(1, Map.count afterW.Next.Placement.Pending)
+    let targetBefore = Map.tryFind w afterW.Next.Placement.Desired
+
+    // 2台目のモニターが現れるが、wのモニター（monitor0）自体の構成は変わらない——Reconcileが計算し
+    // 直す目標も前回と同じなので、dispatchPlacementsのdesiredChanged判定により再発行の必要が無い
+    // （Supersededにした意味はあった：古いPendingが指す観測待ちは、もう当てにできないため取り消す）。
+    let afterSettle1 = settleTwoMonitors afterW (mkMonitor 1) 200L
+    Assert.Empty(afterSettle1.Next.Placement.Pending) // 古いridは消え、新しいridも作られない
+    Assert.Equal(targetBefore, Map.tryFind w afterSettle1.Next.Placement.Desired)
+    Assert.Equal(None, Map.tryFind w afterSettle1.Next.Placement.RetryAttempts)
+
+[<Fact>]
+let ``TopologySettledは、窓のモニターの配置が変わった場合は新しい目標でPendingを発行し直す(v2.29)`` () =
+    let w = WindowId 1L
+    let afterW = settleOneMonitorThenDiscoverWindow w
+    let rid0 = afterW.Next.Placement.Pending |> Map.toSeq |> Seq.head |> fst
+
+    // monitor0の解像度/WorkAreaが変わった（モニター自体は同じId、構成の変化としてSettlingへ入る）。
+    let resizedMonitor0 = { mkMonitor 0 with Bounds = { X = 0; Y = 0; Width = 1280; Height = 720 }; WorkArea = { X = 0; Y = 0; Width = 1280; Height = 720 } }
+    let afterMonitorResized = step RuntimePolicy.defaults afterW.Next (mkEnvelope 200L (MonitorTopologyObserved [ resizedMonitor0 ]))
+    let afterSettle1 =
+        step RuntimePolicy.defaults afterMonitorResized.Next (mkEnvelope (200L + TopologyConfig.defaults.SettleMs) (TimerElapsed (TimerId.Topology ScreenSettle)))
+
+    Assert.Equal(1, Map.count afterSettle1.Next.Placement.Pending)
+    let rid1 = afterSettle1.Next.Placement.Pending |> Map.toSeq |> Seq.head |> fst
+    Assert.NotEqual(rid0, rid1)
+    Assert.Equal(Some (Shown (Some resizedMonitor0.WorkArea)), Map.tryFind w afterSettle1.Next.Placement.Desired)
 
 [<Fact>]
 let ``WindowRemovedは同じstepでPlacement.Geometryも除く`` () =

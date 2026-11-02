@@ -1,5 +1,16 @@
 # Windows プログラマブル・ウィンドウマネージャー 統合設計書
 
+Version: 2.29（§7.2「TopologySettled → Superseded」を実装した。`Topology`が出す`TopologySettled`
+DomainEventをこれまで`WmState.step`が捨てていた（Opusレビュー5-3）のをやめ、`Placement.onTopologySettled`
+を呼ぶようになった：既存の全Pendingは古いモニター配置に基づく目標なので、観測を待たず即座に
+`CancelTimer`付きで一括取り消す（`Desired`はあえて残す）。これだけでは取り消した代わりが二度と
+発行されない空白ができるため、`shouldReconcile`（段⑦の引き金）も`TopologySettled`で真になるよう
+拡張した——同じstepのReconcileが新しいモニター配置で目標を計算し直し、窓のモニターが変わらなければ
+`dispatchPlacements`のdesiredChanged判定により何もしない（偶然同じ座標になる場合に無駄な再発行を
+しない）。`RetryAttempts`も同時にリセットする。Backoffと同様、個々のPendingが実際に影響を受けたかを
+判定する根拠が無いため、モニターが変わったかに関わらず一律で全Pendingを取り消す簡略化。
+`onEffectCallReturned`側のRetryと同じ理由で、`WorkspaceShown`/`WorkspaceHidden`/`CurrentChanged`
+（`SwitchWorkspace`自体が未配線）は依然捨てたままにする。
 Version: 2.28（§7.2「Timeout → Retry/Backoff」のうちRetry部分を実装した。`onPendingDeadlineTimerFired`
 が、上限（既定3回、`pendingRetryMaxAttempts`）に達するまで、同じ`TargetRect`/`Epoch`へ新しい
 `RequestId`で`SetRect`を即座に再発行し新しい`PendingDeadline`を始動する。Backoff（試行間隔を指数的に
@@ -85,7 +96,9 @@ Version: 2.23（v2.22で見つけ記録した既知のギャップ（`Denied Oth
 `MoveFocusedToWorkspace`を配線し、Focus/Workspaces発のEffectが安全にRequestIdを発行できる
 `Placement.allocateRequestId`という単一の共有採番元を新設した（v2.27）／§7.2の`Timeout → Retry`を
 実装し、`PendingDeadline`満了を上限回数まで同じTargetへの即座の再試行として扱うようにした
-（Backoffは実測値が無いため依然対象外）（v2.28）
+（Backoffは実測値が無いため依然対象外）（v2.28）／§7.2の`TopologySettled → Superseded`を実装し、
+`WmState.step`が捨てていた`TopologySettled`DomainEventを初めて消費するようになった。`shouldReconcile`
+も拡張し、取り消した代わりが同じstepで発行し直されるようにした（v2.29）
 Version: 2.22（Wm.Simulationが`EffectCallReturned`を実際に返せるようになったので（v2.21）、
 `InputEvent.EffectCallReturned`をPlacement/Healthへ配線した。`Placement.onEffectCallReturned`は
 `Ok ()`では何もせず（§7.2「目標矩形を観測するまではSatisfiedにしない」）、`Error`は`classify`で
