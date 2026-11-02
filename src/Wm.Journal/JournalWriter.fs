@@ -9,6 +9,8 @@ open System.IO
 open System.Text.Json.Nodes
 open Wm.Contracts.Identifiers
 open Wm.Contracts.ErrorTypes
+open Wm.Contracts.Observation
+open Wm.Contracts.SharedVocabulary
 open Wm.Contracts.Timers
 open Wm.Contracts.CoreCommand
 open Wm.Contracts.JournalTypes
@@ -20,21 +22,21 @@ open Wm.Contracts.JournalTypes
 
 let private timerIdTag (id: TimerId) : string =
     match id with
-    | Placement (PendingDeadline _) -> "placement-pending-deadline"
-    | Placement (IntegrityReprobe _) -> "placement-integrity-reprobe"
-    | Windows (ClassificationDeadline _) -> "windows-classification-deadline"
-    | Topology ScreenSettle -> "topology-screen-settle"
-    | Topology ScreenGrace -> "topology-screen-grace"
-    | Topology ReconfigurationCap -> "topology-reconfiguration-cap"
-    | Focus WorkspaceSwitchSettle -> "focus-workspace-switch-settle"
-    | Health (ResponsivenessReprobe _) -> "health-responsiveness-reprobe"
+    | TimerId.Placement (PendingDeadline _) -> "placement-pending-deadline"
+    | TimerId.Placement (IntegrityReprobe _) -> "placement-integrity-reprobe"
+    | TimerId.Windows (ClassificationDeadline _) -> "windows-classification-deadline"
+    | TimerId.Topology ScreenSettle -> "topology-screen-settle"
+    | TimerId.Topology ScreenGrace -> "topology-screen-grace"
+    | TimerId.Topology ReconfigurationCap -> "topology-reconfiguration-cap"
+    | TimerId.Focus WorkspaceSwitchSettle -> "focus-workspace-switch-settle"
+    | TimerId.Health (ResponsivenessReprobe _) -> "health-responsiveness-reprobe"
 
 let private windowIdOf (id: TimerId) : JsonNode option =
     match id with
-    | Placement (PendingDeadline (RequestId rid)) -> Some (JsonValue.Create(rid) :> JsonNode)
-    | Placement (IntegrityReprobe (WindowId w))
-    | Windows (ClassificationDeadline (WindowId w))
-    | Health (ResponsivenessReprobe (WindowId w)) -> Some (JsonValue.Create(w) :> JsonNode)
+    | TimerId.Placement (PendingDeadline (RequestId rid)) -> Some (JsonValue.Create(rid) :> JsonNode)
+    | TimerId.Placement (IntegrityReprobe (WindowId w))
+    | TimerId.Windows (ClassificationDeadline (WindowId w))
+    | TimerId.Health (ResponsivenessReprobe (WindowId w)) -> Some (JsonValue.Create(w) :> JsonNode)
     | _ -> None
 
 let private timerIdToJson (id: TimerId) : JsonNode =
@@ -49,14 +51,14 @@ let private timerIdOfJson (node: JsonNode) : TimerId =
     let tag = node.["tag"].GetValue<string>()
     let refVal () = node.["ref"].GetValue<int64>()
     match tag with
-    | "placement-pending-deadline" -> Placement (PendingDeadline (RequestId (refVal ())))
-    | "placement-integrity-reprobe" -> Placement (IntegrityReprobe (WindowId (refVal ())))
-    | "windows-classification-deadline" -> Windows (ClassificationDeadline (WindowId (refVal ())))
-    | "topology-screen-settle" -> Topology ScreenSettle
-    | "topology-screen-grace" -> Topology ScreenGrace
-    | "topology-reconfiguration-cap" -> Topology ReconfigurationCap
-    | "focus-workspace-switch-settle" -> Focus WorkspaceSwitchSettle
-    | "health-responsiveness-reprobe" -> Health (ResponsivenessReprobe (WindowId (refVal ())))
+    | "placement-pending-deadline" -> TimerId.Placement (PendingDeadline (RequestId (refVal ())))
+    | "placement-integrity-reprobe" -> TimerId.Placement (IntegrityReprobe (WindowId (refVal ())))
+    | "windows-classification-deadline" -> TimerId.Windows (ClassificationDeadline (WindowId (refVal ())))
+    | "topology-screen-settle" -> TimerId.Topology ScreenSettle
+    | "topology-screen-grace" -> TimerId.Topology ScreenGrace
+    | "topology-reconfiguration-cap" -> TimerId.Topology ReconfigurationCap
+    | "focus-workspace-switch-settle" -> TimerId.Focus WorkspaceSwitchSettle
+    | "health-responsiveness-reprobe" -> TimerId.Health (ResponsivenessReprobe (WindowId (refVal ())))
     | other -> failwithf "Replay: unrecognized TimerId tag '%s' — このJournalはより新しいスキーマで書かれている" other
 
 let private pixelRectToJson (r: PixelRect) : JsonNode =
@@ -92,7 +94,172 @@ let private monitorSnapshotOfJson (node: JsonNode) : MonitorSnapshot =
       Dpi = node.["dpi"].GetValue<int>()
       IsPrimary = node.["isPrimary"].GetValue<bool>() }
 
-/// このスライスで対応するInputEventのタグ（§9.2のDTOタグ付け規約）。
+let private errorSpaceToJson (space: ErrorSpace) : string =
+    match space with
+    | Win32LastError -> "win32-last-error"
+    | HResult -> "hresult"
+    | BoolFalseNoCode -> "bool-false-no-code"
+
+let private errorSpaceOfJson (tag: string) : ErrorSpace =
+    match tag with
+    | "win32-last-error" -> Win32LastError
+    | "hresult" -> HResult
+    | "bool-false-no-code" -> BoolFalseNoCode
+    | other -> failwithf "Replay: unrecognized ErrorSpace tag '%s'" other
+
+let private nativeCallRecordToJson (r: NativeCallRecord) : JsonNode =
+    let o = JsonObject()
+    o.["api"] <- JsonValue.Create(r.Api)
+    o.["space"] <- JsonValue.Create(errorSpaceToJson r.Space)
+    o.["code"] <- JsonValue.Create(r.Code)
+    o.["elapsedUs"] <- JsonValue.Create(r.ElapsedUs)
+    o :> JsonNode
+
+let private nativeCallRecordOfJson (node: JsonNode) : NativeCallRecord =
+    { Api = node.["api"].GetValue<string>()
+      Space = errorSpaceOfJson (node.["space"].GetValue<string>())
+      Code = node.["code"].GetValue<int>()
+      ElapsedUs = node.["elapsedUs"].GetValue<int64>() }
+
+let private windowIdOptionToJson (w: WindowId option) : JsonNode =
+    match w with
+    | Some (WindowId v) -> JsonValue.Create(v) :> JsonNode
+    | None -> null
+
+let private windowIdOptionOfJson (node: JsonNode) : WindowId option =
+    if isNull node then None else Some (WindowId (node.GetValue<int64>()))
+
+/// `ForegroundObserved`が運ぶ`Observation<WindowId option>`のDTO（§4.2。Observation<'T>は`'T`ごとに
+/// 個別の符号化が要る——このスライスで実際に必要なのはこの1つだけなので、汎用の符号化基盤は作らない）。
+let private observationWindowIdOptionToJson (obs: Observation<WindowId option>) : JsonNode =
+    let o = JsonObject()
+    o.["sampleSequence"] <- JsonValue.Create(obs.SampleSequence)
+    o.["monotonicTime"] <- JsonValue.Create(obs.MonotonicTime)
+    o.["source"] <- JsonValue.Create(obs.Source)
+    match obs.Value with
+    | Ok w ->
+        o.["outcome"] <- JsonValue.Create("ok")
+        o.["value"] <- windowIdOptionToJson w
+    | Error rec_ ->
+        o.["outcome"] <- JsonValue.Create("failed")
+        o.["failure"] <- nativeCallRecordToJson rec_
+    o :> JsonNode
+
+let private observationWindowIdOptionOfJson (node: JsonNode) : Observation<WindowId option> =
+    let value =
+        match node.["outcome"].GetValue<string>() with
+        | "ok" -> Ok (windowIdOptionOfJson node.["value"])
+        | "failed" -> Error (nativeCallRecordOfJson node.["failure"])
+        | other -> failwithf "Replay: unrecognized Observation outcome '%s'" other
+    { Value = value
+      SampleSequence = node.["sampleSequence"].GetValue<int64>()
+      MonotonicTime = node.["monotonicTime"].GetValue<int64>()
+      Source = node.["source"].GetValue<string>() }
+
+let private managementToJson (m: Management) : string =
+    match m with
+    | Tiled -> "tiled"
+    | Floating -> "floating"
+    | Excluded -> "excluded"
+
+let private managementOfJson (tag: string) : Management =
+    match tag with
+    | "tiled" -> Tiled
+    | "floating" -> Floating
+    | "excluded" -> Excluded
+    | other -> failwithf "Replay: unrecognized Management tag '%s'" other
+
+let private layoutArgsToJson (args: LayoutArgs) : JsonNode =
+    let o = JsonObject()
+    match args with
+    | NoArgs -> o.["tag"] <- JsonValue.Create("no-args")
+    | MasterRatio r ->
+        o.["tag"] <- JsonValue.Create("master-ratio")
+        o.["value"] <- JsonValue.Create(r)
+    | ColumnCount c ->
+        o.["tag"] <- JsonValue.Create("column-count")
+        o.["value"] <- JsonValue.Create(c)
+    o :> JsonNode
+
+let private layoutArgsOfJson (node: JsonNode) : LayoutArgs =
+    match node.["tag"].GetValue<string>() with
+    | "no-args" -> NoArgs
+    | "master-ratio" -> MasterRatio (node.["value"].GetValue<decimal>())
+    | "column-count" -> ColumnCount (node.["value"].GetValue<int>())
+    | other -> failwithf "Replay: unrecognized LayoutArgs tag '%s'" other
+
+let private layoutRefToJson (r: LayoutRef) : JsonNode =
+    let o = JsonObject()
+    let (LayoutId lid) = r.Id
+    o.["id"] <- JsonValue.Create(lid)
+    o.["apiVersion"] <- JsonValue.Create(r.ApiVersion)
+    o.["args"] <- layoutArgsToJson r.Args
+    o :> JsonNode
+
+let private layoutRefOfJson (node: JsonNode) : LayoutRef =
+    { Id = LayoutId (node.["id"].GetValue<string>())
+      ApiVersion = node.["apiVersion"].GetValue<int>()
+      Args = layoutArgsOfJson node.["args"] }
+
+/// §9.2のDTOタグ付け規約：`CoreCommand`の全ケースを安定文字列タグで符号化する（Opusレビュー5-4。
+/// `step`が状態遷移に使う入力はJournalが往復できなければならない——`UserCommand`は
+/// `Topology.update`がReconfiguring解除の契機として読むので、このスライスでも既に`step`の
+/// 分岐対象になっている）。
+let private coreCommandToJson (cmd: CoreCommand) : JsonNode =
+    let o = JsonObject()
+    let simple tag = o.["tag"] <- JsonValue.Create(tag: string)
+    match cmd with
+    | FocusNext -> simple "focus-next"
+    | FocusPrevious -> simple "focus-previous"
+    | FocusMostRecent -> simple "focus-most-recent"
+    | SwapWithMaster -> simple "swap-with-master"
+    | PromoteToMaster -> simple "promote-to-master"
+    | CloseFocused -> simple "close-focused"
+    | SwitchWorkspace (WorkspaceId ws) ->
+        simple "switch-workspace"
+        o.["workspaceId"] <- JsonValue.Create(ws)
+    | MoveFocusedToWorkspace (WorkspaceId ws) ->
+        simple "move-focused-to-workspace"
+        o.["workspaceId"] <- JsonValue.Create(ws)
+    | FocusMonitor (MonitorId mid) ->
+        simple "focus-monitor"
+        o.["monitorId"] <- JsonValue.Create(mid)
+    | ChangeLayout layoutRef ->
+        simple "change-layout"
+        o.["layoutRef"] <- layoutRefToJson layoutRef
+    | ToggleFloating (WindowId w) ->
+        simple "toggle-floating"
+        o.["windowId"] <- JsonValue.Create(w)
+    | SetManagement (WindowId w, management) ->
+        simple "set-management"
+        o.["windowId"] <- JsonValue.Create(w)
+        o.["management"] <- JsonValue.Create(managementToJson management)
+    | ClearUserOverride (WindowId w) ->
+        simple "clear-user-override"
+        o.["windowId"] <- JsonValue.Create(w)
+    o :> JsonNode
+
+let private coreCommandOfJson (node: JsonNode) : CoreCommand =
+    match node.["tag"].GetValue<string>() with
+    | "focus-next" -> FocusNext
+    | "focus-previous" -> FocusPrevious
+    | "focus-most-recent" -> FocusMostRecent
+    | "swap-with-master" -> SwapWithMaster
+    | "promote-to-master" -> PromoteToMaster
+    | "close-focused" -> CloseFocused
+    | "switch-workspace" -> SwitchWorkspace (WorkspaceId (node.["workspaceId"].GetValue<int>()))
+    | "move-focused-to-workspace" -> MoveFocusedToWorkspace (WorkspaceId (node.["workspaceId"].GetValue<int>()))
+    | "focus-monitor" -> FocusMonitor (MonitorId (node.["monitorId"].GetValue<int64>()))
+    | "change-layout" -> ChangeLayout (layoutRefOfJson node.["layoutRef"])
+    | "toggle-floating" -> ToggleFloating (WindowId (node.["windowId"].GetValue<int64>()))
+    | "set-management" ->
+        SetManagement (WindowId (node.["windowId"].GetValue<int64>()), managementOfJson (node.["management"].GetValue<string>()))
+    | "clear-user-override" -> ClearUserOverride (WindowId (node.["windowId"].GetValue<int64>()))
+    | other -> failwithf "Replay: unrecognized CoreCommand tag '%s' — このJournalはより新しいスキーマで書かれている" other
+
+/// このスライスで対応するInputEventのタグ（§9.2のDTOタグ付け規約）。`step`が分岐に使う入力
+/// （MonitorTopologyObserved/ScreenReconfigurationInProgress/TimerElapsed/ForegroundObserved/
+/// WindowRemoved/UserCommand）は全て対応する（Opusレビュー5-4）。
 let private inputEventToJson (input: InputEvent) : JsonNode =
     let o = JsonObject()
     match input with
@@ -107,6 +274,15 @@ let private inputEventToJson (input: InputEvent) : JsonNode =
     | TimerElapsed timerId ->
         o.["tag"] <- JsonValue.Create("timer-elapsed")
         o.["timerId"] <- timerIdToJson timerId
+    | ForegroundObserved obs ->
+        o.["tag"] <- JsonValue.Create("foreground-observed")
+        o.["observation"] <- observationWindowIdOptionToJson obs
+    | WindowRemoved (WindowId w) ->
+        o.["tag"] <- JsonValue.Create("window-removed")
+        o.["windowId"] <- JsonValue.Create(w)
+    | UserCommand cmd ->
+        o.["tag"] <- JsonValue.Create("user-command")
+        o.["command"] <- coreCommandToJson cmd
     | other ->
         // 本ビルドで未対応のInputEvent。表示専用（Replayはこのタグに出会うとfail-fastする、§9.2）。
         o.["tag"] <- JsonValue.Create("unsupported-input-event")
@@ -120,6 +296,9 @@ let private inputEventOfJson (node: JsonNode) : InputEvent =
         MonitorTopologyObserved snapshots
     | "screen-reconfiguration-in-progress" -> ScreenReconfigurationInProgress (node.["value"].GetValue<bool>())
     | "timer-elapsed" -> TimerElapsed (timerIdOfJson node.["timerId"])
+    | "foreground-observed" -> ForegroundObserved (observationWindowIdOptionOfJson node.["observation"])
+    | "window-removed" -> WindowRemoved (WindowId (node.["windowId"].GetValue<int64>()))
+    | "user-command" -> UserCommand (coreCommandOfJson node.["command"])
     | other -> failwithf "Replay: unrecognized InputEvent tag '%s' — このJournalはより新しいスキーマで書かれている" other
 
 let private payloadToJson (payload: JournalPayload) : JsonNode =
