@@ -10,6 +10,7 @@
     <Compile Include="DecisionTrace.fs" />
     <Compile Include="Topology.fs" />
     <Compile Include="Workspaces.fs" />
+    <Compile Include="Health.fs" />
   </ItemGroup>
 
   <ItemGroup>

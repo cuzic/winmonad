@@ -8,6 +8,7 @@
   <ItemGroup>
     <Compile Include="TopologyScreenSettleTests.fs" />
     <Compile Include="WorkspacesInvariantTests.fs" />
+    <Compile Include="HealthInvariantTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

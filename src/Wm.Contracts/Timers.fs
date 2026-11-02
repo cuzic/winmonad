@@ -62,12 +62,12 @@ let awaitDeadline (recordedDeadline: int64 option) (inputTime: int64) : bool =
     | Some deadline -> deadline <= inputTime
     | None -> false
 
-/// 上限付き指数バックオフ（既定: baseDelayMs * 2^AttemptCount）。上限に達したらNone（再probe打ち切り）。
-let nextRetry (maxAttempts: int) (baseDelayMs: int64) (now: int64) (state: RetryState) : (RetryState * int64) option =
+/// 上限付き指数バックオフ（baseDelayMs * 2^AttemptCount、maxDelayMsで頭打ち）。上限回数に達したらNone（再probe打ち切り）。
+let nextRetry (maxAttempts: int) (baseDelayMs: int64) (maxDelayMs: int64) (now: int64) (state: RetryState) : (RetryState * int64) option =
     if state.AttemptCount >= maxAttempts then
         None
     else
-        let delay = baseDelayMs * pown 2L state.AttemptCount
+        let delay = min maxDelayMs (baseDelayMs * pown 2L state.AttemptCount)
         Some ({ AttemptCount = state.AttemptCount + 1; LastAttemptAt = now }, delay)
 
 /// StartTimer/CancelTimerを処理する小さな表（同じIDの再始動・取消）。Windows版（Hostのタイマーサービス）と
