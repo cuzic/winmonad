@@ -106,7 +106,10 @@ let rec evaluateLayoutPredicate (tiledCount: int) (monitorWidthDip: int) (predic
     | Both ps -> ps |> List.forall (evaluateLayoutPredicate tiledCount monitorWidthDip)
 
 type ClassificationResult =
-    | Resolved of Management
+    /// v2.15でマッチしたルールのIdを追加（`None`はどのルールにも一致せず`DefaultManagement`に落ちたことを
+    /// 意味する）。Core.Windowsの`WindowRecord.Classification`が`ClassifiedBy = ByPolicy of PolicyRuleId option`
+    /// として保持するために必要になった（ADR-019実装順14、Core.Windows着手時に追加）。
+    | Resolved of Management * matchedRule: PolicyRuleId option
     /// 優先度の高いルールがUnknownであり、低優先のルールへ進むと振動・誤判定の恐れがあるため保留する
     /// （§5.4「Unknownの高優先ルールがある場合、低優先のTiledをすぐ適用すると危険なら保留」）。
     /// どのルールが保留の原因かは呼び出し元のExplainが`WindowRule.Id`から特定できる。
@@ -122,10 +125,10 @@ let selectManagement (patternSet: TitlePatternSet) (view: ClassificationView) (p
         |> List.sortBy (fun r -> let (PolicyRuleId rid) = r.Id in (-r.Priority, rid))
     let rec go rules =
         match rules with
-        | [] -> Resolved policy.DefaultManagement
+        | [] -> Resolved (policy.DefaultManagement, None)
         | (rule: WindowRule) :: rest ->
             match evaluateWindowPredicate patternSet view rule.When with
-            | Believed b when b.Value -> Resolved rule.Apply
+            | Believed b when b.Value -> Resolved (rule.Apply, Some rule.Id)
             | Believed _ -> go rest
             | Unformed _ -> AwaitingEvidence rule.Id
     go ordered

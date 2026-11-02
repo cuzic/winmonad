@@ -105,17 +105,17 @@ let ``AnyOfは1つでも確定したYesがあればYes、全てNoならNo`` () =
 // ===== selectManagement =====
 
 [<Fact>]
-let ``ルールが無ければDefaultManagementを返す`` () =
-    Assert.Equal(Resolved Tiled, selectManagement emptyPatternSet emptyView basePolicy)
+let ``ルールが無ければDefaultManagementを返す(matchedRuleはNone)`` () =
+    Assert.Equal(Resolved (Tiled, None), selectManagement emptyPatternSet emptyView basePolicy)
 
 [<Fact>]
-let ``最初にYesとなった(Priority降順)ルールのApplyを返す`` () =
+let ``最初にYesとなった(Priority降順)ルールのApplyとそのIdを返す`` () =
     let policy =
         { basePolicy with
             WindowRules =
                 [ windowRule "low" 10 AnyWindow Floating
                   windowRule "high" 90 AnyWindow Excluded ] }
-    Assert.Equal(Resolved Excluded, selectManagement emptyPatternSet emptyView policy)
+    Assert.Equal(Resolved (Excluded, Some (PolicyRuleId "high")), selectManagement emptyPatternSet emptyView policy)
 
 [<Fact>]
 let ``高優先のルールがUnknownなら、低優先が確定Yesでも保留してAwaitingEvidenceを返す`` () =
@@ -134,7 +134,7 @@ let ``Noのルールはスキップして次を評価する`` () =
             WindowRules =
                 [ windowRule "no" 90 (DialogIs true) Excluded // Noで確定、スキップされる
                   windowRule "yes" 10 AnyWindow Floating ] }
-    Assert.Equal(Resolved Floating, selectManagement emptyPatternSet view policy)
+    Assert.Equal(Resolved (Floating, Some (PolicyRuleId "yes")), selectManagement emptyPatternSet view policy)
 
 [<Fact>]
 let ``同じPriorityはPolicyRuleIdの昇順で評価する`` () =
@@ -144,7 +144,7 @@ let ``同じPriorityはPolicyRuleIdの昇順で評価する`` () =
             WindowRules =
                 [ windowRule "b" 50 AnyWindow Excluded
                   windowRule "a" 50 AnyWindow Floating ] }
-    Assert.Equal(Resolved Floating, selectManagement emptyPatternSet emptyView policy)
+    Assert.Equal(Resolved (Floating, Some (PolicyRuleId "a")), selectManagement emptyPatternSet emptyView policy)
 
 // ===== selectLayout =====
 

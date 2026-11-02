@@ -50,3 +50,15 @@ type PolicyIR = {
     /// i3の`workspace X output Y`相当（§4.4）。
     WorkspaceAssignments: (WorkspaceId * MonitorSelector) list
 }
+
+module PolicyIR =
+    /// `PolicyActivated`の配線（§21の未決事項、未実装）が無い間、`RuntimePolicy`が使う安全な既定値。
+    /// ルールを一切持たず、全ての窓を`DefaultManagement`（Tiled）へ分類する（ADR-019実装順14、
+    /// Core.Windows着手時に追加）。
+    let defaults: PolicyIR =
+        { SchemaVersion = 1
+          WindowRules = []
+          DefaultManagement = Tiled
+          LayoutRules = []
+          DefaultLayout = { Id = LayoutId "monocle"; ApiVersion = 1; Args = NoArgs }
+          WorkspaceAssignments = [] }

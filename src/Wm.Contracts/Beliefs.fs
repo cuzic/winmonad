@@ -219,19 +219,26 @@ type IdentityBeliefs = {
 }
 
 /// Windows `ClassInputs`（LatestWins規則）。
+///
+/// v2.15で`BeliefSlot`から`LatestWins`へ訂正（ADR-019実装順14、Core.Windows着手時に発見）：
+/// architecture.md §4.5は v2.11で既に「`ClassInputBeliefs`はLatestWinsを使う」と訂正していたが
+/// （Opus批判的レビューdocs/review-phase-a-round1.md 1-1/round2.md N-1・N-2の対象）、Windows/Placement
+/// ドメインがまだ無かったため、このContracts側の型には反映されていなかった（ドキュメントの訂正が
+/// コードに取り込まれないまま残っていた既知のずれ）。Core.Windowsの実装時にこのずれを塞ぐ。
 type ClassInputBeliefs = {
-    IsDialog: BeliefSlot<bool>
-    Owner: BeliefSlot<WindowId option>
-    IsVisible: BeliefSlot<bool>
-    Cloak: BeliefSlot<CloakState>
-    TitleMatches: BeliefSlot<TitleMatchVector>
+    IsDialog: LatestWins<bool>
+    Owner: LatestWins<WindowId option>
+    IsVisible: LatestWins<bool>
+    Cloak: LatestWins<CloakState>
+    TitleMatches: LatestWins<TitleMatchVector>
 }
 
-/// Placement `Geometry`（LatestWins規則）。
+/// Placement `Geometry`（LatestWins規則）。ClassInputBeliefsと同じ理由（上記）で、v2.15で
+/// `BeliefSlot`から`LatestWins`へ訂正する。Core.Placementの実装時にこの型をそのまま使うこと。
 type GeometryBeliefs = {
-    NativeRect: BeliefSlot<PixelRect>
-    VisibleFrameRect: BeliefSlot<PixelRect>
-    Monitor: BeliefSlot<MonitorId>
-    IsMinimized: BeliefSlot<bool>
-    Presence: BeliefSlot<ObservedPresence>
+    NativeRect: BeliefSlot<PixelRect> // NativeRectはAccumulating寄りの用途(§4.5の表に無い)のためBeliefSlotのまま
+    VisibleFrameRect: LatestWins<PixelRect>
+    Monitor: LatestWins<MonitorId>
+    IsMinimized: LatestWins<bool>
+    Presence: LatestWins<ObservedPresence>
 }
