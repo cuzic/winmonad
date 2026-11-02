@@ -18,9 +18,11 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- §17依存方向：Wm.Core（Contracts・Policy・Layouts）。Wm.Layoutsはまだこのスライスで必要な型が無いため後で追加する。 -->
+    <!-- §17依存方向：Wm.Core（Contracts・Policy・Layouts）。PlacementのReconcileがLayoutRegistry/
+         PlanValidatorを呼ぶため、ADR-019実装順14のPlacementのPending/Desiredラウンドでようやく追加した。 -->
     <ProjectReference Include="../Wm.Contracts/Wm.Contracts.fsproj" />
     <ProjectReference Include="../Wm.Policy/Wm.Policy.fsproj" />
+    <ProjectReference Include="../Wm.Layouts/Wm.Layouts.fsproj" />
   </ItemGroup>
 
 </Project>

@@ -19,6 +19,7 @@ open Wm.Core.Windows
 open Wm.Core.Placement
 open Wm.Policy.PolicyTypes
 open Wm.Policy.PolicyEvaluator
+open Wm.Layouts.LayoutRegistry
 
 /// `step`が各段へ配線する環境（状態ではない。§3.3「RuntimePolicyは環境なので決定性ゲートの対象外」）。
 /// Windowsドメインの実装に伴い、段⑤が読む採用中Policy用のフィールドを追加する（ADR-019実装順14）。
@@ -29,14 +30,21 @@ type RuntimePolicy =
       Policy: PolicyIR
       PatternSet: TitlePatternSet
       /// §5.4「Unknownには期限を設ける」。実測値未確定のため暫定値（TopologyConfigのSettleMs/GraceMsと同様）。
-      ClassificationTimeoutMs: int64 }
+      ClassificationTimeoutMs: int64
+      /// §7.1段⑦「Reconcile」が`PolicyIR`の`LayoutRef`からF#関数を解決するためのRegistry（§5.6）。
+      /// ADR-019実装順14、PlacementのPending/Desiredラウンドで追加した。
+      LayoutRegistry: Registry }
 
 module RuntimePolicy =
     let defaults =
         { Topology = TopologyConfig.defaults
           Policy = PolicyIR.defaults
           PatternSet = buildTitlePatternSet PolicyIR.defaults
-          ClassificationTimeoutMs = 3_000L }
+          ClassificationTimeoutMs = 3_000L
+          LayoutRegistry =
+            Registry.empty
+            |> Registry.register (Wm.Layouts.MasterStack.implementation "builtin-master-stack-v1")
+            |> Registry.register (Wm.Layouts.Monocle.implementation "builtin-monocle-v1") }
 
 /// 親の状態。最初はTopologyのフィールドだけを持ち、ドメインを実装するたびにフィールドを追加する
 /// （ADR-019決定8。6フィールドを骨格だけ一括で用意する代替案は退けた）。Workspaces・Health・Focus・
@@ -170,9 +178,10 @@ let private applyWindowsEvent (state: WmState) (ev: DomainEvent) : WmState =
 /// （ADR-018：各ドメインは自分の状態だけを返し、他ドメインの状態を書かない）。
 ///
 /// Opusレビュー5-3：§7.1の段の順そのままではなく、今実装済みのドメインが処理できる入力の分だけ
-/// 素直に並べている。PlacementはGeometryの信念だけが実装済みで、段③④⑦（Pending照合・Reconcile）の
-/// 配線先はまだ無い（`StyleChanged`も同様に未配線、Windows.fs/Placement.fsのファイル冒頭コメント参照）。
-/// 表どおりの8段パイプラインへの完全な組み直しは、PlacementのDesired/Pending着手時まで持ち越す。
+/// 素直に並べている。段⑦（Reconcile）はアクティブなWorkspace1つだけを対象に配線した（`StyleChanged`は
+/// 依然未配線、Windows.fs/Placement.fsのファイル冒頭コメント参照）。表どおりの8段パイプラインへの
+/// 完全な組み直し（複数の可視Workspace、`WorkspaceShown`/`Hidden`経由のReconcileトリガー等）は
+/// 今後のラウンドへ持ち越す。
 let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelope<InputEvent>) : StepResult =
     let now = envelope.MonotonicTime
     let focusedBefore = focused state
@@ -209,6 +218,8 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         | WindowObserved snapshot -> Placement.onWindowObserved now snapshot stateAfterWindows.Placement
         | MinimizedStateChanged (w, obs) -> Placement.onMinimizedStateChanged now w obs stateAfterWindows.Placement, [], []
         | TimerElapsed (TimerId.Placement (IntegrityReprobe w)) -> Placement.onIntegrityReprobeTimerFired now w stateAfterWindows.Placement
+        | TimerElapsed (TimerId.Placement (PendingDeadline rid)) ->
+            Placement.onPendingDeadlineTimerFired now rid stateAfterWindows.Placement, [], []
         | _ -> stateAfterWindows.Placement, [], []
 
     let stateAfterPlacement = { stateAfterWindows with Placement = placementState' }
@@ -265,16 +276,52 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
 
     let next = { stateAfterBeliefs with Focus = focusFinal; Workspaces = workspacesFinal }
 
+    // Windows/Healthの実際の状態から組み立てる（gateInputとReconcileの両方が使う共通の投影）。
+    let aliveWindows = next.Windows.Records |> Map.toSeq |> Seq.map fst |> Set.ofSeq
+    let managementByWindow =
+        next.Windows.Records
+        |> Map.toSeq
+        |> Seq.choose (fun (w, r) -> match r.Classification with Classified (eff, _) -> Some (w, eff) | _ -> None)
+        |> Map.ofSeq
+
+    // 段⑦相当（Placement、Reconcile）：WindowClassified/WindowUnmanaged（windowsEvents）かWindowRemovedで
+    // アクティブなWorkspaceの構成が変わった可能性がある場合に限り、そのWorkspaceだけをReconcileする
+    // （Placement.fsのファイル冒頭「対象外」：複数の可視Workspaceへの拡張、WorkspaceShown/Hidden経由の
+    // トリガーはまだ無い）。
+    let shouldReconcile =
+        not (List.isEmpty windowsEvents)
+        || (match envelope.Input with WindowRemoved _ -> true | _ -> false)
+
+    let placementAfterReconcile, reconcileEffects, reconcileTimerCmds =
+        if not shouldReconcile then
+            next.Placement, [], []
+        else
+            match activeWorkspace next, Topology.displays next.Topology with
+            | Some ws, Displays (current, _) ->
+                let wsState = WorkspaceSet.stateOf ws next.Workspaces
+                let stackList = wsState.Stack |> Option.map Zipper.toList |> Option.defaultValue []
+                let tiledIds = stackList |> List.filter (fun w -> not (Set.contains w wsState.Floating))
+                let focusedTiled =
+                    wsState.Stack
+                    |> Option.bind (fun z -> if Set.contains z.Focus wsState.Floating then None else Some z.Focus)
+                let ctx: LayoutContext =
+                    { WorkArea = current.Monitor.WorkArea
+                      Dpi = current.Monitor.Dpi
+                      TiledWindows = tiledIds |> List.map (fun w -> { Id = w; MinWidthDip = None })
+                      Focused = focusedTiled }
+                let monitorWidthDip = current.Monitor.WorkArea.Width * 96 / current.Monitor.Dpi
+                let layoutRef = selectLayout (List.length tiledIds) monitorWidthDip runtimePolicy.Policy
+                Placement.reconcileWorkspace now runtimePolicy.LayoutRegistry layoutRef ctx managementByWindow aliveWindows next.Placement
+            | _ -> next.Placement, [], [] // モニター0台。Layout計算もEffect発行も行わない（§4.4）
+
+    let next = { next with Placement = placementAfterReconcile }
+
     // 段⑧ゲート（§6.2/§7.1）：Windows/Placementの実装に伴い、Alive/Management/NotMovable/Hungを
-    // 実際の状態から組み立てる（HiddenByWm/NeedsRestoreはDesired/Pendingが無いため、引き続き空集合の
+    // 実際の状態から組み立てる（HiddenByWm/NeedsRestoreはDesired全体の反映が無いため、引き続き空集合の
     // まま、既知のギャップとして残す）。
     let gateInput =
-        { Alive = next.Windows.Records |> Map.toSeq |> Seq.map fst |> Set.ofSeq
-          Management =
-            next.Windows.Records
-            |> Map.toSeq
-            |> Seq.choose (fun (w, r) -> match r.Classification with Classified (eff, _) -> Some (w, eff) | _ -> None)
-            |> Map.ofSeq
+        { Alive = aliveWindows
+          Management = managementByWindow
           Monitors =
             match Topology.displays next.Topology with
             | NoMonitors -> []
@@ -294,14 +341,27 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
           HiddenByWm = Set.empty
           NeedsRestore = Set.empty }
 
-    let gated, _rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects)
+    let gated, rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects @ reconcileEffects)
 
-    // 段①・段②のDomainEventは、消費する後続の段（Topologyの`current`追従、Placementの配置判断等）が
-    // まだ無いため捨てる（Opusレビュー5-3。Placement実装時にここへ配線を追加する）。
+    // §7.2「GateRejected → Cancelled（Deadlineまで待たず同じstep内で即時に遷移する）」。
+    let rejectedRequestIds = rejected |> List.choose fst
+    let placementAfterGateRejection, gateRejectionTimerCmds = Placement.onGateRejected rejectedRequestIds next.Placement
+    let finalNext = { next with Placement = placementAfterGateRejection }
+
+    // 段①・段②のDomainEventは、消費する後続の段（Topologyの`current`追従等）がまだ無いため捨てる
+    // （Opusレビュー5-3。段⑦自体はPlacementのReconcileとして配線済みになった）。
     ignore stage1Events
     ignore topologyEvents
 
-    { Next = next
+    { Next = finalNext
       Effects = gated
-      Timers = topologyResponse.TimerCommands @ healthTimerCmds @ switchSettleTimerCmds @ windowsTimerCmds @ vanishTimerCmds @ placementTimerCmds
+      Timers =
+        topologyResponse.TimerCommands
+        @ healthTimerCmds
+        @ switchSettleTimerCmds
+        @ windowsTimerCmds
+        @ vanishTimerCmds
+        @ placementTimerCmds
+        @ reconcileTimerCmds
+        @ gateRejectionTimerCmds
       Trace = traces }
