@@ -10,6 +10,8 @@
     <Compile Include="WorkspacesInvariantTests.fs" />
     <Compile Include="HealthInvariantTests.fs" />
     <Compile Include="FocusInvariantTests.fs" />
+    <Compile Include="WmStateFocusTests.fs" />
+    <Compile Include="CrossDomainInvariantTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
