@@ -394,6 +394,17 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             | None -> stateAfterMovability
         | _ -> stateAfterMovability
 
+    // `UserCommand ChangeLayout`（§4.4「コマンドの意味」、v2.37）：アクティブなWorkspaceの
+    // `LayoutOverride`へ記録する（`WorkspaceState.LayoutOverride`の型直前のコメント参照：`None`なら
+    // Policyの`LayoutRules`で選ぶ、`Some`なら明示的にそれを使う——`reconcileOneScreen`が読む）。
+    // `PromoteToMaster`/`SwapWithMaster`とは違い、`focused`を基準にしない——Layoutの切替はWorkspace
+    // 全体の設定であり、特定の窓がフォーカスされているかとは無関係（`focused = Elsewhere`でも働く）。
+    let stateAfterMovability =
+        match envelope.Input, activeWorkspace stateAfterMovability with
+        | UserCommand (ChangeLayout layoutRef), Some ws ->
+            { stateAfterMovability with Workspaces = WorkspaceSet.setLayoutOverride ws layoutRef stateAfterMovability.Workspaces }
+        | _ -> stateAfterMovability
+
     // Health：ResponsivenessReprobeタイマーの発火と、PlacementのEffectCallReturned処理が`TargetHung`と
     // 判定した場合のResponsiveness修正（§7.2「EffectCallReturned(Error) → classify → TargetHung →
     // Cancelled ＋ Responsiveness:=Hung」。この信念修正自体はHealthの管轄なのでPlacement.fsではなく
@@ -460,6 +471,9 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         // MasterStack LayoutのTiledWindows順も変わる。windowsEvents（分類の変化）は出ないため、
         // 明示的にここで引き金にする。
         || (match envelope.Input with UserCommand PromoteToMaster | UserCommand SwapWithMaster -> true | _ -> false)
+        // ChangeLayout（v2.37）：LayoutOverrideが変わるだけで窓の所属は変わらないため、同じ理由で
+        // 明示的にここで引き金にする。
+        || (match envelope.Input with UserCommand (ChangeLayout _) -> true | _ -> false)
 
     let reconcileOneScreen (placementSt: PlacementState, effects, cmds) (screen: Screen) =
         let wsState = WorkspaceSet.stateOf screen.Workspace next.Workspaces
@@ -474,7 +488,12 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
               TiledWindows = tiledIds |> List.map (fun w -> { Id = w; MinWidthDip = None })
               Focused = focusedTiled }
         let monitorWidthDip = screen.Monitor.WorkArea.Width * 96 / screen.Monitor.Dpi
-        let layoutRef = selectLayout (List.length tiledIds) monitorWidthDip runtimePolicy.Policy
+        // §4.4「ChangeLayoutの記録」（v2.37）：`LayoutOverride`が明示的に設定されていればそれを使い、
+        // `None`のときだけPolicyの`LayoutRules`（`selectLayout`）で選ぶ（`WorkspaceState.LayoutOverride`
+        // の型直前のコメント参照）。
+        let layoutRef =
+            wsState.LayoutOverride
+            |> Option.defaultValue (selectLayout (List.length tiledIds) monitorWidthDip runtimePolicy.Policy)
         // PlanValidator.checkNoMissingPlacement（§6.2「TiledWindows ⊆ Alive ∩ Managed(Tiled)」、
         // 実際にはこの呼び出しでは等号が要求される）は、渡された`Management`/`Alive`に含まれる
         // 全てのTiled×Aliveな窓がこの`placements`に現れることを要求する。複数のWorkspaceを順に

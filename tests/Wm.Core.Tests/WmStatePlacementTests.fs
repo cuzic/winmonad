@@ -532,6 +532,37 @@ let ``PromoteToMasterはfocusedを先頭へ移し、他の窓は1つずつ後ろ
     Assert.Equal(afterPromote.Next.Workspaces, afterPromoteAgain.Next.Workspaces)
 
 [<Fact>]
+let ``ChangeLayoutはアクティブなWorkspaceのLayoutOverrideへ記録し、Reconcileが新しいLayoutで計算し直す(v2.37)`` () =
+    // RuntimePolicy.defaults（DefaultLayout=Monocle）から始め、ChangeLayoutでMasterStackへ切り替える。
+    // focusedを一切要求しない（ChangeLayoutはWorkspace全体の設定であり、特定の窓とは無関係）。
+    let w1, w2 = WindowId 1L, WindowId 2L
+    let afterW1 = settleOneMonitorThenDiscoverWindow w1
+    let afterW2 = step RuntimePolicy.defaults afterW1.Next (mkEnvelope 101L (visibleWindowObserved w2))
+    let ws0 = WorkspaceSet.workspaceOf w1 afterW2.Next.Workspaces |> Option.get
+    let workArea = (mkMonitor 0).WorkArea
+    // Monocleでは両方ともWorkArea全体。
+    Assert.Equal(Some workArea, desiredRectOf afterW2.Next.Placement w1)
+    Assert.Equal(Some workArea, desiredRectOf afterW2.Next.Placement w2)
+    Assert.Equal(None, (WorkspaceSet.stateOf ws0 afterW2.Next.Workspaces).LayoutOverride)
+
+    let masterStackRef : LayoutRef = { Id = LayoutId "master-stack"; ApiVersion = 1; Args = NoArgs }
+    let afterChange = step RuntimePolicy.defaults afterW2.Next (mkEnvelope 102L (UserCommand (ChangeLayout masterStackRef)))
+    Assert.Equal(Some masterStackRef, (WorkspaceSet.stateOf ws0 afterChange.Next.Workspaces).LayoutOverride)
+    let masterRect, _, _ = masterStackRects workArea
+    // 窓は2つしか無く片方がmaster・片方がstackなので、stackは1窓分=stackArea全体になる
+    // （masterStackRectsは2窓stackの前提で作った。stack1窓は`stackArea`全体になる——下で検算する）。
+    let stackArea = { workArea with X = masterRect.Width; Width = workArea.Width - masterRect.Width }
+    Assert.Equal(Some masterRect, desiredRectOf afterChange.Next.Placement w1)
+    Assert.Equal(Some stackArea, desiredRectOf afterChange.Next.Placement w2)
+
+[<Fact>]
+let ``ChangeLayoutはアクティブなモニターが無い(NoMonitors)場合、何もしない`` () =
+    let state = initial RuntimePolicy.defaults
+    let someRef : LayoutRef = { Id = LayoutId "master-stack"; ApiVersion = 1; Args = NoArgs }
+    let afterChange = step RuntimePolicy.defaults state (mkEnvelope 1L (UserCommand (ChangeLayout someRef)))
+    Assert.Equal(WorkspaceSet.empty, afterChange.Next.Workspaces)
+
+[<Fact>]
 let ``WindowRemovedは同じstepでPlacement.Geometryも除く`` () =
     let state = initial RuntimePolicy.defaults
     let obs: Observation<bool> = { Value = Ok true; SampleSequence = 1L; MonotonicTime = 1L; Source = "test" }

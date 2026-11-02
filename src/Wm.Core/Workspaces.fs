@@ -184,6 +184,12 @@ module WorkspaceSet =
         | None -> s
         | Some z -> setState { st with Stack = Some (Zipper.swapWithMaster z) } s
 
+    /// `UserCommand ChangeLayout`の結果を記録する（§4.4、R6-2。`WorkspaceState.LayoutOverride`の
+    /// 型直前のコメント参照：`None`ならPolicyのLayoutRulesで選ぶ、`Some`なら明示的にそれを使う）。
+    let setLayoutOverride (ws: WorkspaceId) (layoutRef: LayoutRef) (s: WorkspaceSet) : WorkspaceSet =
+        let st = stateOf ws s
+        setState { st with LayoutOverride = Some layoutRef } s
+
     /// Stackの所属は変えず、Floating集合への出入りだけを切り替える（§4.4のToggleFloating）。
     let toggleFloating (w: WindowId) (s: WorkspaceSet) : WorkspaceSet =
         match workspaceOf w s with
