@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="WindowEventNormalizer.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- §17依存方向：Wm.Normalization（Contractsのみ）。Wm.WindowsとWm.Simulationが共有する（ADR-013/ADR-019）。 -->
+    <ProjectReference Include="../Wm.Contracts/Wm.Contracts.fsproj" />
+  </ItemGroup>
+
+</Project>
