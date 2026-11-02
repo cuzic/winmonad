@@ -35,6 +35,54 @@ type BeliefSlot<'T> =
     | Believed of Belief<'T>
     | Unformed of EvidenceGap list
 
+/// LatestWins規則（§4.5）専用の水位つきスロット。
+///
+/// Opusレビュー（2026-11-01）で、`Belief<'T>.LastRevisedAt`の単位がドメインごとに食い違う問題が見つかった：
+/// LatestWinsの新旧比較には`Observation<'T>.SampleSequence`（§4.2「EventEnvelopeのSequenceとは別の番号空間」）
+/// が必要だが、`Belief<'T>`にはその専用フィールドが無い。これを`LastRevisedAt`で代用すると、
+/// Accumulating規則（Health等、`now`=`EventEnvelope.MonotonicTime`を使う）と同じフィールドに
+/// 異なる番号空間が混在し、`combineAll`/`combineAnyOf`の`max LastRevisedAt`が意味を失う
+/// （例：`All [IsDialog; MovableIs Movable]`でSampleSequenceとmsの`max`を取ってしまう）。
+///
+/// 解決：`Belief<'T>.LastRevisedAt`は全ドメインで常に`now`（Opusレビュー1-1の提案）に固定し、
+/// LatestWinsの水位（処理済みの最大`SampleSequence`）は、この型の`Watermark`で別に持つ。
+type LatestWins<'T> = { Slot: BeliefSlot<'T>; Watermark: int64 option }
+
+module LatestWins =
+    let unformed: LatestWins<'T> = { Slot = Unformed []; Watermark = None }
+
+    /// LatestWins規則の修正関数（§4.5）。ドメインごとに個別実装せず、Contractsに1つだけ置く
+    /// （Windows/PlacementのClassInputBeliefs/GeometryBeliefsが実装される際も、Focusのように
+    /// コピーして再実装せず、この関数を直接使うこと。Opusレビュー1-1）。
+    ///
+    /// より新しいSampleSequenceのOk観測で置き換える（Confirmed）。Errorの観測は値を保ったまま
+    /// Staleにする（ただしWatermarkは、すでに値が確定している間は進めない——これがOpusレビュー1-2の
+    /// 修正点：Watermarkを無条件に進めると、Errorより古いが現在の値より新しいOk観測を誤って
+    /// 捨ててしまう。まだ値が無い(Unformed)間だけ、Errorの到着でWatermarkを進める——これにより、
+    /// 「より新しい失敗を知っているのに古いOkをConfirmedにする」という1-3の問題も併せて防ぐ）。
+    let revise (now: int64) (current: LatestWins<'T>) (observation: Observation<'T>) : LatestWins<'T> =
+        let isNewer =
+            match current.Watermark with
+            | Some wm -> observation.SampleSequence > wm
+            | None -> true
+
+        if not isNewer then
+            current
+        else
+            match observation.Value, current.Slot with
+            | Ok v, _ ->
+                { Slot = Believed { Value = v; Confidence = Confirmed; LastRevisedAt = now }
+                  Watermark = Some observation.SampleSequence }
+            | Error _, Believed b ->
+                { Slot = Believed { b with Confidence = Stale now }; Watermark = current.Watermark }
+            | Error _, Unformed gaps -> { Slot = Unformed gaps; Watermark = Some observation.SampleSequence }
+
+    /// 現在の値（`Unformed`ならNone）。
+    let value (lw: LatestWins<'T>) : 'T option =
+        match lw.Slot with
+        | Believed b -> Some b.Value
+        | Unformed _ -> None
+
 /// 5.4の三値`Truth`はBeliefSlot<bool>の別名（v2.6、ADR-016）。
 type Truth = BeliefSlot<bool>
 
