@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="JournalWriter.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- §17依存方向：Wm.Journal（Contractsのみ） -->
+    <ProjectReference Include="../Wm.Contracts/Wm.Contracts.fsproj" />
+  </ItemGroup>
+
+</Project>
