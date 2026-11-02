@@ -9,6 +9,7 @@
     <Compile Include="DomainEvents.fs" />
     <Compile Include="DecisionTrace.fs" />
     <Compile Include="Topology.fs" />
+    <Compile Include="Workspaces.fs" />
   </ItemGroup>
 
   <ItemGroup>
