@@ -169,7 +169,8 @@ Phase 0は「要素技術の確認」ではなく、**捨てる前提の素朴�
 - **記録する内容**: 往復ごとの目的窓への到達遅延、目的窓到達前に届いた別hwndへのイベントの有無・回数。
 - **判定**: 「CI実機（自プロセス内の2窓、仮想化・ヘッドレス寄り）では`SwitchSettle`の揺れ吸収機構自体は不要」という一次データが得られた。S4がS4rで実デスクトップ再検証を要した前例に鑑み、測定値（2〜4ms）そのままではなく十分な安全マージンを取った`SwitchSettleMs = 150L`（`RuntimePolicy`）を暫定採用し、`WmState.step`へ配線した（v2.40）。実デスクトップでの再検証（S20r）は持ち越し。
 
-### S21. SetRectの往復精度（M3、Placement `Mismatch → Reevaluate`設計の前提）【未検証：CIで実行予定】
+### S21. SetRectの往復精度（M3、Placement `Mismatch → Reevaluate`設計の前提）【CI実機検証済み：自作WinForms窓では位置・サイズに関わらず完全一致】
+**結果**：現在位置で測り直したシャドウは`(L=7,T=0,R=7,B=7)`——S1が一度だけ測った値と完全に一致し、**位置に依存しない定数**であることを新たに確認した。このシャドウを使って変換した3つの異なる位置・サイズ（workArea相当のフルサイズ、別の四分割位置、3つ目の任意位置）全てで、要求した矩形と`DWMWA_EXTENDED_FRAME_BOUNDS`の読み戻し値が1px単位で完全一致した（`exact-match=true`×4）。自作WinForms窓（S1と同じ窓種）に限ればMismatch→Reevaluate段階1導入の前提（M3）は満たされる。他の窓種（Electron/UWP/カスタム非クライアント領域描画）のシャドウがこの値と異なる・位置依存である可能性はS1同様未確認のまま。
 - **検証する前提**: `Mismatch → Reevaluate`（§7.2、v2.24以来安全上の理由で対象外のままだった項目）の設計相談（Opus敵対的レビュー）で、「段階1（`PendingDeadline`時点でのMismatch分類）はコードの論理だけで安全」としつつ、その前提として「可視枠（`DWMWA_EXTENDED_FRAME_BOUNDS`）と要求した矩形（`SetWindowPos`に渡す`GetWindowRect`空間の値）が正確に一致するか」の実測を先に求めた——換算がシステム的にずれていれば、段階1導入後は全ての配置が常にMismatchと判定され「止まる」が永続化する逆効果になる。S1が測った「シャドウ」（自作WinForms窓で`diff(L,T,R,B)=(7,0,7,7)`px）が位置・サイズを変えても同じ値のまま使えるかを確認する。
 - **方法**: `Phase0CiSpikes`の`spikeS21_SetRectRoundTrip`で、窓の現在位置でシャドウを測り直し、それを使って3つの異なる位置・サイズへ`SetWindowPos`を発行、`DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`で読み戻した可視枠が要求した矩形と1px単位で一致するかを記録する。
 - **記録する内容**: 測り直したシャドウ値、各ターゲットでの要求矩形・観測されたDWM可視枠・一致したかどうか。
