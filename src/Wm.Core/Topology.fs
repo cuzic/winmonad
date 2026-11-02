@@ -220,6 +220,27 @@ module MonitorLifecycle =
 
         { state with Displays = newDisplays; Returns = returnsAfterAdd }, hiddenEvents @ shownEvents
 
+/// `ws`をcurrentへ表示する（xmonadのview、§4.4「SwitchWorkspaceの意味」）。`UserCommand (SwitchWorkspace ws)`の
+/// 非`Reconfiguring`分岐そのもの（v2.32）をここへ抽出した（v2.38）。呼び出し側は`state.Phase`が
+/// `Reconfiguring`でないことを保証すること（Displaysが未確定の間はview自体が無意味——`update`の
+/// `SwitchWorkspace`分岐と同じ前提）。`FocusMostRecent`（`WmState.step`）が行き先の窓のWorkspaceがhiddenな
+/// 場合に同じ遷移を再利用するために公開する。
+let showWorkspace (ws: WorkspaceId) (state: TopologyState) : TopologyState * DomainEvent list =
+    match state.Displays with
+    | NoMonitors -> state, []
+    | Displays (current, _) when current.Workspace = ws -> state, [] // 既にcurrent
+    | Displays (current, visible) ->
+        match visible |> List.tryFind (fun sc -> sc.Workspace = ws) with
+        | Some targetScreen ->
+            let visible' = current :: (visible |> List.filter (fun sc -> sc.Workspace <> ws))
+            { state with Displays = Displays (targetScreen, visible'); Returns = Map.remove ws state.Returns },
+            [ CurrentChanged ws ]
+        | None ->
+            let oldWorkspace = current.Workspace
+            let newCurrent = { current with Workspace = ws }
+            { state with Displays = Displays (newCurrent, visible); Returns = Map.remove ws state.Returns },
+            [ WorkspaceHidden oldWorkspace; WorkspaceShown (ws, UserView) ]
+
 // ===== ScreenPhase（§7.3）：抑止区間・安定待ち・grace window =====
 
 /// 段②：ScreenPhaseの遷移。ScreenSettle縦切り（ADR-019決定8、性質テスト#21）の中心。
@@ -301,29 +322,9 @@ let update (config: TopologyConfig) (now: int64) (input: InputEvent) (state: Top
             // WorkspaceSetは全域なので空のWorkspaceとして扱える）、currentの画面の表示をwsへ入れ替え、
             // それまで表示していたWorkspaceがhiddenになる。NoMonitorsなら何もしない。greedyView
             // （2画面の表示を交換する）は既定にしない（§4.4、ユーザーが見ていない側まで入れ替わるため）。
-            match state.Displays with
-            | NoMonitors -> state, noResponse, [], []
-            | Displays (current, visible) when current.Workspace = ws -> state, noResponse, [], [] // 既にcurrent
-            | Displays (current, visible) ->
-                match visible |> List.tryFind (fun sc -> sc.Workspace = ws) with
-                | Some targetScreen ->
-                    let visible' = current :: (visible |> List.filter (fun sc -> sc.Workspace <> ws))
-                    // ユーザーの明示操作（SwitchWorkspace）は、自動復帰より優先し`ReturnMonitor`を解除する
-                    // （§4.4のReturns更新規則(3)）。既にvisibleなwsは、表示された時点で
-                    // `MonitorLifecycle.reconcile`が`chosen`の予約を既に解除しているはずなので、この分岐で
-                    // 実際に取り除く対象がある状況は到達しにくい（下のhiddenな分岐の方が主な対象）。
-                    // 対称性のための防御的な記述として残す。
-                    { state with Displays = Displays (targetScreen, visible'); Returns = Map.remove ws state.Returns },
-                    noResponse,
-                    [ CurrentChanged ws ],
-                    []
-                | None ->
-                    let oldWorkspace = current.Workspace
-                    let newCurrent = { current with Workspace = ws }
-                    { state with Displays = Displays (newCurrent, visible); Returns = Map.remove ws state.Returns },
-                    noResponse,
-                    [ WorkspaceHidden oldWorkspace; WorkspaceShown (ws, UserView) ],
-                    []
+            // v2.38で`showWorkspace`へ抽出した（`FocusMostRecent`との共有）。
+            let state', events = showWorkspace ws state
+            state', noResponse, events, []
     | UserCommand (FocusMonitor m) ->
         match state.Phase with
         | Reconfiguring _ ->

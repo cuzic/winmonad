@@ -570,3 +570,99 @@ let ``WindowRemovedは同じstepでPlacement.Geometryも除く`` () =
     Assert.True(Map.containsKey (WindowId 1L) afterMinimized.Placement.Geometry)
     let afterRemoved = (step RuntimePolicy.defaults afterMinimized (mkEnvelope 2L (WindowRemoved (WindowId 1L)))).Next
     Assert.False(Map.containsKey (WindowId 1L) afterRemoved.Placement.Geometry)
+
+[<Fact>]
+let ``FocusMostRecentは、focused=ManagedWindowなら同じWorkspace内のHistoryの2番目へ直接RequestForegroundする(v2.38)`` () =
+    // 3窓にする——2窓だと「2番目」が常に「唯一の他の窓」になり、本当にHistoryの順序（2番目≠先頭）を
+    // 見ているのか、単に「focused以外の窓」を見ているだけなのかを区別できない
+    // （FocusNext/FocusPreviousの方向違いと同じ理由で、最初のmutation testingの試行で実際に踏んだ）。
+    let w1, w2, w3 = WindowId 1L, WindowId 2L, WindowId 3L
+    let afterW1 = settleOneMonitorThenDiscoverWindow w1
+    let afterW2 = step RuntimePolicy.defaults afterW1.Next (mkEnvelope 101L (visibleWindowObserved w2))
+    let afterW3 = step RuntimePolicy.defaults afterW2.Next (mkEnvelope 102L (visibleWindowObserved w3))
+    let ws0 = WorkspaceSet.workspaceOf w1 afterW3.Next.Workspaces |> Option.get
+
+    // Historyを[w1;w2;w3]の順に積む：w1→w2→w3の順でフォーカスし、最後にw1へ戻る
+    // （focused=ManagedWindow w1、History=[w1;w3;w2]）。2番目=w3。
+    let afterFocusW1 = step RuntimePolicy.defaults afterW3.Next (mkEnvelope 103L (mkForegroundObserved 103L w1))
+    let afterFocusW2 = step RuntimePolicy.defaults afterFocusW1.Next (mkEnvelope 104L (mkForegroundObserved 104L w2))
+    let afterFocusW3 = step RuntimePolicy.defaults afterFocusW2.Next (mkEnvelope 105L (mkForegroundObserved 105L w3))
+    let afterFocusW1Again = step RuntimePolicy.defaults afterFocusW3.Next (mkEnvelope 106L (mkForegroundObserved 106L w1))
+    Assert.Equal<WindowId list>([ w1; w3; w2 ], afterFocusW1Again.Next.Focus.History)
+
+    let afterFmr = step RuntimePolicy.defaults afterFocusW1Again.Next (mkEnvelope 107L (UserCommand FocusMostRecent))
+    // w3はws0に既にcurrentなので、Topologyのviewは変わらず直接RequestForegroundする。
+    match displays afterFmr.Next.Topology with
+    | Displays (current, []) -> Assert.Equal(ws0, current.Workspace)
+    | other -> failwithf "expected the single monitor to stay on ws0, got %A" other
+    match (WorkspaceSet.stateOf ws0 afterFmr.Next.Workspaces).Stack with
+    | Some z -> Assert.Equal(w3, z.Focus)
+    | None -> Assert.True(false, "expected ws0's zipper to keep a Stack")
+    let effects = afterFmr.Effects |> List.map GatedEffect.effect
+    Assert.Contains(effects, function RequestForeground (_, target) -> target = w3 | _ -> false)
+
+[<Fact>]
+let ``FocusMostRecentは、focused=Elsewhereなら(2番目ではなく)Historyの先頭へ移る(v2.38)`` () =
+    let w1, w2 = WindowId 1L, WindowId 2L
+    let afterW1 = settleOneMonitorThenDiscoverWindow w1
+    let afterW2 = step RuntimePolicy.defaults afterW1.Next (mkEnvelope 101L (visibleWindowObserved w2))
+    let afterFocusW1 = step RuntimePolicy.defaults afterW2.Next (mkEnvelope 102L (mkForegroundObserved 102L w1))
+    // フォアグラウンドがどの窓も指さなくなる(Elsewhereへ)。Historyは[w1]のまま変わらない
+    // （updateHistoryはManagedWindowへ変わったときだけ書くので、Elsewhereへの変化では削らない）。
+    let elsewhereObs: Observation<WindowId option> = { Value = Ok None; SampleSequence = 103L; MonotonicTime = 103L; Source = "test" }
+    let afterElsewhere = step RuntimePolicy.defaults afterFocusW1.Next (mkEnvelope 103L (ForegroundObserved elsewhereObs))
+    Assert.Equal<WindowId list>([ w1 ], afterElsewhere.Next.Focus.History)
+
+    let afterFmr = step RuntimePolicy.defaults afterElsewhere.Next (mkEnvelope 104L (UserCommand FocusMostRecent))
+    let effects = afterFmr.Effects |> List.map GatedEffect.effect
+    Assert.Contains(effects, function RequestForeground (_, target) -> target = w1 | _ -> false)
+
+[<Fact>]
+let ``FocusMostRecentは、行き先の窓のWorkspaceがhiddenならSwitchWorkspaceと同じview遷移で表示してからRequestForegroundし、同じstepでReconcileも新しいcurrentを計算し直す(v2.38)`` () =
+    let w1, w2 = WindowId 1L, WindowId 2L
+    let afterW1 = settleOneMonitorThenDiscoverWindow w1
+    let afterFocusW1 = step RuntimePolicy.defaults afterW1.Next (mkEnvelope 101L (mkForegroundObserved 101L w1))
+
+    // w2を、まだ表示されたことの無いWorkspace(hiddenWs)へ直接投入する（既存のSwitchWorkspaceの
+    // hiddenテストと同じ理由で最短構成を使う：このテストの主眼はFocusMostRecentのview遷移配線と
+    // Reconcileの引き金であって、w2がどう分類されたかではない）。Focus.Historyも直接
+    // [w1(現focused); w2]へ設定する——実際のシーケンス（w2を表示していた時にフォーカス→別へ切替で
+    // hiddenに→w1をフォーカス）を全部再現せずに、その結果の状態だけを作る。
+    let hiddenWs = WorkspaceId 999
+    let windows2 =
+        { afterFocusW1.Next.Windows with
+            Records = Map.add w2 { WindowRecord.initial with Classification = Classified (EffTiled, ByUserOverride) } afterFocusW1.Next.Windows.Records }
+    let workspaces2 = WorkspaceSet.addWindow hiddenWs w2 false afterFocusW1.Next.Workspaces
+    let seeded2 =
+        { afterFocusW1.Next with
+            Windows = windows2
+            Workspaces = workspaces2
+            Focus = { afterFocusW1.Next.Focus with History = [ w1; w2 ] } }
+    // 直接構成した直後はhiddenWsを一度もReconcileしていないので、w2のDesiredはまだ無い。
+    Assert.Equal(None, desiredRectOf seeded2.Placement w2)
+
+    let afterFmr = step RuntimePolicy.defaults seeded2 (mkEnvelope 200L (UserCommand FocusMostRecent))
+    match displays afterFmr.Next.Topology with
+    | Displays (current, []) -> Assert.Equal(hiddenWs, current.Workspace)
+    | other -> failwithf "expected hiddenWs to become current, got %A" other
+    match (WorkspaceSet.stateOf hiddenWs afterFmr.Next.Workspaces).Stack with
+    | Some z -> Assert.Equal(w2, z.Focus)
+    | None -> Assert.True(false, "expected hiddenWs's zipper to keep a Stack")
+    let effects = afterFmr.Effects |> List.map GatedEffect.effect
+    Assert.Contains(effects, function RequestForeground (_, target) -> target = w2 | _ -> false)
+    // shouldReconcileがWorkspaceShown経由でも引き金になる(v2.38のバグ修正)ので、新しくcurrentへ
+    // 入ってきたw2は同じstepで実際の矩形を得る(Shown Noneのままではない)。
+    Assert.NotEqual(None, desiredRectOf afterFmr.Next.Placement w2)
+
+[<Fact>]
+let ``FocusMostRecentは、Historyに行き先が無ければ何もしない(v2.38)`` () =
+    let w1 = WindowId 1L
+    let afterW1 = settleOneMonitorThenDiscoverWindow w1
+    let afterFocusW1 = step RuntimePolicy.defaults afterW1.Next (mkEnvelope 101L (mkForegroundObserved 101L w1))
+    // focused=ManagedWindow w1、History=[w1]だけ——2番目が存在しない。
+    Assert.Equal<WindowId list>([ w1 ], afterFocusW1.Next.Focus.History)
+    let afterFmr = step RuntimePolicy.defaults afterFocusW1.Next (mkEnvelope 102L (UserCommand FocusMostRecent))
+    Assert.Equal(afterFocusW1.Next.Workspaces, afterFmr.Next.Workspaces)
+    Assert.Equal(afterFocusW1.Next.Topology, afterFmr.Next.Topology)
+    let effects = afterFmr.Effects |> List.map GatedEffect.effect
+    Assert.DoesNotContain(effects, function RequestForeground _ -> true | _ -> false)

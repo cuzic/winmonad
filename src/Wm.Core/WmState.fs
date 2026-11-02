@@ -286,6 +286,47 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     let topologyState', topologyResponse, topologyEvents, traces =
         Topology.update runtimePolicy.Topology now envelope.Input stateAfterMovability.Topology
 
+    // `UserCommand FocusMostRecent`（§4.4「focused = ManagedWindow _ならHistoryの2番目、Elsewhereなら
+    // 先頭へ移る」、v2.38）：architecture.mdの表では行き先解決は段②のFocus、view遷移は段⑤のTopologyだが、
+    // Placement着手前の現状の`step`は表どおりの8段パイプラインへの組み直しをまだ行っていない（ファイル
+    // 冒頭コメント参照）。v2.27以降の他のUserCommand同様、ここで直接解決・反映する簡略形を採る。
+    // `stateAfterMovability.Focus.History`はこの時点でまだ今回のstepによる更新を受けていない
+    // （Historyの更新は段⑥相当、下記）ので、`focusedBefore`と対にして読める。行き先の窓wのWorkspaceが
+    // hiddenなら`Topology.showWorkspace`（`SwitchWorkspace`と共有、ShownBy=UserView）で表示する——これにより
+    // 下のWorkspaceHidden/Shown・CurrentChanged/WorkspaceShown(UserView)の既存の受け口
+    // （Presence反映・RequestForeground）をそのまま再利用できる。zipperのFocusを先にwへ動かすので、
+    // 下のswitchForegroundEffectsが自然にwへRequestForegroundする（Elsewhereだった場合も含め、常に
+    // 「渡すべき窓」はwそのもの、架空のzipper位置ではない）。
+    let topologyState', topologyEvents, stateAfterMovability, focusMostRecentEffects =
+        match envelope.Input with
+        | UserCommand FocusMostRecent ->
+            let history = stateAfterMovability.Focus.History
+            let target =
+                match focusedBefore with
+                | ManagedWindow _ -> history |> List.tryItem 1
+                | Elsewhere -> history |> List.tryItem 0
+            match target |> Option.bind (fun w -> WorkspaceSet.workspaceOf w stateAfterMovability.Workspaces |> Option.map (fun ws -> w, ws)) with
+            | None -> topologyState', topologyEvents, stateAfterMovability, []
+            | Some (w, ws) ->
+                let workspaces' =
+                    WorkspaceSet.setFocus ws w stateAfterMovability.Workspaces
+                    |> Option.defaultValue stateAfterMovability.Workspaces
+                let stateAfterMovability = { stateAfterMovability with Workspaces = workspaces' }
+                let alreadyCurrent =
+                    match Topology.displays topologyState' with
+                    | Displays (current, _) -> current.Workspace = ws
+                    | NoMonitors -> false
+                if alreadyCurrent then
+                    // 既にcurrentなWorkspace内の窓へ戻るだけ。`showWorkspace`はこの場合[]を返す
+                    // （Topologyのview自体が変わらない）ので、下のCurrentChanged/WorkspaceShown(UserView)
+                    // 経由のswitchForegroundEffectsは発生しない——ここで直接RequestForegroundする。
+                    let rid, placementSt' = Placement.allocateRequestId stateAfterMovability.Placement
+                    topologyState', topologyEvents, { stateAfterMovability with Placement = placementSt' }, [ RequestForeground (rid, w) ]
+                else
+                    let topologyState'', viewEvents = Topology.showWorkspace ws topologyState'
+                    topologyState'', topologyEvents @ viewEvents, stateAfterMovability, []
+        | _ -> topologyState', topologyEvents, stateAfterMovability, []
+
     // `TopologySettled`（Opusレビュー5-3、v2.29で配線）：モニター構成が確定したので、古い配置に基づく
     // 全Pendingを`Superseded`として一括で取り消す（`Placement.onTopologySettled`のコメント参照）。
     // 取り消した代わりを同じstepで必ず発行させるため、`shouldReconcile`（下記）もこのイベントで
@@ -438,13 +479,22 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         { stateAfterBeliefs.Focus with
             History = Focus.updateHistory focusedBefore focusedAfter stateAfterBeliefs.Focus.History }
 
+    // v2.38で`focusedBefore <> focusedAfter`のガードを追加（バグ修正）：architecture.mdの表の出す
+    // DomainEventは「Focus：FocusObserved w」で、Focusがそれを出す条件自体が「focusedの値がstep開始時から
+    // 変わりManagedWindow wになったら」（すぐ上の`Focus.updateHistory`と同じ条件）。ガード無しだと、
+    // 今回のstepでFocusedの信念（OSからの実際のForegroundObserved）が変わっていない間は毎stepこの資格無き
+    // 再同期が走り、FocusNext/FocusPrevious等がこの直前のコードで動かしたzipperのFocusを、まだ古い
+    // ままのFocus.Foreground信念の値へ毎回書き戻してしまう（RequestForegroundのEffect自体は資格通りの
+    // 新しいFocusを使って計算済みなので実害は無いが、`next.Workspaces`のzipperのFocusとReconcileの
+    // `ctx.Focused`が古い窓のままになる——OS側の実際のForegroundObserved確認が届く次のstepまで、
+    // 内部状態が実際のコマンドの結果と食い違う）。
     let workspacesFinal =
         match focusedAfter with
-        | ManagedWindow w ->
+        | ManagedWindow w when focusedBefore <> focusedAfter ->
             match WorkspaceSet.workspaceOf w stateAfterBeliefs.Workspaces with
             | Some ws -> WorkspaceSet.setFocus ws w stateAfterBeliefs.Workspaces |> Option.defaultValue stateAfterBeliefs.Workspaces
             | None -> stateAfterBeliefs.Workspaces
-        | Elsewhere -> stateAfterBeliefs.Workspaces
+        | _ -> stateAfterBeliefs.Workspaces
 
     let next = { stateAfterBeliefs with Focus = focusFinal; Workspaces = workspacesFinal }
 
@@ -461,8 +511,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     // いずれかでWorkspaceの構成が変わった可能性がある場合に限り、現在表示されている全てのWorkspace
     // （アクティブなものだけでなく、他モニターに表示中の可視Workspaceも含む）を順にReconcileする
     // （v2.26。Placement.fsのファイル冒頭「対象外」が挙げていた2項目のうち「複数の可視Workspaceへの
-    // 拡張」を閉じた）。「WorkspaceShown/Hidden経由のReconcileトリガー」はまだ無い——`SwitchWorkspace`
-    // 自体が未配線のため、個々のWorkspaceの表示/非表示だけでの引き金はまだ無い。
+    // 拡張」を閉じた）。
     let shouldReconcile =
         not (List.isEmpty windowsEvents)
         || (match envelope.Input with WindowRemoved _ -> true | _ -> false)
@@ -474,6 +523,15 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         // ChangeLayout（v2.37）：LayoutOverrideが変わるだけで窓の所属は変わらないため、同じ理由で
         // 明示的にここで引き金にする。
         || (match envelope.Input with UserCommand (ChangeLayout _) -> true | _ -> false)
+        // `WorkspaceShown`経由のReconcileトリガー（v2.38で追加。既存の`SwitchWorkspace`（v2.32）の
+        // バグ修正でもある）：`onWorkspaceShown`（上のpresenceEffects）は`Desired`を`Shown None`に
+        // するだけで、実際のレイアウト矩形は計算しない。新しくcurrentへ入ってきたWorkspaceの窓は、
+        // 直前にReconcileされてから分類・並び順が変わっていてもその間Reconcileされていない
+        // （hiddenな間はこのstepの対象外、下のmatch）ため、ここで引き金にしないと`Desired`が
+        // 矩形無しのまま残り`SetRect`が発行されない。`WorkspaceHidden`は自分自身を引き金にする必要は
+        // 無い（hiddenになった側はもうreconcileOneScreenの対象外になるので、トリガーにしても何も
+        // 起こらない）が、同じstepに両方出ることが多いため区別せず検査する。
+        || (topologyEvents |> List.exists (function WorkspaceShown _ | WorkspaceHidden _ -> true | _ -> false))
 
     let reconcileOneScreen (placementSt: PlacementState, effects, cmds) (screen: Screen) =
         let wsState = WorkspaceSet.stateOf screen.Workspace next.Workspaces
@@ -543,7 +601,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
           HiddenByWm = Set.empty
           NeedsRestore = Set.empty }
 
-    let gated, rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects @ switchForegroundEffects @ focusRotateEffects @ closeFocusedEffects)
+    let gated, rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects @ switchForegroundEffects @ focusRotateEffects @ closeFocusedEffects @ focusMostRecentEffects)
 
     // §7.2「GateRejected → Cancelled（Deadlineまで待たず同じstep内で即時に遷移する）」。
     let rejectedRequestIds = rejected |> List.choose fst
