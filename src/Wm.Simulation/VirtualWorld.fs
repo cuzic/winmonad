@@ -1,13 +1,16 @@
 /// ADR-019実装順17：VirtualWorld.fs。architecture.md §12.1。
 ///
-/// このラウンドで実装するのは、`SetRect`Effectを`Immediate`挙動（即座に成功し要求どおりの矩形が
-/// そのまま観測される）で適用する最小の`applyEffect`だけである。対象外にしたこと：
+/// `SetRect`Effectを`Immediate`挙動（即座に成功し要求どおりの矩形がそのまま観測される）と
+/// `DelayedByMs`挙動（呼び出しは即座に成功するが、観測は`Scheduled`へ積まれ`advanceClock`で
+/// 仮想時計を進めた時だけ発火する——§12.1の`ScheduledSimEvent`に相当）で適用する`applyEffect`を
+/// 実装する。対象外にしたこと：
 /// - `RequestForeground`/`SetPresence`/`RequestClose`/`ObserveWindow`/`Reprobe`/`ForgetWindow`/
 ///   `ApplyBatch`/`ObserveAll`：Reconcileがまだ`SetRect`以外を発行しないため（Placement.fsの
 ///   ファイル冒頭コメント参照）、今は何もしない（`[]`を返す）。
-/// - `ScheduledSimEvent`／時刻のずれを伴う観測（`DelayedByMs`等）：`WindowBehaviors.fs`が`Immediate`
-///   だけを持つ現状では、スケジューラーの出口（`ClockMs`を進めて予定イベントを発火する仕組み）自体が
-///   不要なので実装しない。
+/// - `advanceClock`は`Scheduled`の発火だけを行い、`Reducer`のTimerキュー（`PendingDeadline`等）には
+///   関与しない——両者を同じ呼び出しで進める結合は`ScenarioRunner.fs`冒頭コメントが明示的にシナリオ側の
+///   責務としているため、ここでは2つの独立した時計（疑似OSの`Scheduled`とCoreのTimerキュー）を別々に
+///   進める部品だけを提供する。
 /// - `SimEvent`は本書のまま独立した型にせず、直接`InputEvent`として返す（ファイル冒頭の簡略化）。
 ///   §12.1「`applyEffect`が生成するSimEventは…Normalizerを通してからInputEventになる」は、WinEvent
 ///   フック駆動の観測（可視性・最小化・Cloak・スタイル変更）を疑似OS上で再現するための規約であり、
@@ -26,11 +29,17 @@ open Wm.Simulation.WindowBehaviors
 
 type VirtualWindow = { Id: WindowId; Rect: PixelRect; Behavior: WindowBehavior }
 
-/// §12.1。`Scheduled`/`Seed`は`WindowBehaviors`が`Immediate`だけの間は読み書きする者がいないため、
-/// このラウンドでは持たない（ファイル冒頭コメント参照）。
-type VirtualWorld = { Windows: Map<WindowId, VirtualWindow>; ClockMs: int64; NextSampleSequence: int64 }
+/// §12.1「`ScheduledSimEvent`」の最小形：`DelayedByMs`な`SetRect`が、`FireAtMs`に達するまで積まれる
+/// 未発火の観測。`Seed`はまだ`WindowBehaviors`のどの挙動も使わないため持たない。
+type ScheduledObservation = { FireAtMs: int64; Window: WindowId; Rect: PixelRect }
 
-let empty: VirtualWorld = { Windows = Map.empty; ClockMs = 0L; NextSampleSequence = 0L }
+type VirtualWorld =
+    { Windows: Map<WindowId, VirtualWindow>
+      ClockMs: int64
+      NextSampleSequence: int64
+      Scheduled: ScheduledObservation list }
+
+let empty: VirtualWorld = { Windows = Map.empty; ClockMs = 0L; NextSampleSequence = 0L; Scheduled = [] }
 
 let addWindow (w: WindowId) (rect: PixelRect) (behavior: WindowBehavior) (world: VirtualWorld) : VirtualWorld =
     { world with Windows = Map.add w { Id = w; Rect = rect; Behavior = behavior } world.Windows }
@@ -77,4 +86,33 @@ let applyEffect (now: int64) (world: VirtualWorld) (gated: GatedEffect) : Virtua
                         { emptySnapshot w with
                             VisibleFrameRect = Some { Value = Ok rect; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" } }
                 world', [ observed ], [ rid, Ok () ]
+            | DelayedByMs delayMs ->
+                // 呼び出し自体は即座に成功する（SetWindowPosはOSに受理された時点で返る）。要求どおりの
+                // 矩形の観測だけが`FireAtMs`まで遅れる（`advanceClock`参照）。
+                let world' =
+                    { world with
+                        Windows = Map.add w { vw with Rect = rect } world.Windows
+                        Scheduled = { FireAtMs = now + delayMs; Window = w; Rect = rect } :: world.Scheduled }
+                world', [], [ rid, Ok () ]
     | _ -> world, [], [] // このラウンドで対象外のEffect種別（ファイル冒頭参照）
+
+/// 疑似OSの仮想時計を`toMs`まで進め、`FireAtMs <= toMs`の予定観測を発火時刻の昇順で発火させる
+/// （`Reducer`のTimerキューは別物であり、これは関与しない——ファイル冒頭コメント参照）。
+let advanceClock (toMs: int64) (world: VirtualWorld) : VirtualWorld * InputEvent list =
+    let due, notYet = world.Scheduled |> List.partition (fun s -> s.FireAtMs <= toMs)
+    let dueSorted = due |> List.sortBy (fun s -> s.FireAtMs)
+    let observed, nextSeq =
+        dueSorted
+        |> List.fold
+            (fun (acc, sampleSeq) s ->
+                let ev =
+                    WindowObserved
+                        { emptySnapshot s.Window with
+                            VisibleFrameRect = Some { Value = Ok s.Rect; SampleSequence = sampleSeq; MonotonicTime = s.FireAtMs; Source = "virtual-world" } }
+                acc @ [ ev ], sampleSeq + 1L)
+            ([], world.NextSampleSequence)
+    { world with
+        ClockMs = max world.ClockMs toMs
+        NextSampleSequence = nextSeq
+        Scheduled = notYet },
+    observed

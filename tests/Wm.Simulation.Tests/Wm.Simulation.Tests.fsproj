@@ -8,6 +8,7 @@
   <ItemGroup>
     <Compile Include="ConstrainedWindowScenario.fs" />
     <Compile Include="VirtualWorldScenarioTests.fs" />
+    <Compile Include="DelayedWindowScenario.fs" />
   </ItemGroup>
 
   <ItemGroup>

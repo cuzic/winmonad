@@ -1,5 +1,18 @@
 # Windows プログラマブル・ウィンドウマネージャー 統合設計書
 
+Version: 2.25（`Wm.Simulation`の`WindowBehavior`に`DelayedByMs`（§12.1の`ScheduledSimEvent`相当：
+`SetRect`の呼び出し自体は即座に成功するが、要求どおりの矩形の観測は指定ミリ秒だけ遅れて届く）を追加し、
+`VirtualWorld`に`Scheduled`（未発火の予定観測）と`advanceClock`（仮想時計を進め期限到達分だけ発火する）
+を実装した。`ScenarioRunner.fs`が冒頭コメントで明示的に「タイマー駆動の往復はシナリオ側の責務のまま
+結合しない」としていた部分を初めて専用シナリオ（`tests/Wm.Simulation.Tests/DelayedWindowScenario.fs`）
+として書き、疑似OS側の`Scheduled`とCore側の`PendingDeadline`タイマー（`Reducer.AdvanceToNextTimer`）
+という互いに無関係な2つの時計の競合——遅延観測がPendingDeadlineより先に届く場合（`advanceClock`の
+発火でSatisfied）と、PendingDeadlineより後にしか届かない場合（`AdvanceToNextTimer`がTimeoutを先に
+発火してPendingを打ち切る）——の両方を検証した。実装中、`settleTopology`ヘルパーが`ScreenSettle`→
+`Grace`遷移で新たに始動する`ScreenGrace`タイマー（250ms後）を汲み取らずに残していたため、
+`AdvanceToNextTimer`を明示的に呼ぶシナリオでは最速の期限としてこれが先に誤ってポップされてしまう
+取りこぼしを見つけて修正した（`ConstrainedWindowScenario.fs`等、`AdvanceToNextTimer`を二度と呼ばない
+既存シナリオでは無害だったため、これまで気付かれていなかった）。
 Version: 2.24（§4.5のMovability信念規則のうち未実装だった「`Satisfied`（Pendingが観測と一致）の瞬間に
 `Movable`（`Confirmed`）へ確定する」を`checkPendingSatisfied`に実装した。「試したかどうか」の判定は
 不要で、この遷移は無条件に「配置できた」という直接の証拠であり、既にMovableの窓に対しても確度を
@@ -22,7 +35,10 @@ Version: 2.23（v2.22で見つけ記録した既知のギャップ（`Denied Oth
 これにより、前バージョンで「安全だが非効率」としていた無駄な再試行・ゲート拒否の繰返しが止まる）／
 `checkPendingSatisfied`が一致観測を検出した瞬間に`Movability`を`Movable`（`Confirmed`）へ確定するように
 した。`Mismatch` → `Reevaluate`は安全上の理由（鮮度判定無しでは誤判定の危険）で意図的に未実装のまま
-とすることを明文化した（v2.24）
+とすることを明文化した（v2.24）／`Wm.Simulation`の`WindowBehavior`に`DelayedByMs`と
+`VirtualWorld.advanceClock`を実装し、疑似OS側の遅延観測とCoreの`PendingDeadline`タイマーという
+2つの独立した時計が絡むシナリオを初めて専用テストとして書いた。既存シナリオには影響しない
+`settleTopology`の`ScreenGrace`タイマー取りこぼしを発見・修正した（v2.25）
 Version: 2.22（Wm.Simulationが`EffectCallReturned`を実際に返せるようになったので（v2.21）、
 `InputEvent.EffectCallReturned`をPlacement/Healthへ配線した。`Placement.onEffectCallReturned`は
 `Ok ()`では何もせず（§7.2「目標矩形を観測するまではSatisfiedにしない」）、`Error`は`classify`で
