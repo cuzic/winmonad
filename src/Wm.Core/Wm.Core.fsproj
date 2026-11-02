@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <!-- Wm.Coreは外部パッケージ依存を持たない（architecture.md §17「依存の例外」） -->
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="DomainEvents.fs" />
+    <Compile Include="DecisionTrace.fs" />
+    <Compile Include="Topology.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- §17依存方向：Wm.Core（Contracts・Policy・Layouts）。Wm.Layoutsはまだこのスライスで必要な型が無いため後で追加する。 -->
+    <ProjectReference Include="../Wm.Contracts/Wm.Contracts.fsproj" />
+    <ProjectReference Include="../Wm.Policy/Wm.Policy.fsproj" />
+  </ItemGroup>
+
+</Project>
