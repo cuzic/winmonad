@@ -162,11 +162,18 @@ Phase 0は「要素技術の確認」ではなく、**捨てる前提の素朴�
 - **記録する内容**: 往復ごとの最初のイベント遅延（最小/最大/平均の見立て）、揺れの発生回数、`SetForegroundWindow`のAPI戻り値。
 - **判定**: 「フックの配送自体は速くCI実機では揺れ無し」という前提条件が確認できた（型への反映はまだ早い——下記S20bの結果を合わせて判断する）。CI実機（仮想化・ヘッドレス寄り）での一次データであり、S4がS4rで実デスクトップ再検証を要したのと同様、実デスクトップでの再検証（S20r）が必要かはS20bの結果を見て判断する。
 
-### S20b. SwitchWorkspace実際の順序（hide→show→RequestForeground）での揺れの実測（4.4/R4-5対応）【未検証：CIで実行予定】
+### S20b. SwitchWorkspace実際の順序（hide→show→RequestForeground）での揺れの実測（4.4/R4-5対応）【CI実機検証済み：揺れ無し、SwitchSettleMs=150Lの採用根拠（v2.40）】
+**結果**：`ShowWindow(SW_HIDE)`で前面窓を隠した直後にself-priming付き`SetForegroundWindow`で別窓へ要求する、実際の`SwitchWorkspace`の順序を5往復×2方向（計10回）再現したところ、全ての切替で目的窓への到達は3〜4ms、目的窓到達前に届いた別hwndへのイベントは一度も無かった（S20と合わせて計20回の切替で揺れ0件）。
 - **検証する前提**: S20は「どちらも既にvisibleな2窓間の単純なフォーカス交換」であり、`SwitchSettle`が本来吸収したい経路——`SwitchWorkspace`が旧Workspaceの窓を`SetPresence`で隠し、新Workspaceの窓を見せてからフォーカスを要求する——を再現していなかった。隠す操作自体がOS側の一時的なフォーカス再割り当てを引き起こすかどうかを検証する。
 - **方法**: `Phase0CiSpikes`の`spikeS20b_WorkspaceHideShowSettle`で、`ShowWindow(SW_HIDE)`で前面窓を隠した直後に（self-priming付き）`SetForegroundWindow`で別窓へ要求する、という実際の`SwitchWorkspace`の順序を5往復×2方向（計10回）再現し、目的の窓以外への`EVENT_SYSTEM_FOREGROUND`が先行して届くか（＝本当の意味での「揺れ」）を記録する。
 - **記録する内容**: 往復ごとの目的窓への到達遅延、目的窓到達前に届いた別hwndへのイベントの有無・回数。
-- **判定**: 揺れが一度も発生しなければ、S20の結果と合わせて「CI実機では`SwitchSettle`の揺れ吸収機構自体は（この単純な構成では）不要」という一次データになる。揺れが観測されれば、その発生パターン（常に特定のhwndへ揺れるか、ランダムか）を`SettleMs`や再要求の発火条件の設計に反映する。いずれの結果でも、実デスクトップでの再検証（S20r）が必要かはCI結果を見て判断する。
+- **判定**: 「CI実機（自プロセス内の2窓、仮想化・ヘッドレス寄り）では`SwitchSettle`の揺れ吸収機構自体は不要」という一次データが得られた。S4がS4rで実デスクトップ再検証を要した前例に鑑み、測定値（2〜4ms）そのままではなく十分な安全マージンを取った`SwitchSettleMs = 150L`（`RuntimePolicy`）を暫定採用し、`WmState.step`へ配線した（v2.40）。実デスクトップでの再検証（S20r）は持ち越し。
+
+### S21. SetRectの往復精度（M3、Placement `Mismatch → Reevaluate`設計の前提）【未検証：CIで実行予定】
+- **検証する前提**: `Mismatch → Reevaluate`（§7.2、v2.24以来安全上の理由で対象外のままだった項目）の設計相談（Opus敵対的レビュー）で、「段階1（`PendingDeadline`時点でのMismatch分類）はコードの論理だけで安全」としつつ、その前提として「可視枠（`DWMWA_EXTENDED_FRAME_BOUNDS`）と要求した矩形（`SetWindowPos`に渡す`GetWindowRect`空間の値）が正確に一致するか」の実測を先に求めた——換算がシステム的にずれていれば、段階1導入後は全ての配置が常にMismatchと判定され「止まる」が永続化する逆効果になる。S1が測った「シャドウ」（自作WinForms窓で`diff(L,T,R,B)=(7,0,7,7)`px）が位置・サイズを変えても同じ値のまま使えるかを確認する。
+- **方法**: `Phase0CiSpikes`の`spikeS21_SetRectRoundTrip`で、窓の現在位置でシャドウを測り直し、それを使って3つの異なる位置・サイズへ`SetWindowPos`を発行、`DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`で読み戻した可視枠が要求した矩形と1px単位で一致するかを記録する。
+- **記録する内容**: 測り直したシャドウ値、各ターゲットでの要求矩形・観測されたDWM可視枠・一致したかどうか。
+- **判定**: 全ターゲットで一致すれば、`Mismatch → Reevaluate`段階1導入の前提（M3）が満たされる。一致しない（固定オフセットがあるか、位置依存でシャドウが変わる）場合は、Shell側の換算ロジックに追加の補正が必要であり、段階1の導入前にその補正方法を設計し直す必要がある。
 
 ## 失敗カタログのテンプレート（`docs/failure-catalog.md`、Phase 0完了時に作成）
 

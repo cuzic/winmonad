@@ -32,6 +32,12 @@
 // more faithful reproduction of what SwitchSettle actually guards
 // against: SwitchWorkspace's real hide-then-show-then-RequestForeground
 // order (S20 only exchanged focus between two already-visible windows).
+// S21 was added to ground Placement's Mismatch->Reevaluate design
+// (an Opus adversarial-consult round on this, docs/architecture.md):
+// it measures whether SetWindowPos issued in GetWindowRect-space,
+// corrected by S1's measured shadow, lands exactly on the intended
+// DWM visible-frame rect -- a systematic conversion offset would make
+// a naive Mismatch classifier misfire on every placement.
 // The *r-suffixed spikes (S4r/S5r/S7r/S11r) are real-desktop-
 // only: they need a genuine interactive desktop (an existing third-party
 // foreground window, a modern UWP shell, an already-running elevated
@@ -1773,6 +1779,66 @@ let spikeS20b_WorkspaceHideShowSettle () =
         finally
             UnhookWinEvent(hook) |> ignore
 
+// S21 (M3): SetRectの往復精度——GetWindowRect空間で発行したSetWindowPosが、DWM可視枠
+// (DWMWA_EXTENDED_FRAME_BOUNDS)上で意図した矩形へ正確に戻るか。architecture.mdのPlacement
+// `Mismatch -> Reevaluate`設計相談（Opus）が、段階1（PendingDeadline時点でのMismatch分類）を
+// 安全に採用する前提として先に実測を求めた項目：換算がシステム的にずれていると、段階1導入後は
+// 全ての配置が常にMismatchと判定され「止まる」が永続化する逆効果になる（S8参照）。
+// S1で測った「シャドウ」（GetWindowRectとDWM可視枠の差、自作WinForms窓で(7,0,7,7)px）がこの窓の
+// 現在位置でも同じ値になるか測り直し、それを使って複数の異なる位置・サイズへSetWindowPosし、
+// DWM可視枠が要求した矩形と1px単位で一致するかを確認する。
+let spikeS21_SetRectRoundTrip () =
+    let DWMWA_EXTENDED_FRAME_BOUNDS = 9
+    let SWP_NOZORDER = 0x0004u
+    let SWP_NOACTIVATE = 0x0010u
+
+    let readDwmFrame (hwnd: IntPtr) : RECT option =
+        let mutable r = RECT()
+        let hr = DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &r, Marshal.SizeOf(typeof<RECT>))
+        if hr = 0 then Some r else None
+
+    let readWindowRect (hwnd: IntPtr) : RECT option =
+        let mutable r = RECT()
+        if GetWindowRect(hwnd, &r) then Some r else None
+
+    use form = new Form(Text = "S21", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(100, 100, 400, 300))
+    form.Show()
+    pump 5
+
+    match readWindowRect form.Handle, readDwmFrame form.Handle with
+    | Some wr0, Some dwm0 ->
+        let shadowL = dwm0.Left - wr0.Left
+        let shadowT = dwm0.Top - wr0.Top
+        let shadowR = wr0.Right - dwm0.Right
+        let shadowB = wr0.Bottom - dwm0.Bottom
+        log (sprintf "- measured shadow at initial position: (L=%d,T=%d,R=%d,B=%d) (S1 found (7,0,7,7) on this same window type)" shadowL shadowT shadowR shadowB)
+
+        let tryTarget (label: string) (targetX: int) (targetY: int) (targetW: int) (targetH: int) =
+            // target は欲しいDWM可視枠。GetWindowRect空間の呼出矩形へ、測ったシャドウで変換してSetWindowPosする。
+            let callX = targetX - shadowL
+            let callY = targetY - shadowT
+            let callW = targetW + shadowL + shadowR
+            let callH = targetH + shadowT + shadowB
+            let apiOk = SetWindowPos(form.Handle, IntPtr.Zero, callX, callY, callW, callH, SWP_NOZORDER ||| SWP_NOACTIVATE)
+            pump 5
+            match readDwmFrame form.Handle with
+            | Some dwm' ->
+                let observedW = dwm'.Right - dwm'.Left
+                let observedH = dwm'.Bottom - dwm'.Top
+                let exactMatch = dwm'.Left = targetX && dwm'.Top = targetY && observedW = targetW && observedH = targetH
+                log (
+                    sprintf
+                        "- %s: API returned=%b, target=(%d,%d,%d,%d), observed-DWM=(%d,%d,%d,%d), exact-match=%b"
+                        label apiOk targetX targetY targetW targetH dwm'.Left dwm'.Top observedW observedH exactMatch
+                )
+            | None -> log (sprintf "- %s: DwmGetWindowAttribute failed after SetWindowPos" label)
+
+        tryTarget "same position/size as measured (sanity check)" dwm0.Left dwm0.Top (dwm0.Right - dwm0.Left) (dwm0.Bottom - dwm0.Top)
+        tryTarget "moved+resized (workArea-like target)" 0 0 960 540
+        tryTarget "moved again (different quadrant)" 960 540 960 540
+        tryTarget "re-measure at a third position/size" 200 150 500 400
+    | _ -> log "- failed to read initial GetWindowRect/DWM frame"
+
 [<STAThread>]
 [<EntryPoint>]
 let main argv =
@@ -1834,6 +1900,7 @@ let main argv =
         tryRun "S19 DpiAwareness問い合わせの健全性確認(低優先、実多DPI問題は未解決)" (fun () -> spikeS19_DpiAwarenessQuery exePath)
         tryRun "S20 SwitchSettleのための前面切替フック遅延/揺れの実測(4.4/R4-5)" spikeS20_SwitchSettleTiming
         tryRun "S20b SwitchWorkspace実際の順序(hide->show->RequestForeground)での揺れの実測(4.4/R4-5)" spikeS20b_WorkspaceHideShowSettle
+        tryRun "S21 SetRectの往復精度(M3、Placement Mismatch->Reevaluate設計の前提)" spikeS21_SetRectRoundTrip
 
         log "\n(all spikes finished without the watchdog firing)"
         0
