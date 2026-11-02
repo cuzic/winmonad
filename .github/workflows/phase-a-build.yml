@@ -18,8 +18,8 @@ on:
 
 jobs:
   build-and-test:
-    # architecture.md §17.1：Linuxで Core, Policy, Layout, PlanValidator, Journal, Runtime, Normalization
-    # のビルドとテストを行う（Windows固有の層はWindows側の統合試験で別途検証する）。
+    # architecture.md §17.1：Linuxで Core, Policy, Layout, PlanValidator, Journal, Runtime, Normalization,
+    # Simulation のビルドとテストを行う（Windows固有の層はWindows側の統合試験で別途検証する）。
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

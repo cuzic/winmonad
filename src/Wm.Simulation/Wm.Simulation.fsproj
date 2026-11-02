@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="WindowBehaviors.fs" />
+    <Compile Include="VirtualWorld.fs" />
+    <Compile Include="ScenarioRunner.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- §17依存方向：Wm.Simulation（Core・Runtime・Normalization）。Wm.Normalizationは、SimEventが
+         RawWindowEvent経由（Raw層駆動）になるまでこのラウンドでは不要（VirtualWorld.fsのファイル
+         冒頭コメント参照。Wm.Layoutsが実際に使われるまでWm.Coreに追加されなかったのと同じ理由）。 -->
+    <ProjectReference Include="../Wm.Contracts/Wm.Contracts.fsproj" />
+    <ProjectReference Include="../Wm.Core/Wm.Core.fsproj" />
+    <ProjectReference Include="../Wm.Runtime/Wm.Runtime.fsproj" />
+  </ItemGroup>
+
+</Project>

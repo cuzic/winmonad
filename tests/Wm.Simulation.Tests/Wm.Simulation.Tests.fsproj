@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="ConstrainedWindowScenario.fs" />
+    <Compile Include="VirtualWorldScenarioTests.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/Wm.Contracts/Wm.Contracts.fsproj" />
+    <ProjectReference Include="../../src/Wm.Policy/Wm.Policy.fsproj" />
+    <ProjectReference Include="../../src/Wm.Core/Wm.Core.fsproj" />
+    <ProjectReference Include="../../src/Wm.Runtime/Wm.Runtime.fsproj" />
+    <ProjectReference Include="../../src/Wm.Simulation/Wm.Simulation.fsproj" />
+  </ItemGroup>
+
+</Project>
