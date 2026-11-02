@@ -21,9 +21,11 @@ let private mkMonitor (id: int) (primary: bool) : MonitorSnapshot =
       Dpi = 96
       IsPrimary = primary }
 
+/// 常にモニター0を含む（空にならない）。これらのテストは`initial Map.empty`（NoMonitors）から出発するため、
+/// 観測したトポロジが空だと「変化が無い」と判定されてSettlingへ入らなくなる（Opusレビュー3-2の修正で
+/// 意図した新しい挙動）。各テストはトポロジが実際に変化する前提で書かれているので、非空を保証する。
 let private mkSnapshots (rawIds: int list) : MonitorSnapshot list =
-    rawIds
-    |> List.map (fun i -> abs i % 8)
+    0 :: (rawIds |> List.map (fun i -> abs i % 8))
     |> List.distinct
     |> List.map (fun i -> mkMonitor i (i = 0))
 
@@ -38,7 +40,7 @@ let ``#21前半 StableでMonitorTopologyObservedを受けるとSettlingへ入り
     let expectedHardDeadline = now64 + config.HardDeadlineMs
 
     (phase state' = Settling (snapshots, expectedDeadline, expectedHardDeadline))
-    && (response.TimerCommands = [ StartTimer (Topology ScreenSettle, config.SettleMs) ])
+    && (response.TimerCommands = [ StartTimer (TimerId.Topology ScreenSettle, config.SettleMs) ])
     && (response.Actions = [])
     && (events = [])
     && (trace = [])
@@ -53,7 +55,7 @@ let ``#21後半 deadline未到達のTimerElapsedは状態・応答を一切変�
     | Settling (_, deadline, _) ->
         let offset = (int64 (abs earlyOffsetRaw)) + 1L // 1以上。記録したdeadlineより厳密に前の時刻（古い発火）
         let firedAt = deadline - offset
-        let state2, response, events, trace = update config firedAt (TimerElapsed (Topology ScreenSettle)) state1
+        let state2, response, events, trace = update config firedAt (TimerElapsed (TimerId.Topology ScreenSettle)) state1
         (state2 = state1)
         && (response.Actions = [])
         && (response.TimerCommands = [])
@@ -64,8 +66,18 @@ let ``#21後半 deadline未到達のTimerElapsedは状態・応答を一切変�
 [<Property>]
 let ``#21後半 待ちが存在しない(Stable)間のTimerElapsedも状態を変えない`` (firedAt: int) =
     let state = initial Map.empty
-    let state', response, events, trace = update config (int64 firedAt) (TimerElapsed (Topology ScreenSettle)) state
+    let state', response, events, trace = update config (int64 firedAt) (TimerElapsed (TimerId.Topology ScreenSettle)) state
     (state' = state) && (response.Actions = []) && (response.TimerCommands = []) && (events = []) && (trace = [])
+
+/// Opusレビュー3-2の回帰テスト：Stable/Graceで、現在のDisplaysと同じ内容のMonitorTopologyObservedを
+/// 受けてもSettlingへ入らない（これが無いと、settleが出すObserveAllへの応答が同じトポロジを含むたびに
+/// Settling→Grace→Settling…を無限に繰り返す）。
+[<Property>]
+let ``#21前半 変化していないトポロジ観測ではStableからSettlingへ入らない`` (now: int) =
+    let state = initial Map.empty // NoMonitors
+    let unchanged = [] // currentMonitors state = [] と一致する観測
+    let state', response, events, trace = update config (int64 now) (MonitorTopologyObserved unchanged) state
+    (phase state' = Stable) && (response.Actions = []) && (response.TimerCommands = []) && (events = []) && (trace = [])
 
 [<Property>]
 let ``deadline到達ちょうどのTimerElapsedは本物の発火としてGraceへ進む`` (settlingStart: int) (rawIds: int list) =
@@ -75,11 +87,11 @@ let ``deadline到達ちょうどのTimerElapsedは本物の発火としてGrace�
 
     match phase state1 with
     | Settling (_, deadline, _) ->
-        let state2, response, _events, _trace = update config deadline (TimerElapsed (Topology ScreenSettle)) state1
+        let state2, response, _events, _trace = update config deadline (TimerElapsed (TimerId.Topology ScreenSettle)) state1
         match phase state2 with
         | Grace _ ->
             (response.Actions = [ ObserveAll ])
             && (response.TimerCommands
-                |> List.contains (CancelTimer (Topology ScreenSettle)))
+                |> List.contains (CancelTimer (TimerId.Topology ScreenSettle)))
         | _ -> false
     | _ -> false

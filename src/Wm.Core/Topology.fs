@@ -26,7 +26,12 @@ type TopologyState =
         { Displays: Displays
           Phase: ScreenPhase
           Assignments: Map<WorkspaceId, MonitorSelector>
-          Returns: Map<WorkspaceId, MonitorId> }
+          Returns: Map<WorkspaceId, MonitorId>
+          /// 最後に観測したモニター構成（§7.1段①「全入力について無条件に最初に行う」の具体化）。
+          /// `ScreenPhase`はPhaseをまたいで値を保持する場所を持たないため、Reconfiguringの解除や
+          /// ReconfigurationCapの満了でSettlingへ入るときに使う「latest」をここから取る
+          /// （Opusレビュー3-1：これが無いと、観測を伴わない遷移が`latest=[]`で確定しNoMonitorsになる）。
+          LastObserved: MonitorSnapshot list option }
 
 /// Settling/Grace/Reconfigurationの既定値。実測値はPhase 0〜Bの実機Journalから決める（§7.3）。
 type TopologyConfig =
@@ -48,7 +53,8 @@ let initial (assignments: Map<WorkspaceId, MonitorSelector>) : TopologyState =
     { Displays = NoMonitors
       Phase = Stable
       Assignments = assignments
-      Returns = Map.empty }
+      Returns = Map.empty
+      LastObserved = None }
 
 let displays (s: TopologyState) : Displays = s.Displays
 let phase (s: TopologyState) : ScreenPhase = s.Phase
@@ -60,6 +66,10 @@ let private shownScreens (d: Displays) : Screen list =
 
 let isShown (ws: WorkspaceId) (s: TopologyState) : bool =
     shownScreens s.Displays |> List.exists (fun sc -> sc.Workspace = ws)
+
+/// 現在表示中のモニターの一覧（§15.1 #17のX1が参照する「Topologyが表示するWorkspace」と対になる射影）。
+let private currentMonitors (s: TopologyState) : MonitorSnapshot list =
+    shownScreens s.Displays |> List.map (fun sc -> sc.Monitor)
 
 // ===== MonitorLifecycle.reconcile（§4.4/§7.3、S8） =====
 
@@ -144,10 +154,14 @@ module MonitorLifecycle =
 
                     // 「hiddenなWorkspace」はTopologyが知る全体では無いが、WorkspaceSetは全域（R6-1）なので
                     // 「表示されていない最小のWorkspaceId」で代用できる（未使用の最小IDと同じ集合になる）。
+                    // ただし、他のモニターへの`Returns`を持つWorkspaceは「予約済み」として除外する
+                    // （Opusレビュー3-3：除外しないと、cascaded disconnect/reconnectの途中で無関係な
+                    // 新規モニターがReturns待ちのWorkspaceを奪い、§15.1 #18「各Workspaceは最初の所有者へ戻る」
+                    // が破れる）。
                     let bySmallestUnshown =
                         Seq.initInfinite id
                         |> Seq.map WorkspaceId
-                        |> Seq.find (fun ws -> not (Set.contains ws alreadyShown))
+                        |> Seq.find (fun ws -> not (Set.contains ws alreadyShown) && not (Map.containsKey ws returns))
 
                     let chosen =
                         byReturn
@@ -190,76 +204,85 @@ let update (config: TopologyConfig) (now: int64) (input: InputEvent) (state: Top
     let noResponse = { Actions = []; TimerCommands = [] }
 
     /// 安定を確定し、最新トポロジでreconcileし、全体再観測を発行してGraceへ進む（§7.3）。
-    let settle (latest: MonitorSnapshot list) =
-        let state', events = MonitorLifecycle.reconcile state latest
+    let settle (st: TopologyState) (latest: MonitorSnapshot list) =
+        let state', events = MonitorLifecycle.reconcile st latest
         let graceDeadline = now + config.GraceMs
         { state' with Phase = Grace graceDeadline },
         { Actions = [ ObserveAll ]
-          TimerCommands = [ CancelTimer (Topology ScreenSettle); StartTimer (Topology ScreenGrace, config.GraceMs) ] },
+          TimerCommands =
+            [ CancelTimer (TimerId.Topology ScreenSettle)
+              StartTimer (TimerId.Topology ScreenGrace, config.GraceMs) ] },
         events @ [ TopologySettled latest ],
         []
 
+    let enterSettling (st: TopologyState) (latest: MonitorSnapshot list) (hardDeadline: int64) =
+        let deadline = now + config.SettleMs
+        { st with Phase = Settling (latest, deadline, hardDeadline) },
+        { Actions = []; TimerCommands = [ StartTimer (TimerId.Topology ScreenSettle, config.SettleMs) ] },
+        [],
+        []
+
+    /// Reconfiguringの解除／ReconfigurationCap満了でSettlingへ入るときに使う最新トポロジ。これらの入力
+    /// 自身はモニター構成を運ばないため、段①で無条件に更新している`LastObserved`を使う（無ければ現在の
+    /// Displaysのモニターをそのまま使い、reconcileを実質no-opにする。Opusレビュー3-1：これが無いと、
+    /// 観測を伴わない遷移が`latest=[]`で確定してしまい、ロック→アンロックだけでNoMonitorsになる）。
+    let latestForForcedSettle () = state.LastObserved |> Option.defaultValue (currentMonitors state)
+
     match input with
+    | MonitorTopologyObserved snapshots ->
+        // 段①相当：全入力について無条件に最初に行う。抑止区間中も観測そのものは記録する（Opusレビュー3-1）。
+        let state1 = { state with LastObserved = Some snapshots }
+        match state1.Phase with
+        | Reconfiguring _ -> state1, noResponse, [], [] // 抑止区間中はPhaseを変えない
+        | Stable
+        | Grace _ when Set.ofList snapshots = Set.ofList (currentMonitors state1) ->
+            // 変化が無いトポロジ観測ではSettlingへ入らない（Opusレビュー3-2：入ってしまうと、settleが出す
+            // ObserveAllの応答が同じトポロジを含むたびにSettling→Grace→Settling…を無限に繰り返す）。
+            state1, noResponse, [], []
+        | Stable
+        | Grace _ -> enterSettling state1 snapshots (now + config.HardDeadlineMs)
+        | Settling (_, _, hardDeadline) when now >= hardDeadline ->
+            // hardDeadlineを過ぎたら、イベントが続いていても強制的に確定する（§7.3）。
+            settle state1 snapshots
+        | Settling (_, _, hardDeadline) -> enterSettling state1 snapshots hardDeadline
     | ScreenReconfigurationInProgress true ->
         match state.Phase with
         | Reconfiguring _ -> state, noResponse, [], []
         | _ ->
             { state with Phase = Reconfiguring now },
-            { Actions = []; TimerCommands = [ StartTimer (Topology ReconfigurationCap, config.ReconfigurationCapMs) ] },
+            { Actions = []; TimerCommands = [ StartTimer (TimerId.Topology ReconfigurationCap, config.ReconfigurationCapMs) ] },
             [],
             []
     | ScreenReconfigurationInProgress false ->
         match state.Phase with
         | Reconfiguring _ ->
-            let deadline = now + config.SettleMs
-            { state with Phase = Settling ([], deadline, now + config.HardDeadlineMs) },
-            { Actions = []; TimerCommands = [ CancelTimer (Topology ReconfigurationCap); StartTimer (Topology ScreenSettle, config.SettleMs) ] },
-            [],
-            []
+            let state', response, events, trace = enterSettling state (latestForForcedSettle ()) (now + config.HardDeadlineMs)
+            state',
+            { response with TimerCommands = CancelTimer (TimerId.Topology ReconfigurationCap) :: response.TimerCommands },
+            events,
+            trace
         | _ -> state, noResponse, [], []
     | UserCommand _ ->
         match state.Phase with
         | Reconfiguring _ ->
-            let deadline = now + config.SettleMs
-            { state with Phase = Settling ([], deadline, now + config.HardDeadlineMs) },
-            { Actions = []; TimerCommands = [ CancelTimer (Topology ReconfigurationCap); StartTimer (Topology ScreenSettle, config.SettleMs) ] },
-            [],
-            []
+            let state', response, events, trace = enterSettling state (latestForForcedSettle ()) (now + config.HardDeadlineMs)
+            state',
+            { response with TimerCommands = CancelTimer (TimerId.Topology ReconfigurationCap) :: response.TimerCommands },
+            events,
+            trace
         | _ -> state, noResponse, [], []
-    | MonitorTopologyObserved snapshots ->
+    | TimerElapsed (TimerId.Topology ScreenSettle) ->
         match state.Phase with
-        | Reconfiguring _ -> state, noResponse, [], [] // 抑止区間中は観測を信念へ反映するのみ（段①）。Phaseは変えない
-        | Stable | Grace _ ->
-            let deadline = now + config.SettleMs
-            { state with Phase = Settling (snapshots, deadline, now + config.HardDeadlineMs) },
-            { Actions = []; TimerCommands = [ StartTimer (Topology ScreenSettle, config.SettleMs) ] },
-            [],
-            []
-        | Settling (_, _, hardDeadline) when now >= hardDeadline ->
-            // hardDeadlineを過ぎたら、イベントが続いていても強制的に確定する（§7.3）。
-            settle snapshots
-        | Settling (_, _, hardDeadline) ->
-            let deadline = now + config.SettleMs
-            { state with Phase = Settling (snapshots, deadline, hardDeadline) },
-            { Actions = []; TimerCommands = [ StartTimer (Topology ScreenSettle, config.SettleMs) ] },
-            [],
-            []
-    | TimerElapsed (Topology ScreenSettle) ->
-        match state.Phase with
-        | Settling (latest, deadline, _) when awaitDeadline (Some deadline) now -> settle latest
+        | Settling (latest, deadline, _) when awaitDeadline (Some deadline) now -> settle state latest
         | _ -> state, noResponse, [], [] // 古い発火は無害（§15.1 #21後半、#3の具体化）
-    | TimerElapsed (Topology ScreenGrace) ->
+    | TimerElapsed (TimerId.Topology ScreenGrace) ->
         match state.Phase with
         | Grace deadline when awaitDeadline (Some deadline) now ->
             { state with Phase = Stable }, noResponse, [], []
         | _ -> state, noResponse, [], []
-    | TimerElapsed (Topology ReconfigurationCap) ->
+    | TimerElapsed (TimerId.Topology ReconfigurationCap) ->
         match state.Phase with
         | Reconfiguring since when awaitDeadline (Some (since + config.ReconfigurationCapMs)) now ->
-            let deadline = now + config.SettleMs
-            { state with Phase = Settling ([], deadline, now + config.HardDeadlineMs) },
-            { Actions = []; TimerCommands = [ StartTimer (Topology ScreenSettle, config.SettleMs) ] },
-            [],
-            []
+            enterSettling state (latestForForcedSettle ()) (now + config.HardDeadlineMs)
         | _ -> state, noResponse, [], []
     | _ -> state, noResponse, [], []

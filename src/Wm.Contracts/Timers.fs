@@ -40,6 +40,11 @@ type HealthTimer =
     | ResponsivenessReprobe of WindowId
 
 /// 親のTimerId。TimerElapsedはケースで該当ドメインへ振り分ける（Elmの子Msgの持ち上げと同じ）。
+/// ケース名（Placement/Windows/Topology/Focus/Health）がCoreのドメインモジュール名・`WmState`のフィールド名・
+/// 将来の`Wm.Layouts`の`Placement`型・`Wm.Windows`プロジェクト名と衝突するため、`RequireQualifiedAccess`を
+/// 付けて必ず`TimerId.Topology`のように書かせる（Opusレビュー5-1。付けない場合、F#の名前解決がopenの順序に
+/// 依存して変わり、パターン`| Placement p ->`が意図しない型へ束縛される誤りが読みにくい形で起こり得る）。
+[<RequireQualifiedAccess>]
 type TimerId =
     | Placement of PlacementTimer
     | Windows of WindowsTimer
