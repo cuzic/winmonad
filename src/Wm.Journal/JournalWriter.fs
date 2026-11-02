@@ -24,6 +24,7 @@ let private timerIdTag (id: TimerId) : string =
     match id with
     | TimerId.Placement (PendingDeadline _) -> "placement-pending-deadline"
     | TimerId.Placement (IntegrityReprobe _) -> "placement-integrity-reprobe"
+    | TimerId.Placement (PresenceDeadline _) -> "placement-presence-deadline"
     | TimerId.Windows (ClassificationDeadline _) -> "windows-classification-deadline"
     | TimerId.Topology ScreenSettle -> "topology-screen-settle"
     | TimerId.Topology ScreenGrace -> "topology-screen-grace"
@@ -33,7 +34,8 @@ let private timerIdTag (id: TimerId) : string =
 
 let private windowIdOf (id: TimerId) : JsonNode option =
     match id with
-    | TimerId.Placement (PendingDeadline (RequestId rid)) -> Some (JsonValue.Create(rid) :> JsonNode)
+    | TimerId.Placement (PendingDeadline (RequestId rid))
+    | TimerId.Placement (PresenceDeadline (RequestId rid)) -> Some (JsonValue.Create(rid) :> JsonNode)
     | TimerId.Placement (IntegrityReprobe (WindowId w))
     | TimerId.Windows (ClassificationDeadline (WindowId w))
     | TimerId.Health (ResponsivenessReprobe (WindowId w)) -> Some (JsonValue.Create(w) :> JsonNode)
@@ -53,6 +55,7 @@ let private timerIdOfJson (node: JsonNode) : TimerId =
     match tag with
     | "placement-pending-deadline" -> TimerId.Placement (PendingDeadline (RequestId (refVal ())))
     | "placement-integrity-reprobe" -> TimerId.Placement (IntegrityReprobe (WindowId (refVal ())))
+    | "placement-presence-deadline" -> TimerId.Placement (PresenceDeadline (RequestId (refVal ())))
     | "windows-classification-deadline" -> TimerId.Windows (ClassificationDeadline (WindowId (refVal ())))
     | "topology-screen-settle" -> TimerId.Topology ScreenSettle
     | "topology-screen-grace" -> TimerId.Topology ScreenGrace

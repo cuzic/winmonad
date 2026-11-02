@@ -237,6 +237,9 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         | TimerElapsed (TimerId.Placement (PendingDeadline rid)) ->
             let s, e, t = Placement.onPendingDeadlineTimerFired now rid stateAfterWindows.Placement
             s, e, t, None
+        | TimerElapsed (TimerId.Placement (PresenceDeadline rid)) ->
+            let s, t = Placement.onPresenceDeadlineTimerFired now rid stateAfterWindows.Placement
+            s, [], t, None
         | EffectCallReturned (rid, result) ->
             let s, e, t, failureInfo = Placement.onEffectCallReturned now envelope.Sequence rid result stateAfterWindows.Placement
             s, e, t, failureInfo
@@ -396,10 +399,10 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         (WorkspaceSet.stateOf ws stateAfterMovability.Workspaces).Stack |> Option.map Zipper.toList |> Option.defaultValue []
     let hiddenWindows = topologyEvents |> List.choose (function WorkspaceHidden ws -> Some ws | _ -> None) |> List.collect windowsOfWorkspace
     let shownWindows = topologyEvents |> List.choose (function WorkspaceShown (ws, _) -> Some ws | _ -> None) |> List.collect windowsOfWorkspace
-    let stateAfterMovability, presenceEffects =
-        let placementSt1, e1 = Placement.onWorkspaceHidden hiddenWindows stateAfterMovability.Placement
-        let placementSt2, e2 = Placement.onWorkspaceShown shownWindows placementSt1
-        { stateAfterMovability with Placement = placementSt2 }, e1 @ e2
+    let stateAfterMovability, presenceEffects, presenceTimerCmds =
+        let placementSt1, e1, t1 = Placement.onWorkspaceHidden now hiddenWindows stateAfterMovability.Placement
+        let placementSt2, e2, t2 = Placement.onWorkspaceShown now shownWindows placementSt1
+        { stateAfterMovability with Placement = placementSt2 }, e1 @ e2, t1 @ t2
 
     // `CurrentChanged`/`WorkspaceShown (_, UserView)`（v2.32で消費を開始）：ユーザーが`SwitchWorkspace`で
     // 明示的に切り替えた先のWorkspaceへ、そのzipperのFocus（Stack=NoneならNone、RequestForegroundは
@@ -689,6 +692,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         @ windowsTimerCmds
         @ vanishTimerCmds
         @ placementTimerCmds
+        @ presenceTimerCmds
         @ topologySettledTimerCmds
         @ reconcileTimerCmds
         @ gateRejectionTimerCmds

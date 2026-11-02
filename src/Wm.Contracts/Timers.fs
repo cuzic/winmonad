@@ -24,6 +24,10 @@ type Response<'TimerId, 'Action> = {
 type PlacementTimer =
     | PendingDeadline of RequestId
     | IntegrityReprobe of WindowId
+    /// `SetPresence`（§4.4のHiddenByWm/Shown）の「実際にそうなったか」の観測による確認（`Satisfied`相当、
+    /// `ObservedPresence`との一致判定）の待ち（v2.41新設）。`PendingDeadline`と同じ形だが、矩形ではなく
+    /// 表示状態を待つので別のRequestId集合（`Placement.PendingPresence`）を指す。
+    | PresenceDeadline of RequestId
 
 type WindowsTimer =
     | ClassificationDeadline of WindowId

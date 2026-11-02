@@ -68,6 +68,18 @@
 /// WorkspaceのウィンドウがOS側では表示されたまま取り残される、という実在する不具合（今回初めて
 /// `SetPresence`を発行するまで、WMはこの種の窓を一度も隠していなかった）を閉じた。
 ///
+/// `SetPresence`の観測による確認（v2.41追加）：`checkPendingSatisfied`（Geometry/`SetRect`）と
+/// 同じ考え方を表示状態へ適用した`PendingPresence`/`checkPendingPresenceSatisfied`を新設し、
+/// `onWorkspaceHidden`/`onWorkspaceShown`が発行する`SetPresence`それぞれに対応する待ちを作る。
+/// `onWindowObserved`で`Geometry.Presence`（`ObservedPresence`信念、既に`reviseGeometryFromSnapshot`が
+/// 修正していた）が`DesiredVisible`と一致した瞬間に待ちを消す。期限到達時（`onPresenceDeadlineTimerFired`）
+/// は`PendingRequest`と違いRetryもDesiredの取消しも行わない単発の諦め——`onWorkspaceHidden`/
+/// `onWorkspaceShown`は（`dispatchPlacements`の`desiredChanged`のような差分判定を持たず）呼ばれる
+/// たびに無条件で`SetPresence`を再発行するので、`Desired`を取り消しても取り消さなくても次回の挙動は
+/// 変わらない。`onGateRejected`/`onWindowVanished`も`PendingPresence`を同時に後始末するよう拡張した。
+/// `onTopologySettled`は意図的に対象外のまま（下記）：Geometry Pendingと違い、表示状態はモニター配置に
+/// 依存しないため、トポロジ確定で失効させる理由が無い。
+///
 
 /// このラウンドで意図的に対象外にしたこと（いずれも「できればやる」ではなく、別の未実装の仕組みが
 /// 前提になっているため実装できない項目であり、専用のラウンドへ切り出す）：
@@ -75,12 +87,12 @@
 ///   v2.28で実装済み（上記）。試行間隔を空ける理由・適切な遅延量はPhase 0の実測が必要。
 /// - **`onEffectCallReturned`の`Unclassified`のRetry**：`Transient`はv2.30で対象にしたが（上記）、
 ///   `Unclassified`（未知の失敗）を当てなく再試行するのは危険なため対象外のまま。
-/// - **`HiddenByWm`/`Shown None`の観測による確認（`Satisfied`相当）**：`onWorkspaceHidden`/
-///   `onWorkspaceShown`（v2.31）は`SetPresence`を発行するだけで、実際に非表示/表示になったかの
-///   確認は無い（`ObservedPresence`信念との一致判定、専用の信念・タイムアウト機構が必要）。
-///   `SetPresence`呼出の`EffectCallReturned`も、これらのRequestIdに対応するPendingが無いため、
-///   現状の`onEffectCallReturned`では「対応するPendingが無い＝無害に無視」される（型直前のコメント
-///   参照）——失敗した`SetPresence`は今は何も検知しない。
+/// - ~~**`HiddenByWm`/`Shown None`の観測による確認（`Satisfied`相当）**~~：v2.41で実装（`PendingPresence`/
+///   `checkPendingPresenceSatisfied`/`onPresenceDeadlineTimerFired`、型直前のコメント参照）。
+///   ただしRetry/Backoffは対象外のまま（`PendingRequest`と同じ理由。期限到達時は単発で諦める）。
+///   `SetPresence`呼出の`EffectCallReturned`（`Error`の場合）は依然`onEffectCallReturned`の対象外
+///   （`PendingPresence`のRequestIdには対応するGeometryのPendingが無いため「対応するPendingが
+///   無い＝無害に無視」されるだけで、失敗を検知しない——専用のラウンドへ切り出す、既知のギャップ）。
 /// - **`Mismatch` → `Reevaluate`**：観測が`TargetRect`と一致しない場合、`checkPendingSatisfied`は
 ///   何もしない（Pendingはそのまま残り、`PendingDeadline`満了か次のReconcileに委ねる）。即座に
 ///   `Desired`を取り消して再試行させる実装も検討したが、`SetRect`完了前に届く無関係な観測
@@ -148,6 +160,16 @@ type DesiredPresence =
 /// WindowsのAwaitingEvidenceと同じ「存在で状態を表す」規約で足りる。
 type PendingRequest = { Window: WindowId; Epoch: IntentEpoch; TargetRect: PixelRect; IssuedAt: int64; Deadline: int64 }
 
+/// `PendingRequest`と同じ考え方（§7.2「待ちをデータで表す」）を`SetPresence`へ適用した最小形
+/// （v2.41新設、ファイル冒頭「`SetPresence`の観測による確認」参照）。`Epoch`/`Retry`は持たない——
+/// `onWorkspaceHidden`/`onWorkspaceShown`は呼ばれるたびに無条件で新しい`SetPresence`を発行する
+/// （`dispatchPlacements`の`desiredChanged`のような「前回と同じ意図かどうか」の判定を持たない）ため、
+/// 同じ窓を指す古い`PendingPresence`が残っていれば（例：隠した直後に再び見せた）`dispatchPlacements`と
+/// 同じ要領で必ず先に失効させる（下記）。この不変条件（1窓につき同時に1つまで）が保たれる限り、
+/// 複数のPendingPresenceが同じ窓を指して競合することは無く、`Epoch`で古い要求を失効させる仕組みは
+/// 要らない。
+type PendingPresence = { Window: WindowId; DesiredVisible: bool; IssuedAt: int64; Deadline: int64 }
+
 type PlacementState =
     { Geometry: Map<WindowId, GeometryBeliefs>
       Movability: Map<WindowId, Belief<Movability>>
@@ -158,6 +180,9 @@ type PlacementState =
       /// （Reconcileが「前回と同じ意図」と判断する基準。§7.3「未完了の同一Targetへの重複要求を発行しない」）。
       Desired: Map<WindowId, DesiredPresence>
       Pending: Map<RequestId, PendingRequest>
+      /// `SetPresence`の観測による確認の待ち（v2.41新設、型直前のコメント参照）。1窓につき同時に
+      /// 1つまで（`onWorkspaceHidden`/`onWorkspaceShown`が古いエントリを必ず先に失効させる）。
+      PendingPresence: Map<RequestId, PendingPresence>
       /// `RequestId`の単一の採番元（§7.1「`EffectCallReturned`の`RequestId`で相関する」ので、採番元は
       /// プロセス全体で1つでなければならない）。物理的にここに置くのは実装の都合——意味的には
       /// `WmState`全体の資源であり、`WmState.step`は`allocateRequestId`（下記）経由で、Placement以外の
@@ -182,6 +207,7 @@ let initial: PlacementState =
       IntegrityReprobes = Map.empty
       Desired = Map.empty
       Pending = Map.empty
+      PendingPresence = Map.empty
       NextRequestId = 0L
       Epochs = Map.empty
       RetryAttempts = Map.empty }
@@ -233,6 +259,31 @@ let private checkPendingSatisfied (now: int64) (w: WindowId) (state: PlacementSt
                 Movability = Map.add w { Value = Movable; Confidence = Confirmed; LastRevisedAt = now } state.Movability
                 RetryAttempts = Map.remove w state.RetryAttempts },
             [ CancelTimer (TimerId.Placement (PendingDeadline rid)) ]
+        | None -> state, []
+
+/// `SetPresence`の観測による確認（v2.41新設、ファイル冒頭「`SetPresence`の観測による確認」参照）：
+/// `checkPendingSatisfied`と同じ形で、窓`w`の現在の`Geometry.Presence`（`ObservedPresence`信念）と、
+/// `w`宛てのPendingPresenceの`DesiredVisible`を照合する。`DesiredVisible = true`なら`VisibleToUser`、
+/// `false`なら`HiddenByWmMethod`で一致（`HiddenOther`は一致させない——§4.4の「WMが隠した」という
+/// 意図への確認であり、ユーザー等の別経路での非表示は別の信念・別の反応の対象であって、ここで
+/// WMの意図が叶ったと誤認してはならない）。
+let private checkPendingPresenceSatisfied (w: WindowId) (state: PlacementState) : PlacementState * TimerCommand<TimerId> list =
+    let observedPresence = Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.Presence)
+    match observedPresence with
+    | None -> state, []
+    | Some presence ->
+        match state.PendingPresence |> Map.toSeq |> Seq.tryFind (fun (_, pp) -> pp.Window = w) with
+        | Some (rid, pp) ->
+            let matches =
+                match pp.DesiredVisible, presence with
+                | true, VisibleToUser -> true
+                | false, HiddenByWmMethod -> true
+                | _ -> false
+            if matches then
+                { state with PendingPresence = Map.remove rid state.PendingPresence },
+                [ CancelTimer (TimerId.Placement (PresenceDeadline rid)) ]
+            else
+                state, []
         | None -> state, []
 
 /// `WindowObserved`：§7.1段①「Windows→Placement→Health→Focus」のPlacement分。Windowsと同じ入力から
@@ -297,7 +348,8 @@ let onWindowObserved (now: int64) (snapshot: WindowSnapshot) (state: PlacementSt
     // Mismatch（§7.2の`Reevaluate`）はこのラウンドでは明示的に扱わず、一致しなければ次のPendingDeadline
     // タイマーの発火（またはこの先の再Reconcile）に委ねる（ファイル冒頭「対象外」参照）。
     let pendingState, pendingTimerCmds = checkPendingSatisfied now w stateAfterBeliefs
-    pendingState, effects, timerCmds @ pendingTimerCmds
+    let pendingPresenceState, pendingPresenceTimerCmds = checkPendingPresenceSatisfied w pendingState
+    pendingPresenceState, effects, timerCmds @ pendingTimerCmds @ pendingPresenceTimerCmds
 
 let onMinimizedStateChanged (now: int64) (w: WindowId) (obs: Observation<bool>) (state: PlacementState) : PlacementState =
     { state with Geometry = Map.add w (reviseMinimized now (Map.tryFind w state.Geometry |> Option.defaultValue geometryInitial) obs) state.Geometry }
@@ -429,8 +481,10 @@ let onPendingDeadlineTimerFired (now: int64) (rid: RequestId) (state: PlacementS
     | _ -> state, [], []
 
 /// §7.2「GateRejected → Cancelled（Deadlineまで待たず同じstep内で即時に遷移する）」。
-/// `GatedEffect.gate`が返す拒否リストのうち、このstepでPlacementが発行したPendingに対応する
-/// RequestIdだけが対象になる（他ドメインのRequestIdは`Map.tryFind`が`None`を返すだけで無害）。
+/// `GatedEffect.gate`が返す拒否リストのうち、このstepでPlacementが発行したPending（`SetRect`）
+/// またはPendingPresence（`SetPresence`、v2.41）に対応するRequestIdだけが対象になる（他ドメインの
+/// RequestIdは`Map.tryFind`が`None`を返すだけで無害）。`SetPresence`側は`Desired`を取り消さない
+/// （`PendingPresence`の型直前のコメントと同じ理由）。
 let onGateRejected (rejectedRequestIds: RequestId list) (state: PlacementState) : PlacementState * TimerCommand<TimerId> list =
     rejectedRequestIds
     |> List.fold
@@ -442,7 +496,10 @@ let onGateRejected (rejectedRequestIds: RequestId list) (state: PlacementState) 
                     Desired = Map.remove pr.Window st.Desired
                     RetryAttempts = Map.remove pr.Window st.RetryAttempts },
                 cmds @ [ CancelTimer (TimerId.Placement (PendingDeadline rid)) ]
-            | None -> st, cmds)
+            | None ->
+                match Map.tryFind rid st.PendingPresence with
+                | Some _ -> { st with PendingPresence = Map.remove rid st.PendingPresence }, cmds @ [ CancelTimer (TimerId.Placement (PresenceDeadline rid)) ]
+                | None -> st, cmds)
         (state, [])
 
 /// `EffectCallReturned`：§7.2のPending終端遷移のうち、Coreが直接判断できる部分（ファイル冒頭コメント
@@ -510,43 +567,75 @@ let onTopologySettled (state: PlacementState) : PlacementState * TimerCommand<Ti
         RetryAttempts = affectedWindows |> Set.fold (fun m w -> Map.remove w m) state.RetryAttempts },
     cancelCmds
 
+/// 窓`w`を指す既存の`PendingPresence`があれば取り除き`CancelTimer`する（§7.2「同じ窓へ新しい意図が
+/// 生じた場合、古い要求を失効させる」と同じ理由。`PendingPresence`の型直前のコメント参照）。
+/// `onWorkspaceHidden`/`onWorkspaceShown`の両方が、新しいエントリを追加する前に必ず呼ぶ。
+let private supersedePendingPresence (w: WindowId) (state: PlacementState) : PlacementState * TimerCommand<TimerId> list =
+    let existing = state.PendingPresence |> Map.toSeq |> Seq.filter (fun (_, pp) -> pp.Window = w) |> Seq.map fst |> List.ofSeq
+    { state with PendingPresence = existing |> List.fold (fun m rid -> Map.remove rid m) state.PendingPresence },
+    existing |> List.map (fun rid -> CancelTimer (TimerId.Placement (PresenceDeadline rid)))
+
 /// `DomainEvents.WorkspaceHidden`（§4.4「WMが見せているべきか。非表示の実装方式に依存しない」、v2.31で
 /// 初めて消費する）：そのWorkspaceに属していた窓を`HiddenByWm`にし、`SetPresence(_, w, false)`を発行
-/// する。「実際に非表示になったか」の観測による確認（`Satisfied`相当、`ObservedPresence`との一致判定）
-/// はまだ無い——発行するだけで確認はしない（`DesiredPresence`の型直前のコメント「まだ対象外」参照、
-/// これは専用の信念・確認機構が必要な別の課題として残す）。各窓ごとに`allocateRequestId`で新しい
+/// する。「実際に非表示になったか」の観測による確認（`checkPendingPresenceSatisfied`、v2.41）のため
+/// `PendingPresence`を作り`PresenceDeadline`タイマーを開始する。各窓ごとに`allocateRequestId`で新しい
 /// RequestIdを採番する（SetRectと同じ採番元を共有、§7.1）。
-let onWorkspaceHidden (windows: WindowId list) (state: PlacementState) : PlacementState * Effect list =
+let onWorkspaceHidden (now: int64) (windows: WindowId list) (state: PlacementState) : PlacementState * Effect list * TimerCommand<TimerId> list =
     windows
     |> List.fold
-        (fun (st: PlacementState, effects) w ->
-            let rid, st' = allocateRequestId st
-            { st' with Desired = Map.add w HiddenByWm st'.Desired }, effects @ [ SetPresence (rid, w, false) ])
-        (state, [])
+        (fun (st: PlacementState, effects, cmds) w ->
+            let stSuperseded, supersedeCmds = supersedePendingPresence w st
+            let rid, st' = allocateRequestId stSuperseded
+            let deadline = now + pendingDeadlineMs
+            let pp = { Window = w; DesiredVisible = false; IssuedAt = now; Deadline = deadline }
+            { st' with
+                Desired = Map.add w HiddenByWm st'.Desired
+                PendingPresence = Map.add rid pp st'.PendingPresence },
+            effects @ [ SetPresence (rid, w, false) ],
+            cmds @ supersedeCmds @ [ StartTimer (TimerId.Placement (PresenceDeadline rid), pendingDeadlineMs) ])
+        (state, [], [])
 
 /// `DomainEvents.WorkspaceShown`（上記の逆）：そのWorkspaceに属する窓を`Shown None`にし、
 /// `SetPresence(_, w, true)`を発行する。目標矩形はまだ無い（`Shown None`、`DesiredPresence`の型直前の
 /// コメント参照）——このWorkspaceが`current`/`visible`になった同じstepのReconcileが実際の目標を計算し、
 /// `dispatchPlacements`の`desiredChanged`判定は`Shown (Some _)`以外を常に「変化あり」と見なすので、
 /// 必ず新しいSetRectが発行される（隠されていた間に実際の位置が変わっていたかもしれないため、
-/// 古い矩形を信用しない）。
-let onWorkspaceShown (windows: WindowId list) (state: PlacementState) : PlacementState * Effect list =
+/// 古い矩形を信用しない）。`PendingPresence`/`PresenceDeadline`の開始は`onWorkspaceHidden`と同じ（v2.41）。
+let onWorkspaceShown (now: int64) (windows: WindowId list) (state: PlacementState) : PlacementState * Effect list * TimerCommand<TimerId> list =
     windows
     |> List.fold
-        (fun (st: PlacementState, effects) w ->
-            let rid, st' = allocateRequestId st
-            { st' with Desired = Map.add w (Shown None) st'.Desired }, effects @ [ SetPresence (rid, w, true) ])
-        (state, [])
+        (fun (st: PlacementState, effects, cmds) w ->
+            let stSuperseded, supersedeCmds = supersedePendingPresence w st
+            let rid, st' = allocateRequestId stSuperseded
+            let deadline = now + pendingDeadlineMs
+            let pp = { Window = w; DesiredVisible = true; IssuedAt = now; Deadline = deadline }
+            { st' with
+                Desired = Map.add w (Shown None) st'.Desired
+                PendingPresence = Map.add rid pp st'.PendingPresence },
+            effects @ [ SetPresence (rid, w, true) ],
+            cmds @ supersedeCmds @ [ StartTimer (TimerId.Placement (PresenceDeadline rid), pendingDeadlineMs) ])
+        (state, [], [])
 
-/// 窓の消滅時、`Geometry`/`Movability`/`TargetIntegrity`/`IntegrityReprobes`/`Desired`/`Pending`/`Epochs`
-/// を除く（§4.4「各ドメインの信念は窓が消滅した時点でのみ除去する」）。動いている再probeタイマーと、
-/// その窓宛てのPendingが持つ`PendingDeadline`タイマーがあれば`CancelTimer`を返す
-/// （review-phase-a-round1.md 4-3と同じ理由、Windows.ClassificationDeadline/Health.Reprobesと同じ扱い）。
-/// `WmState.vanishWindow`から呼ぶ。
+/// `TimerElapsed (Placement (PresenceDeadline rid))`：単発の諦め（`PendingPresence`の型直前のコメント
+/// 参照、Retry/Backoffは対象外）。`Desired`は取り消さない——`onWorkspaceHidden`/`onWorkspaceShown`は
+/// 呼ばれるたびに無条件で`SetPresence`を再発行するため（`dispatchPlacements`の`desiredChanged`相当の
+/// 判定を持たない）、ここで取り消しても次回の挙動は変わらない。
+let onPresenceDeadlineTimerFired (now: int64) (rid: RequestId) (state: PlacementState) : PlacementState * TimerCommand<TimerId> list =
+    match Map.tryFind rid state.PendingPresence with
+    | Some pp when awaitDeadline (Some pp.Deadline) now -> { state with PendingPresence = Map.remove rid state.PendingPresence }, []
+    | _ -> state, [] // 古い発火、またはもう追跡していない（確認済み、GateRejected、窓の消滅等）
+
+/// 窓の消滅時、`Geometry`/`Movability`/`TargetIntegrity`/`IntegrityReprobes`/`Desired`/`Pending`/
+/// `PendingPresence`/`Epochs`を除く（§4.4「各ドメインの信念は窓が消滅した時点でのみ除去する」）。
+/// 動いている再probeタイマーと、その窓宛てのPending/PendingPresenceが持つ`PendingDeadline`/
+/// `PresenceDeadline`タイマーがあれば`CancelTimer`を返す（review-phase-a-round1.md 4-3と同じ理由、
+/// Windows.ClassificationDeadline/Health.Reprobesと同じ扱い）。`WmState.vanishWindow`から呼ぶ。
 let onWindowVanished (w: WindowId) (state: PlacementState) : PlacementState * TimerCommand<TimerId> list =
     let integrityCancel = if Map.containsKey w state.IntegrityReprobes then [ CancelTimer (TimerId.Placement (IntegrityReprobe w)) ] else []
     let pendingForWindow = state.Pending |> Map.toSeq |> Seq.filter (fun (_, pr) -> pr.Window = w) |> Seq.map fst |> List.ofSeq
     let pendingCancel = pendingForWindow |> List.map (fun rid -> CancelTimer (TimerId.Placement (PendingDeadline rid)))
+    let pendingPresenceForWindow = state.PendingPresence |> Map.toSeq |> Seq.filter (fun (_, pp) -> pp.Window = w) |> Seq.map fst |> List.ofSeq
+    let pendingPresenceCancel = pendingPresenceForWindow |> List.map (fun rid -> CancelTimer (TimerId.Placement (PresenceDeadline rid)))
     { state with
         Geometry = Map.remove w state.Geometry
         Movability = Map.remove w state.Movability
@@ -554,6 +643,7 @@ let onWindowVanished (w: WindowId) (state: PlacementState) : PlacementState * Ti
         IntegrityReprobes = Map.remove w state.IntegrityReprobes
         Desired = Map.remove w state.Desired
         Pending = pendingForWindow |> List.fold (fun p rid -> Map.remove rid p) state.Pending
+        PendingPresence = pendingPresenceForWindow |> List.fold (fun p rid -> Map.remove rid p) state.PendingPresence
         Epochs = Map.remove w state.Epochs
         RetryAttempts = Map.remove w state.RetryAttempts },
-    integrityCancel @ pendingCancel
+    integrityCancel @ pendingCancel @ pendingPresenceCancel

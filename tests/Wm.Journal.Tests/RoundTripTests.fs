@@ -77,6 +77,11 @@ let ``TimerElapsed(Health ResponsivenessReprobe)は往復しても一致する``
     roundTrip entry = entry
 
 [<Property>]
+let ``TimerElapsed(Placement PresenceDeadline)は往復しても一致する(v2.41)`` (rid: int) =
+    let entry = mkEntry (InputPayload (TimerElapsed (TimerId.Placement (PresenceDeadline (RequestId (int64 (abs rid)))))))
+    roundTrip entry = entry
+
+[<Property>]
 let ``ForegroundObservedは往復しても一致する(Ok)`` (sequence: int) (w: int option) =
     let obs =
         { Value = Ok (w |> Option.map (fun i -> WindowId (int64 (abs i))))
