@@ -3,10 +3,18 @@
 /// 旧実装は`MonitorTopologyObserved`/`ScreenReconfigurationInProgress`/`TimerElapsed`しか符号化せず、
 /// `ForegroundObserved`/`WindowRemoved`/`UserCommand`（いずれも`WmState.step`が分岐に使う）は
 /// "unsupported-input-event"として書かれ、Replayがfail-fastしていた。
+///
+/// round2レビューT-5：当初の往復テストは`Management`/`LayoutArgs`/`ErrorSpace`/`CoreCommand`について
+/// 固定の代表値(常に`Win32LastError`・`Code=5`・`MasterRatio 0.5m`・`Tiled`等)しか使っておらず、
+/// これらの型の他のケース(`HResult`・`BoolFalseNoCode`・`NoArgs`・`ColumnCount`・`Floating`・
+/// `Excluded`、および`MasterRatio`の任意の値)が符号化で正しく往復するかは未検証だった。
+/// `Generators.JournalGenerators`で全ケースを覆うArbitraryを定義し、このモジュール全体に適用する。
+[<FsCheck.Xunit.Properties(Arbitrary = [| typeof<Wm.Journal.Tests.Generators.JournalGenerators> |])>]
 module Wm.Journal.Tests.RoundTripTests
 
 open System
 open System.IO
+open FsCheck
 open FsCheck.Xunit
 open Wm.Contracts.Identifiers
 open Wm.Contracts.ErrorTypes
@@ -79,8 +87,15 @@ let ``ForegroundObservedは往復しても一致する(Ok)`` (sequence: int) (w:
     roundTrip entry = entry
 
 [<Property>]
-let ``ForegroundObservedは往復しても一致する(Error)`` (sequence: int) =
-    let err: NativeCallRecord = { Api = "test"; Space = Win32LastError; Code = 5; ElapsedUs = 10L }
+let ``ForegroundObservedは往復しても一致する(Error、ErrorSpaceの全ケースと任意のCode/Api/ElapsedUs)``
+    (sequence: int)
+    (space: ErrorSpace)
+    (api: NonNull<string>)
+    (code: int)
+    (elapsedUs: int64)
+    =
+    let (NonNull apiStr) = api
+    let err: NativeCallRecord = { Api = apiStr; Space = space; Code = code; ElapsedUs = elapsedUs }
     let obs = { Value = Error err; SampleSequence = int64 (abs sequence); MonotonicTime = int64 (abs sequence); Source = "test" }
     let entry = mkEntry (InputPayload (ForegroundObserved obs))
     roundTrip entry = entry
@@ -91,7 +106,7 @@ let ``WindowRemovedは往復しても一致する`` (w: int) =
     roundTrip entry = entry
 
 [<Property>]
-let ``UserCommandの全ケースは往復しても一致する`` (ws: int) (w: int) =
+let ``UserCommandの全13ケースは往復しても一致する(固定値、回帰の土台)`` (ws: int) (w: int) =
     let cmds =
         [ FocusNext
           FocusPrevious
@@ -111,3 +126,26 @@ let ``UserCommandの全ケースは往復しても一致する`` (ws: int) (w: i
     |> List.forall (fun cmd ->
         let entry = mkEntry (InputPayload (UserCommand cmd))
         roundTrip entry = entry)
+
+/// round2レビューT-5の本体：`Generators.JournalGenerators.CoreCommand`が13ケースを一様に選び、
+/// `ChangeLayout`/`SetManagement`には`LayoutArgs`(NoArgs/MasterRatio任意精度/ColumnCount)・
+/// `Management`(Tiled/Floating/Excluded)の任意の値を載せる。固定値テストでは拾えない、
+/// 「`MasterRatio`の特定の値でだけ精度が落ちる」「`Excluded`だけ符号化し忘れる」といった
+/// クラス単位の取りこぼしをFsCheckの反復実行(既定100回)で検出する。
+[<Property>]
+let ``UserCommandは任意のCoreCommand(全ケース×任意のLayoutArgs/Management)でも往復しても一致する`` (cmd: CoreCommand) =
+    let entry = mkEntry (InputPayload (UserCommand cmd))
+    roundTrip entry = entry
+
+/// `ChangeLayout`単体についても、`LayoutArgs`の全ケースと任意精度の`MasterRatio`を直接検査する
+/// (decimalのJSON往復は精度を保つはずだが、System.Text.Jsonの数値表現を介するため明示的に確認する)。
+[<Property>]
+let ``ChangeLayoutはLayoutArgsの全ケース・任意精度のMasterRatioでも往復しても一致する`` (layoutRef: LayoutRef) =
+    let entry = mkEntry (InputPayload (UserCommand (ChangeLayout layoutRef)))
+    roundTrip entry = entry
+
+/// `SetManagement`単体についても、`Management`の全ケース(Tiled/Floating/Excluded)を直接検査する。
+[<Property>]
+let ``SetManagementはManagementの全ケースでも往復しても一致する`` (w: int) (management: Management) =
+    let entry = mkEntry (InputPayload (UserCommand (SetManagement (WindowId (int64 (abs w)), management))))
+    roundTrip entry = entry

@@ -1,0 +1,10 @@
+<Project>
+
+  <!-- round2レビューT-5：不完全なパターンマッチ(FS0025)はJournal/DTOの符号化・復号が新しいケースに
+       追従し忘れたまま警告だけ出して通ってしまう、という事故の典型源。全プロジェクト共通でエラー化し、
+       ビルドの時点で気付けるようにする。 -->
+  <PropertyGroup>
+    <WarningsAsErrors>$(WarningsAsErrors);FS0025</WarningsAsErrors>
+  </PropertyGroup>
+
+</Project>
