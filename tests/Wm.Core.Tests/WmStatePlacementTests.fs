@@ -666,3 +666,90 @@ let ``FocusMostRecentは、Historyに行き先が無ければ何もしない(v2.
     Assert.Equal(afterFocusW1.Next.Topology, afterFmr.Next.Topology)
     let effects = afterFmr.Effects |> List.map GatedEffect.effect
     Assert.DoesNotContain(effects, function RequestForeground _ -> true | _ -> false)
+
+[<Fact>]
+let ``ForegroundChangedは、管理下の窓が別のvisible(非current)モニターへ移ったら、RequestForegroundせずにcurrentだけ追従する(R5-1、v2.39)`` () =
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0; mkMonitor 1 ]
+    let current, visible =
+        match displays topology with
+        | Displays (c, v) -> c, v
+        | NoMonitors -> failwith "expected 2 monitors to settle into Displays"
+    match visible with
+    | [ visibleScreen ] ->
+        let w2 = WindowId 2L
+        let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+        let windows2 =
+            { seeded.Windows with
+                Records = Map.add w2 { WindowRecord.initial with Classification = Classified (EffTiled, ByUserOverride) } seeded.Windows.Records }
+        let workspaces2 = WorkspaceSet.addWindow visibleScreen.Workspace w2 false seeded.Workspaces
+        let seeded2 = { seeded with Windows = windows2; Workspaces = workspaces2 }
+
+        // w2は既にvisibleScreen（非current）のWorkspaceに属する管理下の窓。これが前面になった
+        // （ユーザーが別モニターの窓を直接クリックした等）ことをForegroundObservedで届ける。
+        let afterForeground = step RuntimePolicy.defaults seeded2 (mkEnvelope 1L (mkForegroundObserved 1L w2))
+        match displays afterForeground.Next.Topology with
+        | Displays (newCurrent, [ newVisible ]) ->
+            Assert.Equal(visibleScreen.Workspace, newCurrent.Workspace) // currentがw2のWorkspaceへ追従
+            Assert.Equal(current.Workspace, newVisible.Workspace)
+        | other -> failwithf "expected current to follow to w2's monitor, got %A" other
+
+        // OS側で既にw2にフォーカスがあるので、RequestForegroundは発行しない
+        // （SwitchWorkspace/FocusMonitorの明示操作とは違い、二重要求になる）。
+        let effects = afterForeground.Effects |> List.map GatedEffect.effect
+        Assert.DoesNotContain(effects, function RequestForeground _ -> true | _ -> false)
+    | other -> Assert.True(false, sprintf "expected exactly 1 visible (non-active) screen, got %A" other)
+
+[<Fact>]
+let ``ForegroundChangedは、hiddenなWorkspaceの窓が前面になったらForegroundFollowで表示し、ReturnMonitorを保持したままRequestForegroundしない(R5-1、v2.39)`` () =
+    // `TopologyState`はprivateなので`Returns`を直接構成できない——モニター切断の実際の経路
+    // （`MonitorLifecycle.reconcile`、visibleScreenが切断されてhiddenになりReturnsへ記録される）で
+    // 本物のReturn予約を作る。
+    let topology0, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0; mkMonitor 1 ]
+    let current0, visible0 =
+        match displays topology0 with
+        | Displays (c, v) -> c, v
+        | NoMonitors -> failwith "expected 2 monitors to settle into Displays"
+    match visible0 with
+    | [ visibleScreen ] ->
+        let w2 = WindowId 2L
+        let seeded = { initial RuntimePolicy.defaults with Topology = topology0 }
+        let windows2 =
+            { seeded.Windows with
+                Records = Map.add w2 { WindowRecord.initial with Classification = Classified (EffTiled, ByUserOverride) } seeded.Windows.Records }
+        let workspaces2 = WorkspaceSet.addWindow visibleScreen.Workspace w2 false seeded.Workspaces
+        let seeded2 = { seeded with Windows = windows2; Workspaces = workspaces2 }
+
+        // monitor1を切断する。visibleScreen.WorkspaceがhiddenになりReturnsへ記録される（実際の経路）。
+        let settleMs = TopologyConfig.defaults.SettleMs
+        let afterDisconnect = step RuntimePolicy.defaults seeded2 (mkEnvelope 100L (MonitorTopologyObserved [ mkMonitor 0 ]))
+        let afterSettle = step RuntimePolicy.defaults afterDisconnect.Next (mkEnvelope (100L + settleMs) (TimerElapsed (TimerId.Topology ScreenSettle)))
+        match displays afterSettle.Next.Topology with
+        | Displays (c, []) -> Assert.Equal(current0.Workspace, c.Workspace)
+        | other -> failwithf "expected monitor1 to disconnect, got %A" other
+        Assert.Equal(Some visibleScreen.Monitor.Id, returns afterSettle.Next.Topology |> Map.tryFind visibleScreen.Workspace)
+
+        // w2のWorkspace（今はhidden）の窓が前面になった（タスクバーからの選択等）。
+        let afterForeground = step RuntimePolicy.defaults afterSettle.Next (mkEnvelope 200L (mkForegroundObserved 200L w2))
+        match displays afterForeground.Next.Topology with
+        | Displays (newCurrent, []) -> Assert.Equal(visibleScreen.Workspace, newCurrent.Workspace)
+        | other -> failwithf "expected visibleScreen.Workspace to become current via ForegroundFollow, got %A" other
+        // ユーザーの明示操作ではないので、ReturnMonitorはSwitchWorkspace/FocusMostRecentとは違い解除しない。
+        Assert.Equal(Some visibleScreen.Monitor.Id, returns afterForeground.Next.Topology |> Map.tryFind visibleScreen.Workspace)
+        // OS側で既にw2にフォーカスがあるのでRequestForegroundは発行しない。
+        let effects = afterForeground.Effects |> List.map GatedEffect.effect
+        Assert.DoesNotContain(effects, function RequestForeground _ -> true | _ -> false)
+        // shouldReconcileはWorkspaceShown(ShownByの値を問わない)で引き金になる(v2.38)ので、新しくcurrentへ
+        // 入ってきたw2は同じstepで実際の矩形を得る。
+        Assert.NotEqual(None, desiredRectOf afterForeground.Next.Placement w2)
+    | other -> Assert.True(false, sprintf "expected exactly 1 visible (non-active) screen, got %A" other)
+
+[<Fact>]
+let ``ForegroundChangedは、step開始時点でどのWorkspaceにも属さない窓では追従しない(v2.39)`` () =
+    // architecture.md §7.1補足：観測の到着順は保証されないため、ForegroundObservedが窓の発見より
+    // 先に届く経路がある。その窓はstep開始時点ではどのWorkspaceにも属していないので追従しない
+    // （新しい窓は常にアクティブなWSに入るので、追従自体が無意味、§7.1補足）。
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0 ]
+    let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+    let w = WindowId 1L
+    let afterForegroundFirst = step RuntimePolicy.defaults seeded (mkEnvelope 1L (mkForegroundObserved 1L w))
+    Assert.Equal(seeded.Topology, afterForegroundFirst.Next.Topology)

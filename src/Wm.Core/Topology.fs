@@ -220,26 +220,55 @@ module MonitorLifecycle =
 
         { state with Displays = newDisplays; Returns = returnsAfterAdd }, hiddenEvents @ shownEvents
 
-/// `ws`をcurrentへ表示する（xmonadのview、§4.4「SwitchWorkspaceの意味」）。`UserCommand (SwitchWorkspace ws)`の
-/// 非`Reconfiguring`分岐そのもの（v2.32）をここへ抽出した（v2.38）。呼び出し側は`state.Phase`が
-/// `Reconfiguring`でないことを保証すること（Displaysが未確定の間はview自体が無意味——`update`の
-/// `SwitchWorkspace`分岐と同じ前提）。`FocusMostRecent`（`WmState.step`）が行き先の窓のWorkspaceがhiddenな
-/// 場合に同じ遷移を再利用するために公開する。
-let showWorkspace (ws: WorkspaceId) (state: TopologyState) : TopologyState * DomainEvent list =
+/// `ws`をcurrentへ表示する（xmonadのview）内部実装。`shownBy`/`clearReturn`を呼び出し側が選べる
+/// （v2.39、R5-1の`ForegroundFollow`との共有のためパラメータ化した）。呼び出し側は`state.Phase`が
+/// `Reconfiguring`でないことを保証すること（Displaysが未確定の間はview自体が無意味）。
+let private showWorkspaceAs (shownBy: ShownBy) (clearReturn: bool) (ws: WorkspaceId) (state: TopologyState) : TopologyState * DomainEvent list =
     match state.Displays with
     | NoMonitors -> state, []
     | Displays (current, _) when current.Workspace = ws -> state, [] // 既にcurrent
     | Displays (current, visible) ->
+        let returns' = if clearReturn then Map.remove ws state.Returns else state.Returns
         match visible |> List.tryFind (fun sc -> sc.Workspace = ws) with
         | Some targetScreen ->
             let visible' = current :: (visible |> List.filter (fun sc -> sc.Workspace <> ws))
-            { state with Displays = Displays (targetScreen, visible'); Returns = Map.remove ws state.Returns },
+            { state with Displays = Displays (targetScreen, visible'); Returns = returns' },
             [ CurrentChanged ws ]
         | None ->
             let oldWorkspace = current.Workspace
             let newCurrent = { current with Workspace = ws }
-            { state with Displays = Displays (newCurrent, visible); Returns = Map.remove ws state.Returns },
-            [ WorkspaceHidden oldWorkspace; WorkspaceShown (ws, UserView) ]
+            { state with Displays = Displays (newCurrent, visible); Returns = returns' },
+            [ WorkspaceHidden oldWorkspace; WorkspaceShown (ws, shownBy) ]
+
+/// `ws`をcurrentへ表示する（xmonadのview、§4.4「SwitchWorkspaceの意味」）。`UserCommand (SwitchWorkspace ws)`の
+/// 非`Reconfiguring`分岐そのもの（v2.32）をここへ抽出した（v2.38）。ユーザーの明示操作なので
+/// `ShownBy = UserView`、`ReturnMonitor`は解除する。`FocusMostRecent`（`WmState.step`）が行き先の窓の
+/// Workspaceがhiddenな場合に同じ遷移を再利用するために公開する。
+let showWorkspace (ws: WorkspaceId) (state: TopologyState) : TopologyState * DomainEvent list =
+    showWorkspaceAs UserView true ws state
+
+/// R5-1「hiddenなWorkspaceの窓がフォアグラウンドになった」（§4.4、v2.39）：`SwitchWorkspace`と同じview
+/// 遷移だが`ShownBy = ForegroundFollow`で、`ReturnMonitor`は保持する（ユーザーの明示操作ではないため）。
+/// 呼び出し側（`WmState.step`）はこの後`RequestForeground`を発行しない——`WorkspaceShown (_, UserView)`
+/// だけを拾う既存の受け口（v2.32）が`ForegroundFollow`には反応しないので、自然にそうなる。
+let showWorkspaceAsForegroundFollow (ws: WorkspaceId) (state: TopologyState) : TopologyState * DomainEvent list =
+    showWorkspaceAs ForegroundFollow false ws state
+
+/// R5-1「アクティブなモニターの追従」（§4.4、v2.39）：`ws`が既にvisible（current以外）なモニターに
+/// 表示されていれば、そのモニターをcurrentにする。`FocusMonitor`の「既にvisible」分岐と同じ操作だが、
+/// 意図的にDomainEventを出さない——`CurrentChanged`を出すと既存の受け口（v2.32）がそのWorkspaceの
+/// zipperのFocusへ`RequestForeground`してしまうが、この追従はOS側で既にフォーカスが済んでいる窓を
+/// 内部のcurrent帳簿に反映するだけの処理であり、フォーカスの再要求は不要（かつ有害：別の窓の
+/// zipperのFocusへ要求してしまう可能性がある）。
+let followForegroundToVisibleMonitor (ws: WorkspaceId) (state: TopologyState) : TopologyState =
+    match state.Displays with
+    | Displays (current, visible) when current.Workspace <> ws ->
+        match visible |> List.tryFind (fun sc -> sc.Workspace = ws) with
+        | Some targetScreen ->
+            let visible' = current :: (visible |> List.filter (fun sc -> sc.Workspace <> ws))
+            { state with Displays = Displays (targetScreen, visible') }
+        | None -> state
+    | _ -> state
 
 // ===== ScreenPhase（§7.3）：抑止区間・安定待ち・grace window =====
 

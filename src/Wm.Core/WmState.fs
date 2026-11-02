@@ -327,6 +327,36 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
                     topologyState'', topologyEvents @ viewEvents, stateAfterMovability, []
         | _ -> topologyState', topologyEvents, stateAfterMovability, []
 
+    // R5-1「アクティブなモニターの追従」とhiddenなWorkspaceの窓への`ForegroundFollow`（§4.4「更新規則」、
+    // v2.39）：`stage1Events`の`ForegroundChanged`（信念の値が変わったstepに限るedge-triggered。state
+    // から毎stepに適用するlevel-triggeredだと、`FocusMonitor`直後・`ForegroundObserved`が届く前の
+    // 同じstepでcurrentが元へ戻ってしまう、R5-1の警告——ただし`ForegroundChanged`は`ForegroundObserved`
+    // からしか出ず`UserCommand`とは同じstepで両立しないため、実際にはこの競合は構造的に起きない）を
+    // 引き金にする。wが（step開始時点で）管理下の窓かどうかは`state.Workspaces`（今回のstepの変更を
+    // 一切受けていない、関数の引数そのもの）で判定する——そのstepで初めて分類された窓はstep開始時には
+    // 所属を持たないので、その窓へのフォアグラウンドの変化では追従しない（新しい窓は常にアクティブな
+    // WSに入るため追従の必要が無い、architecture.md §7.1補足）。`ForegroundChanged`は`ForegroundObserved`
+    // 入力からしか出ず、`windowsEvents`（分類）を生む入力（`WindowObserved`等）とは同じstepで両立しない
+    // ため、現状の実装では`state.Workspaces`と`stateAfterMovability.Workspaces`は`ForegroundObserved`の
+    // stepでは常に一致する——今はこの区別を実際には踏めないが、表どおりの8段パイプラインへの組み直し
+    // （ファイル冒頭コメント）後に複数の原因が同じstepへ合流する余地に備えて、より仕様に忠実な
+    // `state.Workspaces`を選んでおく。`Reconfiguring`中はDisplaysが未確定なので何もしない。
+    let topologyState', topologyEvents, stateAfterMovability =
+        match stage1Events |> List.tryPick (function ForegroundChanged wOpt -> Some wOpt | _ -> None) with
+        | Some (Some w) when (match Topology.phase topologyState' with Reconfiguring _ -> false | _ -> true) ->
+            match WorkspaceSet.workspaceOf w state.Workspaces with
+            | None -> topologyState', topologyEvents, stateAfterMovability
+            | Some ws ->
+                match Topology.displays topologyState' with
+                | NoMonitors -> topologyState', topologyEvents, stateAfterMovability
+                | Displays (current, _) when current.Workspace = ws -> topologyState', topologyEvents, stateAfterMovability
+                | Displays (_, visible) when visible |> List.exists (fun sc -> sc.Workspace = ws) ->
+                    Topology.followForegroundToVisibleMonitor ws topologyState', topologyEvents, stateAfterMovability
+                | Displays _ ->
+                    let topologyState'', viewEvents = Topology.showWorkspaceAsForegroundFollow ws topologyState'
+                    topologyState'', topologyEvents @ viewEvents, stateAfterMovability
+        | _ -> topologyState', topologyEvents, stateAfterMovability
+
     // `TopologySettled`（Opusレビュー5-3、v2.29で配線）：モニター構成が確定したので、古い配置に基づく
     // 全Pendingを`Superseded`として一括で取り消す（`Placement.onTopologySettled`のコメント参照）。
     // 取り消した代わりを同じstepで必ず発行させるため、`shouldReconcile`（下記）もこのイベントで
