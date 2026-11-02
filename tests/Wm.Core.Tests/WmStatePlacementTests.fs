@@ -7,9 +7,12 @@ open Wm.Contracts.Identifiers
 open Wm.Contracts.ErrorTypes
 open Wm.Contracts.Observation
 open Wm.Contracts.Beliefs
+open Wm.Contracts.SharedVocabulary
 open Wm.Contracts.GatedEffect
 open Wm.Contracts.CoreCommand
 open Wm.Core.Topology
+open Wm.Core.Workspaces
+open Wm.Core.Windows
 open Wm.Core.Placement
 open Wm.Core.WmState
 
@@ -96,6 +99,44 @@ let ``EffectCallReturnedのTargetHungは同じstepでHealth.Responsivenessも修
     | Some { Value = Hung; Confidence = Confirmed } -> ()
     | other -> Assert.True(false, sprintf "unexpected: %A" other)
     Assert.Empty(afterHung.Next.Placement.Pending)
+
+[<Fact>]
+let ``EffectCallReturnedのDenied OtherDenialは、同じstepでMovability修正・Unplacedへの降格・Workspaceからの除去までつながる`` () =
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0 ]
+    let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+    let w = WindowId 1L
+    let afterObserved = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved w))
+    Assert.True((WorkspaceSet.workspaceOf w afterObserved.Next.Workspaces).IsSome)
+    let rid =
+        afterObserved.Next.Placement.Pending
+        |> Map.toSeq
+        |> Seq.filter (fun (_, (pr: PendingRequest)) -> pr.Window = w)
+        |> Seq.map fst
+        |> Seq.head
+    let deniedError: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 5; ElapsedUs = 0L }
+    let afterDenied = step RuntimePolicy.defaults afterObserved.Next (mkEnvelope 2L (EffectCallReturned (rid, Error deniedError)))
+
+    // Movabilityの修正
+    match Map.tryFind w afterDenied.Next.Placement.Movability with
+    | Some { Value = NotMovable } -> ()
+    | other -> Assert.True(false, sprintf "unexpected Movability: %A" other)
+    Assert.Empty(afterDenied.Next.Placement.Pending)
+
+    // Windowsの分類がUnplacedへ降格
+    match Map.tryFind w afterDenied.Next.Windows.Records |> Option.map (fun r -> r.Classification) with
+    | Some (Classified (EffUnplaced, _)) -> ()
+    | other -> Assert.True(false, sprintf "unexpected Classification: %A" other)
+
+    // WorkspacesからもFocus.Historyからも除かれている（§4.4「Unplacedはどのworkspaceにも属さない」）
+    Assert.Equal(None, WorkspaceSet.workspaceOf w afterDenied.Next.Workspaces)
+
+    // 2つ目の窓が現れてReconcileが再び走っても、Unplacedになった窓はもはやTiledWindowsに含まれず、
+    // 無駄なSetRectが再発行されない（既知のギャップ注記のとおり、ゲート拒否の繰返しにはならない）。
+    let w2 = WindowId 2L
+    let afterSecondWindow = step RuntimePolicy.defaults afterDenied.Next (mkEnvelope 3L (visibleWindowObserved w2))
+    let effects = afterSecondWindow.Effects |> List.map GatedEffect.effect
+    let setRectsForW = effects |> List.choose (function SetRect (_, target, _) when target = w -> Some target | _ -> None)
+    Assert.Empty(setRectsForW)
 
 [<Fact>]
 let ``WindowRemovedは同じstepでPlacement.Geometryも除く`` () =

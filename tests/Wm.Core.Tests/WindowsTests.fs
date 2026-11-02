@@ -52,7 +52,8 @@ let private ctxWith (policy: PolicyIR) (now: int64) : ClassificationCtx =
       Policy = policy
       ActiveWorkspace = Some (WorkspaceId 0)
       ForegroundWindow = None
-      ClassificationTimeoutMs = 1_000L }
+      ClassificationTimeoutMs = 1_000L
+      Movability = Map.empty }
 
 let private identityInit: IdentityBeliefs =
     { Exe = Unformed []; HostExe = Unformed []; Aumid = Unformed []; CoreWindowExe = Unformed []; Process = Unformed [] }
@@ -257,3 +258,47 @@ let ``onWindowVanishedはRecords・Identity・ClassInputsを除く`` () =
     Assert.False(Map.containsKey (WindowId 1L) registry2.Records)
     Assert.False(Map.containsKey (WindowId 1L) registry2.Identity)
     Assert.False(Map.containsKey (WindowId 1L) registry2.ClassInputs)
+
+// ===== Movability → Unplaced（§4.4、v2.23） =====
+
+[<Fact>]
+let ``NotMovableな窓はPolicy評価の時点からEffUnplacedになり、WindowUnmanagedを出す`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "r" 10 AnyWindow Tiled ] }
+    let w = WindowId 1L
+    let ctx = { ctxWith policy 0L with Movability = Map.ofList [ w, { Value = NotMovable; Confidence = Inferred []; LastRevisedAt = 0L } ] }
+    let registry', events, _ = onWindowObserved ctx (visibleSnapshot w) initial
+    Assert.Equal<DomainEvent list>([ WindowUnmanaged w ], events)
+    match (Map.find w registry'.Records).Classification with
+    | Classified (EffUnplaced, ByPolicy _) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+
+[<Fact>]
+let ``onMovabilityBecameNotMovableはTiled/Floatingで確定済みの窓だけをUnplacedへ降格する`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "r" 10 AnyWindow Tiled ] }
+    let ctx = ctxWith policy 0L
+    let w = WindowId 1L
+    let registry1, _, _ = onWindowObserved ctx (visibleSnapshot w) initial
+    match (Map.find w registry1.Records).Classification with
+    | Classified (EffTiled, _) -> ()
+    | other -> Assert.True(false, sprintf "expected Tiled first, got %A" other)
+    let registry2, events = onMovabilityBecameNotMovable w registry1
+    Assert.Equal<DomainEvent list>([ WindowUnmanaged w ], events)
+    match (Map.find w registry2.Records).Classification with
+    | Classified (EffUnplaced, _) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+
+[<Fact>]
+let ``onMovabilityBecameNotMovableはユーザー指定(ByUserOverride)の窓には作用しない`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "r" 10 AnyWindow Tiled ] }
+    let ctx = ctxWith policy 0L
+    let w = WindowId 1L
+    let registry1, _, _ = onWindowObserved ctx (visibleSnapshot w) initial
+    let registry2, _, _ = onUserCommand ctx (ToggleFloating w) registry1 // ByUserOverrideへ
+    let registry3, events = onMovabilityBecameNotMovable w registry2
+    Assert.Empty(events)
+    Assert.Equal<WindowRegistry>(registry2, registry3)
+
+[<Fact>]
+let ``onMovabilityBecameNotMovableは管理下に無い窓や既にUnplaced/Excludedの窓には何もしない`` () =
+    let state0, _ = onMovabilityBecameNotMovable (WindowId 99L) initial
+    Assert.Equal<WindowRegistry>(initial, state0)

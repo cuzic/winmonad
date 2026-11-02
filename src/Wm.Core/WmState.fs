@@ -160,7 +160,8 @@ let private classificationCtx (runtimePolicy: RuntimePolicy) (now: int64) (state
       Policy = runtimePolicy.Policy
       ActiveWorkspace = activeWorkspace state
       ForegroundWindow = LatestWins.value state.Focus.Foreground |> Option.flatten
-      ClassificationTimeoutMs = runtimePolicy.ClassificationTimeoutMs }
+      ClassificationTimeoutMs = runtimePolicy.ClassificationTimeoutMs
+      Movability = state.Placement.Movability }
 
 /// Windowsが出した`WindowClassified`/`WindowUnmanaged`をWorkspaces/Focusへ反映する（§7.1段⑤→Workspaces）。
 /// `WindowClassified`の`home`が`None`（「新しい好みは無い」、Windows.fsの`resolveHome`参照）なら、
@@ -234,20 +235,33 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
 
     let stateAfterPlacement = { stateAfterWindows with Placement = placementState' }
 
+    // §4.4「Movability = NotMovableならTiled/Floatingを Unplacedに読み替える」。Placementの
+    // EffectCallReturned処理が`Denied OtherDenial`と判定した場合だけ、Windowsにその窓の分類を
+    // Unplacedへ降格させる（Movability自体の修正はPlacement.fsが行い、再分類の反映はここで
+    // WmState.stepが仲介する——TargetHungのHealth修正と同じ理由、ADR-018）。
+    let windowsAfterMovability, movabilityEvents =
+        match effectCallFailure with
+        | Some (w, Denied OtherDenial) -> Windows.onMovabilityBecameNotMovable w stateAfterPlacement.Windows
+        | _ -> stateAfterPlacement.Windows, []
+
+    let stateAfterMovability =
+        { stateAfterPlacement with Windows = windowsAfterMovability }
+        |> fun s -> movabilityEvents |> List.fold applyWindowsEvent s
+
     // 段①相当：観測の信念反映（全入力について無条件に最初に行う、§7.1）。FocusのForegroundを配線する。
     // 信念の値が変わったらForegroundChanged（§7.1表の段①が出すDomainEvent）を出す。
     let focusAfterBelief, stage1Events =
         match envelope.Input with
         | ForegroundObserved obs ->
-            let revised = Focus.reviseForeground now stateAfterPlacement.Focus.Foreground obs
-            let changed = LatestWins.value revised <> LatestWins.value stateAfterPlacement.Focus.Foreground
-            { stateAfterPlacement.Focus with Foreground = revised },
+            let revised = Focus.reviseForeground now stateAfterMovability.Focus.Foreground obs
+            let changed = LatestWins.value revised <> LatestWins.value stateAfterMovability.Focus.Foreground
+            { stateAfterMovability.Focus with Foreground = revised },
             (if changed then [ ForegroundChanged (LatestWins.value revised |> Option.flatten) ] else [])
-        | _ -> stateAfterPlacement.Focus, []
+        | _ -> stateAfterMovability.Focus, []
 
     // 段②：Topologyの原因・コマンドの受付。
     let topologyState', topologyResponse, topologyEvents, traces =
-        Topology.update runtimePolicy.Topology now envelope.Input stateAfterPlacement.Topology
+        Topology.update runtimePolicy.Topology now envelope.Input stateAfterMovability.Topology
 
     // Health：ResponsivenessReprobeタイマーの発火と、PlacementのEffectCallReturned処理が`TargetHung`と
     // 判定した場合のResponsiveness修正（§7.2「EffectCallReturned(Error) → classify → TargetHung →
@@ -255,12 +269,12 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     // ここで行う、ADR-018）を配線する。
     let healthState', healthTimerCmds =
         match envelope.Input with
-        | TimerElapsed (TimerId.Health (ResponsivenessReprobe w)) -> Health.onReprobeTimerFired now w stateAfterPlacement.Health
+        | TimerElapsed (TimerId.Health (ResponsivenessReprobe w)) -> Health.onReprobeTimerFired now w stateAfterMovability.Health
         | EffectCallReturned _ ->
             match effectCallFailure with
-            | Some (w, TargetHung) -> Health.applyEvidence now w (FromEffectFailure TargetHung) stateAfterPlacement.Health
-            | _ -> stateAfterPlacement.Health, []
-        | _ -> stateAfterPlacement.Health, []
+            | Some (w, TargetHung) -> Health.applyEvidence now w (FromEffectFailure TargetHung) stateAfterMovability.Health
+            | _ -> stateAfterMovability.Health, []
+        | _ -> stateAfterMovability.Health, []
 
     // Focus：SwitchSettleタイマーの発火。「再要求が必要な窓」はPlacement（RequestIdの採番元）が
     // 無いためEffectへ変換できず、既知のギャップとして捨てる（TimerCommand（CancelTimer）だけは反映する）。
@@ -270,7 +284,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         | _ -> focusAfterBelief, None, []
 
     let stateAfterBeliefs =
-        { stateAfterPlacement with
+        { stateAfterMovability with
             Topology = topologyState'
             Health = healthState'
             Focus = focusAfterTimer }

@@ -90,6 +90,11 @@ type ClassificationCtx = {
     ActiveWorkspace: WorkspaceId option
     ForegroundWindow: WindowId option
     ClassificationTimeoutMs: int64
+    /// Placement `Movability`の読み取り専用の写し（§4.4「Movability = NotMovableならTiled/Floatingを
+    /// Unplacedに読み替える」）。段①⑤でWindowsがPlacementより先に処理されるため（§7.1）、
+    /// `WmState.step`がstep開始時点のPlacement状態からその場で渡す（v2.23追加、Core.Windowsの
+    /// 次ラウンドでMovabilityを実際に読むまでは常に空だった既知のギャップを塞ぐ）。
+    Movability: Map<WindowId, Belief<Movability>>
 }
 
 // ===== 信念の修正（§4.5） =====
@@ -149,24 +154,38 @@ let isCandidate (inputs: ClassInputBeliefs) : bool =
         | None -> true
     | _ -> false
 
-let private toEffective (m: Management) : EffectiveManagement =
+/// §4.4「Movability = NotMovableならTiled/Floatingを Unplacedに読み替える」。`Excluded`は対象外
+/// （すでにどのWorkspaceにも属さない。Unplacedとは意味が別、§4.4）。
+let private toEffective (movability: Movability) (m: Management) : EffectiveManagement =
     match m with
+    | Excluded -> EffExcluded
+    | Tiled when movability = NotMovable -> EffUnplaced
+    | Floating when movability = NotMovable -> EffUnplaced
     | Tiled -> EffTiled
     | Floating -> EffFloating
-    | Excluded -> EffExcluded
+
+/// `ctx.Movability`（Placementの信念の写し）に窓のエントリが無ければ、4.5の発見時の楽観的既定値
+/// （`Movable`、`Inferred []`）を返す（Placementがまだこの窓を見ていない、または消滅後の古い参照）。
+/// エントリがあれば、その確度・根拠（`Confidence`/`LastRevisedAt`）をそのまま伝える。
+let private movabilityBeliefOf (ctx: ClassificationCtx) (w: WindowId) : Belief<Movability> =
+    Map.tryFind w ctx.Movability
+    |> Option.defaultValue { Value = Movable; Confidence = Inferred []; LastRevisedAt = ctx.Now }
+
+let private movabilityOf (ctx: ClassificationCtx) (w: WindowId) : Movability = (movabilityBeliefOf ctx w).Value
 
 /// Policyの述語が読む信念だけを集めた最小限の投影（§4.5「Policyの評価とLayoutが読むビュー」、
-/// PolicyEvaluator.fsのドキュメンテーションコメント参照）。`MinWidthDip`/`Movability`はPlacement
-/// ドメインの信念だが、Placementが無い間は4.5の初期既定値と同じ値を返す（ファイル冒頭コメント参照）。
-let classificationView (now: int64) (w: WindowId) (identity: IdentityBeliefs) (inputs: ClassInputBeliefs) : ClassificationView =
+/// PolicyEvaluator.fsのドキュメンテーションコメント参照）。`MinWidthDip`はPlacementの信念だが、
+/// 収集はできてもまだ蓄積する修正関数が無いため、既定どおりUnknownを返す（Placement.fsのファイル
+/// 冒頭コメント参照）。`Movability`はv2.23で`ctx.Movability`から実際の値を読むようになった。
+let classificationView (ctx: ClassificationCtx) (w: WindowId) (identity: IdentityBeliefs) (inputs: ClassInputBeliefs) : ClassificationView =
     { Identity = identity
       IsDialog = inputs.IsDialog.Slot
       TitleMatches = inputs.TitleMatches.Slot
       MinWidthDip = Unformed [ UnknownMinSize w ]
-      Movability = Believed { Value = Movable; Confidence = Inferred []; LastRevisedAt = now } }
+      Movability = Believed (movabilityBeliefOf ctx w) }
 
 let private tryClassify (ctx: ClassificationCtx) (w: WindowId) (identity: IdentityBeliefs) (inputs: ClassInputBeliefs) : ClassificationResult =
-    classificationView ctx.Now w identity inputs |> fun view -> selectManagement ctx.PatternSet view ctx.Policy
+    classificationView ctx w identity inputs |> fun view -> selectManagement ctx.PatternSet view ctx.Policy
 
 /// 窓の所属先（§5.4「期限超過で解決した窓の所属先は…最初にUnknownと評価された時点のアクティブな
 /// Workspaceとする。ただし分類が確定する時点でその窓がフォアグラウンドなら、所属はその時点の
@@ -176,10 +195,13 @@ let private tryClassify (ctx: ClassificationCtx) (w: WindowId) (identity: Identi
 let private resolveHome (ctx: ClassificationCtx) (w: WindowId) (recordedHome: WorkspaceId option) : WorkspaceId option =
     if ctx.ForegroundWindow = Some w then ctx.ActiveWorkspace else recordedHome
 
-/// `EffExcluded`なら`WindowUnmanaged`（Workspaces/Focus.History/SwitchSettleからだけ除く、§4.4）、
-/// それ以外なら`WindowClassified`（WorkspacesへStack末尾挿入、§4.4）を返す。
+/// `EffExcluded`/`EffUnplaced`なら`WindowUnmanaged`（Workspaces/Focus.History/SwitchSettleからだけ除く、
+/// §4.4「動かせない窓（Unplaced）はどのWorkspaceにも属さない」）、それ以外なら`WindowClassified`
+/// （WorkspacesへStack末尾挿入、§4.4）を返す。
 let private classificationEvent (w: WindowId) (eff: EffectiveManagement) (home: WorkspaceId option) : DomainEvent =
-    if eff = EffExcluded then WindowUnmanaged w else WindowClassified (w, eff, home)
+    match eff with
+    | EffExcluded | EffUnplaced -> WindowUnmanaged w
+    | _ -> WindowClassified (w, eff, home)
 
 /// 現在の信念から、1つの窓の分類を再評価する（§5.4/§7.1段⑤）。`WindowObserved`等で信念が
 /// 更新された直後、またはタイマー・ユーザーコマンドの処理の一部として呼ぶ。
@@ -212,7 +234,7 @@ let private reconsider
             | Classified (eff, ByTimeout) when not record.LateReclassifyUsed ->
                 match tryClassify ctx w identity inputs with
                 | Resolved (m', ruleId) ->
-                    let eff' = toEffective m'
+                    let eff' = toEffective (movabilityOf ctx w) m'
                     if eff' = eff then
                         record, [], []
                     else
@@ -228,7 +250,7 @@ let private reconsider
             | NotCandidate ->
                 match tryClassify ctx w identity inputs with
                 | Resolved (m', ruleId) ->
-                    let eff = toEffective m'
+                    let eff = toEffective (movabilityOf ctx w) m'
                     let home = resolveHome ctx w ctx.ActiveWorkspace
                     { record with Classification = Classified (eff, ByPolicy ruleId) },
                     [ classificationEvent w eff home ], []
@@ -239,7 +261,7 @@ let private reconsider
             | AwaitingEvidence (deadline, home) ->
                 match tryClassify ctx w identity inputs with
                 | Resolved (m', ruleId) ->
-                    let eff = toEffective m'
+                    let eff = toEffective (movabilityOf ctx w) m'
                     let home' = resolveHome ctx w home
                     { record with Classification = Classified (eff, ByPolicy ruleId) },
                     [ classificationEvent w eff home' ], [ CancelTimer (TimerId.Windows (ClassificationDeadline w)) ]
@@ -299,7 +321,7 @@ let onClassificationDeadline (ctx: ClassificationCtx) (w: WindowId) (registry: W
 
 let private applyUserOverride (ctx: ClassificationCtx) (w: WindowId) (m: Management) (registry: WindowRegistry) : WindowRegistry * DomainEvent list * TimerCommand<TimerId> list =
     withRecord w registry (fun record ->
-        let eff = toEffective m
+        let eff = toEffective (movabilityOf ctx w) m
         let home = resolveHome ctx w None
         let wasAwaiting = match record.Classification with AwaitingEvidence _ -> true | _ -> false
         let changed = match record.Classification with Classified (prevEff, _) -> prevEff <> eff | _ -> true
@@ -336,6 +358,23 @@ let onUserCommand (ctx: ClassificationCtx) (cmd: CoreCommand) (registry: WindowR
         let record', events, cmds = reconsider ctx w identity inputs baseRecord
         { registry with Records = Map.add w record' registry.Records }, events, cmds
     | _ -> registry, [], []
+
+/// `Movability`の信念が`NotMovable`へ修正された直後（`Denied OtherDenial`の帰結、§4.5）に呼ぶ。
+/// すでに`Tiled`/`Floating`として確定している窓だけを`Unplaced`へ読み替える（§4.4）。`Excluded`/
+/// `Unplaced`は対象外（前者はそもそも対象外、後者は既にUnplaced）。ユーザー指定（`ByUserOverride`）
+/// も対象外（§4.4のUnplaced読み替えはPolicyの分類結果に対する規則であり、R4-20「ユーザー指定は
+/// Policyより優先する」と同じ理由でユーザーの明示的な指定を上書きしない——v2.23で実装時に判断）。
+/// `Movable`への回復時の逆方向はこのラウンドでは対象外（`Satisfied`→`Movable`遷移自体がまだ無い、
+/// Placement.fsのファイル冒頭コメント参照）。
+let onMovabilityBecameNotMovable (w: WindowId) (registry: WindowRegistry) : WindowRegistry * DomainEvent list =
+    match Map.tryFind w registry.Records with
+    | None -> registry, []
+    | Some record ->
+        match record.Classification with
+        | Classified ((EffTiled | EffFloating), by) when by <> ByUserOverride ->
+            let record' = { record with Classification = Classified (EffUnplaced, by) }
+            { registry with Records = Map.add w record' registry.Records }, [ WindowUnmanaged w ]
+        | _ -> registry, []
 
 /// 窓の消滅時、`Records`/`Identity`/`ClassInputs`を除く（§4.4「Windows.Recordsと各ドメインの信念は
 /// 窓が消滅した時点でのみ除去する」）。`WmState.vanishWindow`から呼ぶ。
