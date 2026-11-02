@@ -116,6 +116,11 @@ type PlacementState =
       /// （Reconcileが「前回と同じ意図」と判断する基準。§7.3「未完了の同一Targetへの重複要求を発行しない」）。
       Desired: Map<WindowId, DesiredPresence>
       Pending: Map<RequestId, PendingRequest>
+      /// `RequestId`の単一の採番元（§7.1「`EffectCallReturned`の`RequestId`で相関する」ので、採番元は
+      /// プロセス全体で1つでなければならない）。物理的にここに置くのは実装の都合——意味的には
+      /// `WmState`全体の資源であり、`WmState.step`は`allocateRequestId`（下記）経由で、Placement以外の
+      /// 理由（Focus.SwitchSettleの再要求、`MoveFocusedToWorkspace`のRequestForeground等、v2.27）でも
+      /// ここから新しいRequestIdを発行できる。
       NextRequestId: int64
       /// 窓ごとのIntentEpoch（§7.2「全体で単一のEpochにすると、1窓の新しい意図が他の全窓のPendingを
       /// 失効させてしまう」）。新しい`SetRect`を発行するたびに1つ進める。
@@ -130,6 +135,13 @@ let initial: PlacementState =
       Pending = Map.empty
       NextRequestId = 0L
       Epochs = Map.empty }
+
+/// `WmState.step`が、Placement自身のReconcile以外の理由（Focus.SwitchSettleの再要求、
+/// `MoveFocusedToWorkspace`のRequestForeground等、v2.27）で新しいRequestIdが要るときに呼ぶ最小の窓口。
+/// `dispatchPlacements`と同じ採番元を共有するので、`EffectCallReturned`の相関が重複することはない
+/// （NextRequestIdの型直前のコメント参照）。
+let allocateRequestId (state: PlacementState) : RequestId * PlacementState =
+    RequestId state.NextRequestId, { state with NextRequestId = state.NextRequestId + 1L }
 
 /// §7.2「PendingのDeadline」の既定値。実測未確定のため暫定値（他のタイムアウトと同様）。
 let pendingDeadlineMs = 2_000L

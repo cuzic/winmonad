@@ -42,6 +42,23 @@ let ``Monocleで1窓をReconcileすると、SetRectがWorkArea全体を指し、
     Assert.Equal(Some (Shown (Some workArea)), Map.tryFind w state'.Desired)
 
 [<Fact>]
+let ``allocateRequestIdは呼ぶたびに異なるRequestIdを返し、dispatchPlacementsの採番元と共有される(v2.27)`` () =
+    // RequestIdはEffectCallReturnedで相関する唯一の鍵なので、採番元がPlacement内で2つに割れてはならない
+    // （`NextRequestId`の型直前のコメント参照）——`allocateRequestId`（WmState.stepがFocus.SwitchSettleの
+    // 再要求やMoveFocusedToWorkspaceのRequestForeground用に呼ぶ窓口）が、後続の`reconcileWorkspace`が
+    // 発行するSetRectのRequestIdと衝突しないことを確認する。
+    let rid1, stateAfterAlloc1 = allocateRequestId initial
+    let rid2, stateAfterAlloc2 = allocateRequestId stateAfterAlloc1
+    Assert.NotEqual(rid1, rid2)
+    Assert.Equal(RequestId 0L, rid1)
+    Assert.Equal(RequestId 1L, rid2)
+
+    let w = WindowId 1L
+    let ctx = ctxWith [ w ]
+    let _, effects, _ = reconcileWorkspace 10L registry monocleRef ctx (managementOf [ w ]) (aliveOf [ w ]) stateAfterAlloc2
+    Assert.Equal<Effect list>([ SetRect (RequestId 2L, w, workArea) ], effects)
+
+[<Fact>]
 let ``Desiredと同じ結果ならSetRectを再発行しない(§7.3重複要求の禁止)`` () =
     let w = WindowId 1L
     let ctx = ctxWith [ w ]

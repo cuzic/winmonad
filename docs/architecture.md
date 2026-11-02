@@ -1,5 +1,17 @@
 # Windows プログラマブル・ウィンドウマネージャー 統合設計書
 
+Version: 2.27（§7.4のCoreCommand`MoveFocusedToWorkspace`を`WmState.step`へ配線した——xmonadの
+`delete`と同じ意味論で、フォーカス中の窓を別のWorkspaceへ送り、元のWorkspaceのzipperは送った窓を
+除いた隣の窓へ`RequestForeground`する。`WorkspaceSet.moveToWorkspace`が内部で呼ぶ`Zipper.remove`
+（「取り除いた窓がFocusだった場合は隣へ移る」）が既に隣への移動を実装していたので、配線する側は
+移動とRequestForegroundの発行だけで済んだ。移動先が既に所属するWorkspaceと同じ場合は並び順を乱す
+だけの無意味な操作として何もしない。実装の過程で、`RequestId`の採番元がこれまで`PlacementState`
+だけに閉じていて（`dispatchPlacements`が唯一の消費者）、Focus/Workspaces発のEffect（本バージョンの
+`RequestForeground`、将来のFocus.SwitchSettleの再要求）が新しいRequestIdを安全に発行する手段が無い
+ことに気づいた：`EffectCallReturned`はRequestIdだけで相関するので、採番元が2つに割れると
+（例えば両方が0から独立にカウントする）異なる発行元の要求が同じIdを名乗る衝突が起こり得る。
+`Placement.allocateRequestId`（カウンタの物理的な所在はPlacementのままだが、`WmState.step`が
+Placement以外の理由でも呼べる窓口）を追加し、単一の採番元を保ったまま共有できるようにした。
 Version: 2.26（Placement.fsのファイル冒頭「対象外」が挙げていた「複数の可視Workspaceへの拡張」を
 閉じた。`WmState.step`の段⑦（Reconcile）が、アクティブなWorkspace1つだけでなく、現在表示中の
 全Workspace（他モニターに表示中の可視Workspaceも含む）を`Topology.displays`の`current :: visible`
@@ -56,7 +68,9 @@ Version: 2.23（v2.22で見つけ記録した既知のギャップ（`Denied Oth
 `settleTopology`の`ScreenGrace`タイマー取りこぼしを発見・修正した（v2.25）／段⑦のReconcileを
 アクティブなWorkspace1つだけでなく現在表示中の全Workspaceへ拡張し、`PlanValidator`の
 `checkNoMissingPlacement`が要求する「渡されたTiled×Aliveの集合は呼び出し先のWorkspaceに
-属する窓だけへ絞り込む」という既存の暗黙の前提を初めて踏んで修正した（v2.26）
+属する窓だけへ絞り込む」という既存の暗黙の前提を初めて踏んで修正した（v2.26）／§7.4の
+`MoveFocusedToWorkspace`を配線し、Focus/Workspaces発のEffectが安全にRequestIdを発行できる
+`Placement.allocateRequestId`という単一の共有採番元を新設した（v2.27）
 Version: 2.22（Wm.Simulationが`EffectCallReturned`を実際に返せるようになったので（v2.21）、
 `InputEvent.EffectCallReturned`をPlacement/Healthへ配線した。`Placement.onEffectCallReturned`は
 `Ok ()`では何もせず（§7.2「目標矩形を観測するまではSatisfiedにしない」）、`Error`は`classify`で

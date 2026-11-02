@@ -172,6 +172,51 @@ let ``2台のモニターそれぞれにWorkspaceが表示されていると、R
         Assert.Empty(rectsForW1)
     | other -> Assert.True(false, sprintf "expected exactly 1 visible (non-active) screen, got %A" other)
 
+let private mkForegroundObserved (sequence: int64) (w: WindowId) : InputEvent =
+    ForegroundObserved { Value = Ok (Some w); SampleSequence = sequence; MonotonicTime = sequence; Source = "test" }
+
+[<Fact>]
+let ``MoveFocusedToWorkspaceは、フォーカス中の窓を別のWorkspaceへ送り、元のWorkspaceは隣の窓へRequestForegroundする`` () =
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0 ]
+    let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+    let w1, w2 = WindowId 1L, WindowId 2L
+    let afterW1 = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved w1))
+    let afterW2 = step RuntimePolicy.defaults afterW1.Next (mkEnvelope 2L (visibleWindowObserved w2))
+    let srcWs = WorkspaceSet.workspaceOf w1 afterW2.Next.Workspaces |> Option.get
+    Assert.Equal(Some srcWs, WorkspaceSet.workspaceOf w2 afterW2.Next.Workspaces)
+
+    let afterFocused = step RuntimePolicy.defaults afterW2.Next (mkEnvelope 3L (mkForegroundObserved 3L w1))
+    let dest = WorkspaceId 99
+    let afterMove = step RuntimePolicy.defaults afterFocused.Next (mkEnvelope 4L (UserCommand (MoveFocusedToWorkspace dest)))
+
+    Assert.Equal(Some dest, WorkspaceSet.workspaceOf w1 afterMove.Next.Workspaces)
+    // 元のWorkspaceのzipperはw1を除いた隣のw2へFocusが移っている。
+    match (WorkspaceSet.stateOf srcWs afterMove.Next.Workspaces).Stack with
+    | Some z -> Assert.Equal(w2, z.Focus)
+    | None -> Assert.True(false, "expected w2 to remain in the source Workspace")
+    let effects = afterMove.Effects |> List.map GatedEffect.effect
+    Assert.Contains(effects, function RequestForeground (_, target) -> target = w2 | _ -> false)
+
+[<Fact>]
+let ``MoveFocusedToWorkspaceは、移動先が既に所属するWorkspaceと同じ場合は窓の並び順も変えず何もしない`` () =
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0 ]
+    let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+    // 2窓にする——1窓だけだと「取り除いて同じWorkspaceの末尾へ再追加」しても並びが変わらず、
+    // ガードが抜けていても区別できない（最初のmutation testingの試行で実際に踏んだ）。
+    let w1, w2 = WindowId 1L, WindowId 2L
+    let afterW1 = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved w1))
+    let afterW2 = step RuntimePolicy.defaults afterW1.Next (mkEnvelope 2L (visibleWindowObserved w2))
+    let srcWs = WorkspaceSet.workspaceOf w1 afterW2.Next.Workspaces |> Option.get
+    let afterFocused = step RuntimePolicy.defaults afterW2.Next (mkEnvelope 3L (mkForegroundObserved 3L w1))
+    let afterMove = step RuntimePolicy.defaults afterFocused.Next (mkEnvelope 4L (UserCommand (MoveFocusedToWorkspace srcWs)))
+    Assert.Equal(afterFocused.Next.Workspaces, afterMove.Next.Workspaces)
+
+[<Fact>]
+let ``MoveFocusedToWorkspaceは、フォーカスが無い(Elsewhere)なら何もしない`` () =
+    let seeded = initial RuntimePolicy.defaults
+    let afterMove = step RuntimePolicy.defaults seeded (mkEnvelope 1L (UserCommand (MoveFocusedToWorkspace (WorkspaceId 7))))
+    Assert.Equal(WorkspaceSet.empty, afterMove.Next.Workspaces)
+
 [<Fact>]
 let ``WindowRemovedは同じstepでPlacement.Geometryも除く`` () =
     let state = initial RuntimePolicy.defaults

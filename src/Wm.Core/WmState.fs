@@ -248,6 +248,28 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         { stateAfterPlacement with Windows = windowsAfterMovability }
         |> fun s -> movabilityEvents |> List.fold applyWindowsEvent s
 
+    // `MoveFocusedToWorkspace`（§7.4「xmonadのdeleteと同じ」、v2.27）：フォーカス中の窓を別のWorkspaceへ
+    // 送る。`focused`がManagedWindow wを返す時点で、wのWorkspaceは必ずTopology.isShownなので
+    // （`focused`の定義参照）、元のWorkspaceのzipperが窓を除いた後に残す隣の窓へRequestForegroundする
+    // ことは常に意味を持つ。`WorkspaceSet.moveToWorkspace`が内部で呼ぶ`Zipper.remove`が「取り除いた窓が
+    // Focusだった場合は隣へ移る」（xmonadのdelete）を既に実装しているので、ここでは移動と
+    // RequestForegroundの発行だけを行う。`dest = srcWs`（同じWorkspaceへの移動）は並び順を乱すだけの
+    // 無意味な操作なので何もしない。
+    let stateAfterMovability, moveFocusedEffects =
+        match envelope.Input, focusedBefore with
+        | UserCommand (MoveFocusedToWorkspace dest), ManagedWindow w ->
+            match WorkspaceSet.workspaceOf w stateAfterMovability.Workspaces with
+            | Some srcWs when srcWs <> dest ->
+                let workspaces' = WorkspaceSet.moveToWorkspace w dest stateAfterMovability.Workspaces
+                match (WorkspaceSet.stateOf srcWs workspaces').Stack with
+                | Some neighborZipper ->
+                    let rid, placement' = Placement.allocateRequestId stateAfterMovability.Placement
+                    { stateAfterMovability with Workspaces = workspaces'; Placement = placement' },
+                    [ RequestForeground (rid, neighborZipper.Focus) ]
+                | None -> { stateAfterMovability with Workspaces = workspaces' }, []
+            | _ -> stateAfterMovability, []
+        | _ -> stateAfterMovability, []
+
     // 段①相当：観測の信念反映（全入力について無条件に最初に行う、§7.1）。FocusのForegroundを配線する。
     // 信念の値が変わったらForegroundChanged（§7.1表の段①が出すDomainEvent）を出す。
     let focusAfterBelief, stage1Events =
@@ -388,7 +410,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
           HiddenByWm = Set.empty
           NeedsRestore = Set.empty }
 
-    let gated, rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects @ reconcileEffects)
+    let gated, rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects)
 
     // §7.2「GateRejected → Cancelled（Deadlineまで待たず同じstep内で即時に遷移する）」。
     let rejectedRequestIds = rejected |> List.choose fst
