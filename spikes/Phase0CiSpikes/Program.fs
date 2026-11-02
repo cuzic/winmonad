@@ -38,6 +38,14 @@
 // corrected by S1's measured shadow, lands exactly on the intended
 // DWM visible-frame rect -- a systematic conversion offset would make
 // a naive Mismatch classifier misfire on every placement.
+// S22-S25 ground the remaining open questions (M1/M2/M6/M7) from that
+// same Mismatch->Reevaluate design-consult writeup: S22 measures the
+// SetWindowPos(ASYNC)-to-LOCATIONCHANGE delay distribution (does
+// pendingDeadlineMs=2000 give enough margin); S23 checks whether a
+// WM_GETMINMAXINFO-rounded resize ever shows an unrounded intermediate
+// rect before settling; S24/S25 check WinEvent arrival order around a
+// (safely posted, not real-drag) move/size cycle and a minimize, to
+// ground the deferred user-drag/minimized-window Mismatch exclusions.
 // The *r-suffixed spikes (S4r/S5r/S7r/S11r) are real-desktop-
 // only: they need a genuine interactive desktop (an existing third-party
 // foreground window, a modern UWP shell, an already-running elevated
@@ -236,6 +244,16 @@ module Native =
         struct
             val mutable X: int
             val mutable Y: int
+        end
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type MINMAXINFO =
+        struct
+            val mutable ptReserved: POINT
+            val mutable ptMaxSize: POINT
+            val mutable ptMaxPosition: POINT
+            val mutable ptMinTrackSize: POINT
+            val mutable ptMaxTrackSize: POINT
         end
 
     [<StructLayout(LayoutKind.Sequential)>]
@@ -1839,6 +1857,232 @@ let spikeS21_SetRectRoundTrip () =
         tryTarget "re-measure at a third position/size" 200 150 500 400
     | _ -> log "- failed to read initial GetWindowRect/DWM frame"
 
+// S22 (M1): how long after SetWindowPos(SWP_ASYNCWINDOWPOS) does EVENT_OBJECT_LOCATIONCHANGE fire
+// for our own window? Grounds the Placement Mismatch->Reevaluate design's open question (M1,
+// docs spikes.md/the Opus adversarial-consult writeup): is pendingDeadlineMs=2000 generous enough
+// as the point at which Stage-1 Mismatch classification runs.
+let spikeS22_SetRectDispatchDelay () =
+    let EVENT_OBJECT_LOCATIONCHANGE = 0x800Bu
+    let WINEVENT_OUTOFCONTEXT = 0x0000u
+    let OBJID_WINDOW = 0
+    let SWP_NOZORDER = 0x0004u
+    let SWP_ASYNCWINDOWPOS = 0x4000u
+
+    let events = ResizeArray<int64>()
+    let sw = Stopwatch()
+    let mutable targetHwnd = IntPtr.Zero
+    let callback =
+        WinEventProc(fun _hWinEventHook eventType hwnd idObject _idChild _idEventThread _dwmsEventTime ->
+            if eventType = EVENT_OBJECT_LOCATIONCHANGE && hwnd = targetHwnd && idObject = OBJID_WINDOW then
+                events.Add(sw.ElapsedMilliseconds))
+
+    let hook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, IntPtr.Zero, callback, 0u, 0u, WINEVENT_OUTOFCONTEXT)
+    if hook = IntPtr.Zero then
+        log (sprintf "- SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE) failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+    else
+        try
+            use form = new Form(Text = "S22", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(100, 100, 400, 300))
+            form.Show()
+            pump 5
+            targetHwnd <- form.Handle
+
+            let targets = [ (100, 100, 400, 300); (300, 200, 500, 350); (50, 50, 600, 400); (400, 400, 350, 250); (10, 10, 700, 500) ]
+            for (x, y, w, h) in targets do
+                events.Clear()
+                sw.Restart()
+                let apiOk = SetWindowPos(form.Handle, IntPtr.Zero, x, y, w, h, SWP_NOZORDER ||| SWP_ASYNCWINDOWPOS)
+                let deadline = 500L
+                while sw.ElapsedMilliseconds < deadline && events.Count = 0 do
+                    Application.DoEvents()
+                    Thread.Sleep(1)
+                match events |> Seq.tryHead with
+                | Some ms -> log (sprintf "- SetWindowPos(ASYNC)->(%d,%d,%d,%d): API returned=%b, first LOCATIONCHANGE after %dms" x y w h apiOk ms)
+                | None -> log (sprintf "- SetWindowPos(ASYNC)->(%d,%d,%d,%d): API returned=%b, NO LOCATIONCHANGE within %dms" x y w h apiOk deadline)
+        finally
+            UnhookWinEvent(hook) |> ignore
+
+// S23 (M2): does rounding to WM_GETMINMAXINFO's MinTrackSize produce an intermediate (unrounded)
+// LOCATIONCHANGE before the final rounded one, or does Windows deliver only the already-rounded
+// rect? A "yes" would mean the existing checkPendingSatisfied (and any future early-Mismatch
+// Stage 2) could see a transient, misleadingly-different rect before the real final one settles.
+type private MinWidthForm(minTrackWidthPx: int) as this =
+    inherit Form()
+    do
+        this.Text <- "S23"
+        this.StartPosition <- FormStartPosition.Manual
+        this.Bounds <- Rectangle(100, 100, 400, 300)
+    override this.WndProc(m: Message byref) =
+        let WM_GETMINMAXINFO = 0x0024
+        if m.Msg = WM_GETMINMAXINFO then
+            let mutable mmi = Marshal.PtrToStructure<MINMAXINFO>(m.LParam)
+            mmi.ptMinTrackSize.X <- minTrackWidthPx
+            Marshal.StructureToPtr(mmi, m.LParam, false)
+        base.WndProc(&m)
+
+let spikeS23_MinWidthRoundingObservation () =
+    let EVENT_OBJECT_LOCATIONCHANGE = 0x800Bu
+    let WINEVENT_OUTOFCONTEXT = 0x0000u
+    let OBJID_WINDOW = 0
+    let SWP_NOZORDER = 0x0004u
+    let minTrackWidthPx = 400
+
+    let events = ResizeArray<int64 * int>() // (elapsedMs, width observed at that LOCATIONCHANGE)
+    let sw = Stopwatch()
+    let mutable targetHwnd = IntPtr.Zero
+    let callback =
+        WinEventProc(fun _hWinEventHook eventType hwnd idObject _idChild _idEventThread _dwmsEventTime ->
+            if eventType = EVENT_OBJECT_LOCATIONCHANGE && hwnd = targetHwnd && idObject = OBJID_WINDOW then
+                let mutable r = RECT()
+                GetWindowRect(hwnd, &r) |> ignore
+                events.Add(sw.ElapsedMilliseconds, r.Right - r.Left))
+
+    let hook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, IntPtr.Zero, callback, 0u, 0u, WINEVENT_OUTOFCONTEXT)
+    if hook = IntPtr.Zero then
+        log (sprintf "- SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE) failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+    else
+        try
+            use form = new MinWidthForm(minTrackWidthPx)
+            form.Show()
+            pump 5
+            targetHwnd <- form.Handle
+
+            events.Clear()
+            sw.Restart()
+            // Requested width (200) is narrower than WM_GETMINMAXINFO's MinTrackSize (400).
+            let apiOk = SetWindowPos(form.Handle, IntPtr.Zero, 100, 100, 200, 300, SWP_NOZORDER)
+            let deadline = 800L
+            while sw.ElapsedMilliseconds < deadline do
+                Application.DoEvents()
+                Thread.Sleep(1)
+            let mutable finalR = RECT()
+            GetWindowRect(form.Handle, &finalR) |> ignore
+            let sawUnroundedIntermediate = events |> Seq.exists (fun (_, w) -> w <> minTrackWidthPx)
+            log (
+                sprintf
+                    "- API returned=%b, requested width=200, MinTrackSize.X=%d, final width=%d, LOCATIONCHANGE sequence=%s, saw an unrounded (<> %d) intermediate width=%b"
+                    apiOk minTrackWidthPx (finalR.Right - finalR.Left)
+                    (events |> Seq.map (fun (t, w) -> sprintf "(%dms,w=%d)" t w) |> String.concat " ")
+                    minTrackWidthPx sawUnroundedIntermediate
+            )
+        finally
+            UnhookWinEvent(hook) |> ignore
+
+// S24 (M6): does EVENT_SYSTEM_MOVESIZESTART/MOVESIZEEND actually fire when WM_ENTERSIZEMOVE/
+// WM_EXITSIZEMOVE are posted directly (S18's safe technique, chosen specifically to avoid the
+// real OS modal-drag loop that risked hanging the pump the same way S4's Alt-key synthetic input
+// once did -- see S18's own header comment) rather than from a genuine OS-driven drag? If so,
+// where do any EVENT_OBJECT_LOCATIONCHANGE events in between land relative to those two. This is
+// the data Mismatch->Reevaluate's deferred "exclude user-drag" condition (condition 6) would need.
+let spikeS24_MoveSizeEventOrder () =
+    let EVENT_SYSTEM_MOVESIZESTART = 0x000Au
+    let EVENT_SYSTEM_MOVESIZEEND = 0x000Bu
+    let EVENT_OBJECT_LOCATIONCHANGE = 0x800Bu
+    let WINEVENT_OUTOFCONTEXT = 0x0000u
+    let OBJID_WINDOW = 0
+    let WM_ENTERSIZEMOVE = 0x0231u
+    let WM_EXITSIZEMOVE = 0x0232u
+    let SWP_NOZORDER = 0x0004u
+
+    let events = ResizeArray<int64 * string>()
+    let sw = Stopwatch()
+    let mutable targetHwnd = IntPtr.Zero
+    let callback =
+        WinEventProc(fun _hWinEventHook eventType hwnd idObject _idChild _idEventThread _dwmsEventTime ->
+            if hwnd = targetHwnd then
+                if eventType = EVENT_SYSTEM_MOVESIZESTART then events.Add(sw.ElapsedMilliseconds, "MOVESIZESTART")
+                elif eventType = EVENT_SYSTEM_MOVESIZEEND then events.Add(sw.ElapsedMilliseconds, "MOVESIZEEND")
+                elif eventType = EVENT_OBJECT_LOCATIONCHANGE && idObject = OBJID_WINDOW then events.Add(sw.ElapsedMilliseconds, "LOCATIONCHANGE"))
+
+    let hookMoveSize = SetWinEventHook(EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND, IntPtr.Zero, callback, 0u, 0u, WINEVENT_OUTOFCONTEXT)
+    let hookLocation = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, IntPtr.Zero, callback, 0u, 0u, WINEVENT_OUTOFCONTEXT)
+    if hookMoveSize = IntPtr.Zero || hookLocation = IntPtr.Zero then
+        log (sprintf "- SetWinEventHook failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+    else
+        try
+            use form = new Form(Text = "S24", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(100, 100, 300, 200))
+            form.Show()
+            pump 5
+            targetHwnd <- form.Handle
+
+            events.Clear()
+            sw.Restart()
+            SendMessage(form.Handle, WM_ENTERSIZEMOVE, IntPtr.Zero, IntPtr.Zero) |> ignore
+            pump 2
+            SetWindowPos(form.Handle, IntPtr.Zero, 150, 150, 300, 200, SWP_NOZORDER) |> ignore
+            pump 2
+            SetWindowPos(form.Handle, IntPtr.Zero, 220, 220, 300, 200, SWP_NOZORDER) |> ignore
+            pump 2
+            SendMessage(form.Handle, WM_EXITSIZEMOVE, IntPtr.Zero, IntPtr.Zero) |> ignore
+            pump 5
+
+            log (
+                sprintf
+                    "- event order (posted WM_ENTERSIZEMOVE/EXITSIZEMOVE around 2 SetWindowPos calls, S18's safe technique -- no real OS-driven drag attempted): %s"
+                    (events |> Seq.map (fun (t, name) -> sprintf "(%dms,%s)" t name) |> String.concat " ")
+            )
+            let sawMoveSizeNotify = events |> Seq.exists (fun (_, n) -> n = "MOVESIZESTART" || n = "MOVESIZEEND")
+            if not sawMoveSizeNotify then
+                log
+                    "- NOTE: no MOVESIZESTART/MOVESIZEEND WinEvent fired at all. These appear to be raised by USER32's own internal modal-drag tracking, not merely by a window seeing the WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE messages -- answering M6 for a genuine user drag needs real synthetic/physical mouse input on real desktop hardware (S11r-style), which this spike deliberately avoided for the hang-risk reason in the comment above."
+        finally
+            UnhookWinEvent(hookMoveSize) |> ignore
+            UnhookWinEvent(hookLocation) |> ignore
+
+// S25 (M7): does EVENT_OBJECT_LOCATIONCHANGE (to the minimized -32000-ish position) arrive before
+// or after EVENT_SYSTEM_MINIMIZESTART? Grounds Mismatch->Reevaluate's deferred "exclude minimized
+// windows" condition (condition 5): if LOCATIONCHANGE could arrive first, a belief-revision order
+// that trusts geometry before IsMinimized would briefly treat the minimized position as a real
+// Mismatch.
+let spikeS25_MinimizeEventOrder () =
+    let EVENT_SYSTEM_MINIMIZESTART = 0x0016u
+    let EVENT_OBJECT_LOCATIONCHANGE = 0x800Bu
+    let WINEVENT_OUTOFCONTEXT = 0x0000u
+    let OBJID_WINDOW = 0
+    let SW_MINIMIZE = 6
+    let SW_RESTORE = 9
+
+    let events = ResizeArray<int64 * string * RECT>()
+    let sw = Stopwatch()
+    let mutable targetHwnd = IntPtr.Zero
+    let callback =
+        WinEventProc(fun _hWinEventHook eventType hwnd idObject _idChild _idEventThread _dwmsEventTime ->
+            if hwnd = targetHwnd then
+                let mutable r = RECT()
+                GetWindowRect(hwnd, &r) |> ignore
+                if eventType = EVENT_SYSTEM_MINIMIZESTART then events.Add(sw.ElapsedMilliseconds, "MINIMIZESTART", r)
+                elif eventType = EVENT_OBJECT_LOCATIONCHANGE && idObject = OBJID_WINDOW then events.Add(sw.ElapsedMilliseconds, "LOCATIONCHANGE", r))
+
+    let hookMinimize = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZESTART, IntPtr.Zero, callback, 0u, 0u, WINEVENT_OUTOFCONTEXT)
+    let hookLocation = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, IntPtr.Zero, callback, 0u, 0u, WINEVENT_OUTOFCONTEXT)
+    if hookMinimize = IntPtr.Zero || hookLocation = IntPtr.Zero then
+        log (sprintf "- SetWinEventHook failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+    else
+        try
+            use form = new Form(Text = "S25", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(100, 100, 300, 200))
+            form.Show()
+            pump 5
+            targetHwnd <- form.Handle
+
+            events.Clear()
+            sw.Restart()
+            ShowWindow(form.Handle, SW_MINIMIZE) |> ignore
+            let deadline = 500L
+            while sw.ElapsedMilliseconds < deadline do
+                Application.DoEvents()
+                Thread.Sleep(1)
+            log (
+                sprintf
+                    "- event order on minimize: %s"
+                    (events |> Seq.map (fun (t, name, r) -> sprintf "(%dms,%s,rect=(%d,%d,%d,%d))" t name r.Left r.Top r.Right r.Bottom) |> String.concat " ")
+            )
+            match events |> Seq.tryFindIndex (fun (_, n, _) -> n = "MINIMIZESTART"), events |> Seq.tryFindIndex (fun (_, n, _) -> n = "LOCATIONCHANGE") with
+            | Some mi, Some li -> log (sprintf "- MINIMIZESTART arrived before LOCATIONCHANGE: %b" (mi < li))
+            | _ -> log "- did not observe both MINIMIZESTART and LOCATIONCHANGE within the deadline"
+            ShowWindow(form.Handle, SW_RESTORE) |> ignore
+        finally
+            UnhookWinEvent(hookMinimize) |> ignore
+            UnhookWinEvent(hookLocation) |> ignore
+
 [<STAThread>]
 [<EntryPoint>]
 let main argv =
@@ -1901,6 +2145,10 @@ let main argv =
         tryRun "S20 SwitchSettleのための前面切替フック遅延/揺れの実測(4.4/R4-5)" spikeS20_SwitchSettleTiming
         tryRun "S20b SwitchWorkspace実際の順序(hide->show->RequestForeground)での揺れの実測(4.4/R4-5)" spikeS20b_WorkspaceHideShowSettle
         tryRun "S21 SetRectの往復精度(M3、Placement Mismatch->Reevaluate設計の前提)" spikeS21_SetRectRoundTrip
+        tryRun "S22 SetWindowPos(ASYNC)発行からLOCATIONCHANGE観測までの遅延分布(M1)" spikeS22_SetRectDispatchDelay
+        tryRun "S23 最小幅での丸めに未丸め矩形の中間観測が出るか(M2)" spikeS23_MinWidthRoundingObservation
+        tryRun "S24 MOVESIZESTART/LOCATIONCHANGE/MOVESIZEENDの到着順(M6)" spikeS24_MoveSizeEventOrder
+        tryRun "S25 最小化時のMINIMIZESTART/LOCATIONCHANGEの到着順(M7)" spikeS25_MinimizeEventOrder
 
         log "\n(all spikes finished without the watchdog firing)"
         0
