@@ -17,29 +17,36 @@ type ResponsivenessEvidence =
 /// settleMs/graceMsと同様、実測確認はPhase 0〜Bで行う暫定値。
 let judgedHungThresholdUs = 1_000L
 
-let private respondingDefault (now: int64) : Belief<Responsiveness> =
-    { Value = Responding; Confidence = Confirmed; LastRevisedAt = now }
-
-/// Accumulating規則（§4.5）。信念が無い窓はRespondingとして扱う（R4-24、楽観側に倒しても安全）。
-/// `IsHungAppWindowTrue`は補助的証拠であり、単独では決してConfirmedにしない（ゴーストウィンドウは常にTRUEを返すため）。
+/// Accumulating規則（§4.5）。「Mapに無い」は「まだ証拠が無い」の意味であり（R6-12）、
+/// 決定的でない証拠から根拠の無い`Confirmed`を新たに作ってMapへ書き込んではならない（Opusレビュー5-5：
+/// 旧実装は証拠が無いときに`respondingDefault`を書き込んでいたため、Explainが「ハングしていないことを
+/// 確認済み」と誤って説明していた）。信念が無い窓をRespondingとして扱うのは、呼び出し側が
+/// `Map.tryFind`の結果が`None`であることをそのまま読む（R4-24）——この関数は`None`を返して
+/// 「Mapへ書かない」ことで実現する。
 let reviseResponsiveness
     (now: int64)
     (current: Belief<Responsiveness> option)
     (evidence: ResponsivenessEvidence)
-    : Belief<Responsiveness> =
+    : Belief<Responsiveness> option =
     match evidence with
-    | FromEffectFailure TargetHung -> { Value = Hung; Confidence = Confirmed; LastRevisedAt = now }
-    | FromEffectFailure _ -> current |> Option.defaultValue (respondingDefault now)
-    | FromObservation PumpResponded -> { Value = Responding; Confidence = Confirmed; LastRevisedAt = now }
+    | FromEffectFailure TargetHung -> Some { Value = Hung; Confidence = Confirmed; LastRevisedAt = now }
+    | FromEffectFailure _ -> current // 決定的な証拠ではない:既存の信念を保つ（無ければMapに書かない）
+    | FromObservation PumpResponded -> Some { Value = Responding; Confidence = Confirmed; LastRevisedAt = now }
     | FromObservation (PumpTimedOut elapsedUs) when elapsedUs <= judgedHungThresholdUs ->
-        { Value = Hung; Confidence = Confirmed; LastRevisedAt = now }
+        Some { Value = Hung; Confidence = Confirmed; LastRevisedAt = now }
     | FromObservation (PumpTimedOut _) ->
         // 判定前のタイムアウト満了（まだハング判定中）はHungの決定的な証拠にならない（Transientに相当）。
-        current |> Option.defaultValue (respondingDefault now)
+        current
     | FromObservation IsHungAppWindowTrue ->
+        // 補助的証拠であり、単独では決してConfirmedにしない（ゴーストウィンドウは常にTRUEを返すため）。
+        // 既存の信念（HungでもRespondingでも）があればそれを保つ。無ければ、この証拠だけを根拠に
+        // Inferredで事前の仮定を作ってよい（Explainの材料としては、本来はこの観測を運んだ入力の
+        // SampleSequenceを`Inferred [Sample seq]`として積むべきだが、現状のResponsivenessEvidenceは
+        // Observation全体ではなくResponsivenessSampleだけを運ぶため情報が無く、`Inferred []`で近似する
+        // ——既知の小さなギャップ。Explainの根拠一覧が薄くなるだけで、正しさには影響しない）。
         match current with
-        | Some b -> b // 既存の信念（HungでもRespondingでも）を変えない
-        | None -> { Value = Hung; Confidence = Inferred []; LastRevisedAt = now }
+        | Some b -> Some b
+        | None -> Some { Value = Hung; Confidence = Inferred []; LastRevisedAt = now }
 
 // ===== 再probe（指数バックオフ、§4.5） =====
 
@@ -53,7 +60,7 @@ let scheduleReprobe (now: int64) (window: WindowId) (retry: RetryState option) :
     let state0 = retry |> Option.defaultValue { AttemptCount = 0; LastAttemptAt = now }
     nextRetry reprobeMaxAttempts reprobeBaseDelayMs reprobeMaxDelayMs now state0
     |> Option.map (fun (state', delay) ->
-        state', now + delay, [ StartTimer (Health (ResponsivenessReprobe window), delay) ])
+        state', now + delay, [ StartTimer (TimerId.Health (ResponsivenessReprobe window), delay) ])
 
 /// Responsivenessの信念と、Hungの間の再probe待ち（§4.5）。
 type HealthState = {
@@ -73,29 +80,31 @@ let applyEvidence
     (state: HealthState)
     : HealthState * TimerCommand<TimerId> list =
     let before = Map.tryFind window state.Responsiveness
-    let revised = reviseResponsiveness now before evidence
-    let responsiveness' = Map.add window revised state.Responsiveness
-    let prevValue = before |> Option.map (fun b -> b.Value)
-    let becameHung = revised.Value = Hung && prevValue <> Some Hung
-    let recoveredFromHung = revised.Value = Responding && prevValue = Some Hung
+    match reviseResponsiveness now before evidence with
+    | None -> state, [] // 決定的な証拠が無く、既存の信念も無い:Mapに何も書かない（5-5）
+    | Some revised ->
+        let responsiveness' = Map.add window revised state.Responsiveness
+        let prevValue = before |> Option.map (fun b -> b.Value)
+        let becameHung = revised.Value = Hung && prevValue <> Some Hung
+        let recoveredFromHung = revised.Value = Responding && prevValue = Some Hung
 
-    if becameHung then
-        match scheduleReprobe now window None with
-        | Some (retry', deadline, cmds) ->
+        if becameHung then
+            match scheduleReprobe now window None with
+            | Some (retry', deadline, cmds) ->
+                { state with
+                    Responsiveness = responsiveness'
+                    Reprobes = Map.add window (retry', deadline) state.Reprobes },
+                cmds
+            | None ->
+                // AttemptCount=0から始めるため理論上到達しないが、全域関数として定義する（§7.1「例外を制御フローに使わない」）。
+                { state with Responsiveness = responsiveness' }, []
+        elif recoveredFromHung then
             { state with
                 Responsiveness = responsiveness'
-                Reprobes = Map.add window (retry', deadline) state.Reprobes },
-            cmds
-        | None ->
-            // AttemptCount=0から始めるため理論上到達しないが、全域関数として定義する（§7.1「例外を制御フローに使わない」）。
+                Reprobes = Map.remove window state.Reprobes },
+            [ CancelTimer (TimerId.Health (ResponsivenessReprobe window)) ]
+        else
             { state with Responsiveness = responsiveness' }, []
-    elif recoveredFromHung then
-        { state with
-            Responsiveness = responsiveness'
-            Reprobes = Map.remove window state.Reprobes },
-        [ CancelTimer (Health (ResponsivenessReprobe window)) ]
-    else
-        { state with Responsiveness = responsiveness' }, []
 
 /// ResponsivenessReprobeタイマーの発火を処理する。Topology.updateと同じくawaitDeadlineで古い発火を無視する。
 let onReprobeTimerFired (now: int64) (window: WindowId) (state: HealthState) : HealthState * TimerCommand<TimerId> list =

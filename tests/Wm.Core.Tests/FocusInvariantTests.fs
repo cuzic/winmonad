@@ -19,32 +19,47 @@ let private sampleErr: NativeCallRecord = { Api = "test"; Space = Win32LastError
 [<Property>]
 let ``reviseForeground: より新しいSampleSequenceのOk観測は常に採用される`` (seq1: int) (seq2: int) (w1: int) (w2: int) =
     let s1, s2 = int64 (abs seq1), int64 (abs seq1) + int64 (abs seq2) + 1L // s2は厳密にs1より新しい
-    let belief1 = reviseForeground None (mkObservation s1 (Ok (Some (WindowId (int64 w1)))))
-    let belief2 = reviseForeground (Some belief1) (mkObservation s2 (Ok (Some (WindowId (int64 w2)))))
-    match belief2 with
-    | Believed b -> b.Value = Some (WindowId (int64 w2)) && b.Confidence = Confirmed && b.LastRevisedAt = s2
+    let belief1 = reviseForeground 0L LatestWins.unformed (mkObservation s1 (Ok (Some (WindowId (int64 w1)))))
+    let belief2 = reviseForeground 1L belief1 (mkObservation s2 (Ok (Some (WindowId (int64 w2)))))
+    match belief2.Slot with
+    | Believed b -> b.Value = Some (WindowId (int64 w2)) && b.Confidence = Confirmed
     | Unformed _ -> false
 
 [<Property>]
 let ``reviseForeground: 古いSampleSequenceの観測は新しい信念を上書きしない`` (seqNewer: int) (seqOlderGap: int) (wNewer: int) (wOlder: int) =
     let sNewer = int64 (abs seqNewer) + int64 (abs seqOlderGap) + 1L
     let sOlder = int64 (abs seqNewer) // sOlder < sNewer
-    let afterNewer = reviseForeground None (mkObservation sNewer (Ok (Some (WindowId (int64 wNewer)))))
-    let afterOlder = reviseForeground (Some afterNewer) (mkObservation sOlder (Ok (Some (WindowId (int64 wOlder)))))
+    let afterNewer = reviseForeground 0L LatestWins.unformed (mkObservation sNewer (Ok (Some (WindowId (int64 wNewer)))))
+    let afterOlder = reviseForeground 1L afterNewer (mkObservation sOlder (Ok (Some (WindowId (int64 wOlder)))))
     afterOlder = afterNewer // 一切変化しない
 
 [<Property>]
 let ``reviseForeground: Errorの観測は値を保ったままStaleにする`` (sequence: int) (w: int) =
     let s = int64 (abs sequence)
-    let afterOk = reviseForeground None (mkObservation s (Ok (Some (WindowId (int64 w)))))
-    let afterErr = reviseForeground (Some afterOk) (mkObservation (s + 1L) (Error sampleErr))
-    match afterOk, afterErr with
+    let afterOk = reviseForeground 0L LatestWins.unformed (mkObservation s (Ok (Some (WindowId (int64 w)))))
+    let afterErr = reviseForeground 1L afterOk (mkObservation (s + 1L) (Error sampleErr))
+    match afterOk.Slot, afterErr.Slot with
     | Believed okBelief, Believed errBelief ->
         errBelief.Value = okBelief.Value
         && (match errBelief.Confidence with
             | Stale _ -> true
             | _ -> false)
     | _ -> false
+
+/// Opusレビュー1-2の回帰テスト：値が既に確定した後にErrorが届いても、Errorより古いが現在の値より
+/// 新しいOk観測は正しく採用される（旧実装は`LastRevisedAt`をErrorのSampleSequenceまで進めてしまい、
+/// この後続のOk観測を誤って「古い」と判定して捨てていた）。
+[<Property>]
+let ``reviseForeground: Errorの後でも値より新しいOk観測は採用される（1-2回帰）`` (sARaw: int) (gapToError: int) (gapToOkB: int) (wA: int) (wB: int) =
+    let sA = int64 (abs sARaw)
+    let sError = sA + int64 (abs gapToError) + 1L
+    let sOkB = sA + int64 (abs gapToOkB) + 1L // sAより厳密に新しい（sErrorより古いか新しいかは問わない）
+    let afterA = reviseForeground 0L LatestWins.unformed (mkObservation sA (Ok (Some (WindowId (int64 wA)))))
+    let afterError = reviseForeground 1L afterA (mkObservation sError (Error sampleErr))
+    let afterB = reviseForeground 2L afterError (mkObservation sOkB (Ok (Some (WindowId (int64 wB)))))
+    match afterB.Slot with
+    | Believed b -> b.Value = Some (WindowId (int64 wB)) && b.Confidence = Confirmed
+    | Unformed _ -> false
 
 [<Property>]
 let ``updateHistory: 任意の遷移列をfoldしてもHistoryに重複が生じない`` (rawWindowIds: int list) =
@@ -74,4 +89,4 @@ let ``SwitchSettle: deadline到達ちょうどのTimerElapsedは本物の発火�
     let state0 = { initial with SwitchSettle = Some settling }
     let (_, deadline) = settling
     let state1, reRequest, cmds1 = onSwitchSettleTimerFired deadline state0
-    (state1.SwitchSettle = None) && (reRequest = focusTarget) && (cmds1 = [ CancelTimer (Focus WorkspaceSwitchSettle) ])
+    (state1.SwitchSettle = None) && (reRequest = focusTarget) && (cmds1 = [ CancelTimer (TimerId.Focus WorkspaceSwitchSettle) ])

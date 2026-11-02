@@ -28,21 +28,28 @@ let ``IsHungAppWindowTrueだけでは新たにHung&Confirmedを作らない`` (n
         | Some b -> b.Value = Hung && b.Confidence = Confirmed
         | None -> false
     let revised = reviseResponsiveness (int64 now) current (FromObservation IsHungAppWindowTrue)
-    let becameHungConfirmed = revised.Value = Hung && revised.Confidence = Confirmed
+    let becameHungConfirmed =
+        match revised with
+        | Some b -> b.Value = Hung && b.Confidence = Confirmed
+        | None -> false
     wasAlreadyHungConfirmed || not becameHungConfirmed
 
 [<Property>]
 let ``PumpRespondedは常にResponding(Confirmed)にする`` (now: int) (currentValue: Responsiveness) =
     let current = mkCurrent currentValue Confirmed
-    let revised = reviseResponsiveness (int64 now) current (FromObservation PumpResponded)
-    revised.Value = Responding && revised.Confidence = Confirmed
+    match reviseResponsiveness (int64 now) current (FromObservation PumpResponded) with
+    | Some revised -> revised.Value = Responding && revised.Confidence = Confirmed
+    | None -> false
 
 [<Property>]
 let ``判定済みのPumpTimedOutとTargetHungは常にHung(Confirmed)にする`` (now: int) (elapsedUsRaw: int) =
     let elapsedUs = int64 (abs elapsedUsRaw % 1000) // judgedHungThresholdUs(1000us)以下に収める
-    let r1 = reviseResponsiveness (int64 now) None (FromObservation (PumpTimedOut elapsedUs))
-    let r2 = reviseResponsiveness (int64 now) None (FromEffectFailure TargetHung)
-    (r1.Value = Hung && r1.Confidence = Confirmed) && (r2.Value = Hung && r2.Confidence = Confirmed)
+    match
+        reviseResponsiveness (int64 now) None (FromObservation (PumpTimedOut elapsedUs)),
+        reviseResponsiveness (int64 now) None (FromEffectFailure TargetHung)
+    with
+    | Some r1, Some r2 -> (r1.Value = Hung && r1.Confidence = Confirmed) && (r2.Value = Hung && r2.Confidence = Confirmed)
+    | _ -> false
 
 [<Property>]
 let ``scheduleReprobeを繰り返すと試行回数は20回を超えず遅延は30秒を超えない`` (startNow: int) =
