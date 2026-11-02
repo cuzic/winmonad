@@ -32,6 +32,13 @@ type RuntimePolicy =
       PatternSet: TitlePatternSet
       /// §5.4「Unknownには期限を設ける」。実測値未確定のため暫定値（TopologyConfigのSettleMs/GraceMsと同様）。
       ClassificationTimeoutMs: int64
+      /// `Focus.SwitchSettle`（§4.4/R4-5、Workspace切替直後の揺れの吸収）の待ち時間。CI実機スパイク
+      /// S20/S20b（docs/spikes.md、自プロセス窓間の`SetWinEventHook(EVENT_SYSTEM_FOREGROUND)`配送、
+      /// 単純なフォーカス交換・実際のhide→show→RequestForeground順序の両方）では一貫して2〜4msで
+      /// 届き揺れは一度も観測されなかったが、S4が実デスクトップ再検証（S4r）で初めて限界が判明した
+      /// 前例があるため、CIの数値そのままではなく十分な安全マージンを取った暫定値とする。
+      /// 実デスクトップでの再検証（S20r）が持ち越しの課題。
+      SwitchSettleMs: int64
       /// §7.1段⑦「Reconcile」が`PolicyIR`の`LayoutRef`からF#関数を解決するためのRegistry（§5.6）。
       /// ADR-019実装順14、PlacementのPending/Desiredラウンドで追加した。
       LayoutRegistry: Registry }
@@ -42,6 +49,7 @@ module RuntimePolicy =
           Policy = PolicyIR.defaults
           PatternSet = buildTitlePatternSet PolicyIR.defaults
           ClassificationTimeoutMs = 3_000L
+          SwitchSettleMs = 150L
           LayoutRegistry =
             Registry.empty
             |> Registry.register (Wm.Layouts.MasterStack.implementation "builtin-master-stack-v1")
@@ -272,15 +280,20 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         | _ -> stateAfterMovability, []
 
     // 段①相当：観測の信念反映（全入力について無条件に最初に行う、§7.1）。FocusのForegroundを配線する。
-    // 信念の値が変わったらForegroundChanged（§7.1表の段①が出すDomainEvent）を出す。
-    let focusAfterBelief, stage1Events =
+    // 信念の値が変わったらForegroundChanged（§7.1表の段①が出すDomainEvent）を出す。v2.40で
+    // `stateAfterMovability.Focus`へ即座に書き戻すようにした（以前は`focusAfterBelief`という別の
+    // 値のまま持ち越し、段⑤のSwitchSettleタイマー処理まで`stateAfterMovability.Focus`に反映しなかった
+    // ——その間に`SwitchWorkspace`の`switchSettleStartCmds`配線が同じ`stateAfterMovability.Focus`へ
+    // `SwitchSettle`を書いても、段⑤の消費が古い`focusAfterBelief`を使っていたせいで消されてしまう
+    // バグを実際にテストで踏んだ）。
+    let stateAfterMovability, stage1Events =
         match envelope.Input with
         | ForegroundObserved obs ->
             let revised = Focus.reviseForeground now stateAfterMovability.Focus.Foreground obs
             let changed = LatestWins.value revised <> LatestWins.value stateAfterMovability.Focus.Foreground
-            { stateAfterMovability.Focus with Foreground = revised },
+            { stateAfterMovability with Focus = { stateAfterMovability.Focus with Foreground = revised } },
             (if changed then [ ForegroundChanged (LatestWins.value revised |> Option.flatten) ] else [])
-        | _ -> stateAfterMovability.Focus, []
+        | _ -> stateAfterMovability, []
 
     // 段②：Topologyの原因・コマンドの受付。
     let topologyState', topologyResponse, topologyEvents, traces =
@@ -341,6 +354,11 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     // stepでは常に一致する——今はこの区別を実際には踏めないが、表どおりの8段パイプラインへの組み直し
     // （ファイル冒頭コメント）後に複数の原因が同じstepへ合流する余地に備えて、より仕様に忠実な
     // `state.Workspaces`を選んでおく。`Reconfiguring`中はDisplaysが未確定なので何もしない。
+    // `SwitchSettle`が待ち中（v2.40）は、hiddenなWorkspaceの`ForegroundFollow`分岐（Workspaceを
+    // 切り替える方）だけを止める（§4.4/R4-5「この待ちの間は、hiddenなWorkspaceの窓のフォアグラウンド
+    // 化でWorkspaceを切り替えない」）。`Foreground`の信念自体は上の段①で既に更新済みなので影響は無い。
+    // 同じcurrentのモニター追従（`followForegroundToVisibleMonitor`）はWorkspaceを切り替えないので対象外。
+    let isSwitchSettling = stateAfterMovability.Focus.SwitchSettle |> Option.isSome
     let topologyState', topologyEvents, stateAfterMovability =
         match stage1Events |> List.tryPick (function ForegroundChanged wOpt -> Some wOpt | _ -> None) with
         | Some (Some w) when (match Topology.phase topologyState' with Reconfiguring _ -> false | _ -> true) ->
@@ -352,6 +370,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
                 | Displays (current, _) when current.Workspace = ws -> topologyState', topologyEvents, stateAfterMovability
                 | Displays (_, visible) when visible |> List.exists (fun sc -> sc.Workspace = ws) ->
                     Topology.followForegroundToVisibleMonitor ws topologyState', topologyEvents, stateAfterMovability
+                | Displays _ when isSwitchSettling -> topologyState', topologyEvents, stateAfterMovability
                 | Displays _ ->
                     let topologyState'', viewEvents = Topology.showWorkspaceAsForegroundFollow ws topologyState'
                     topologyState'', topologyEvents @ viewEvents, stateAfterMovability
@@ -387,24 +406,31 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     // 発行しない）へ一度だけRequestForegroundする（§4.4「ユーザーの操作でWorkspaceが表示されたとき…
     // フォーカスを渡す窓はそのWorkspaceのzipperのFocus」）。アプリの自己アクティブ化
     // （`ForegroundFollow`）やモニター再接続（`Reconcile`）による表示ではフォーカスを要求しない
-    // （§4.4、同じ理由はPlacement.fsのコメント参照）。切替直後の揺れを吸収する`SwitchSettle`は
-    // このラウンドの対象外（Topology.fsのコメント参照）——ここでは一度だけ要求する。
+    // （§4.4、同じ理由はPlacement.fsのコメント参照）。切替直後の揺れを吸収する`SwitchSettle`
+    // （R4-5、v2.40で配線。CI実機スパイクS20/S20bで同一プロセス内の揺れ無しを確認済みだが、S4が
+    // S4rで実デスクトップ再検証を要した前例に鑑み安全マージンを大きく取った暫定値、
+    // `RuntimePolicy.SwitchSettleMs`参照）を同じタイミングで開始する——フォーカスを渡す窓が無い
+    // （`Stack = None`）場合もFocus.startSwitchSettleへ`None`を渡して待ちだけ開始する（R5-1の
+    // `ForegroundFollow`分岐を一時的に止めるのが目的で、再要求するものが無くても待ち自体は要る）。
     let userSwitchedWorkspaces =
         topologyEvents
         |> List.choose (function
             | CurrentChanged ws -> Some ws
             | WorkspaceShown (ws, UserView) -> Some ws
             | _ -> None)
-    let stateAfterMovability, switchForegroundEffects =
+    let stateAfterMovability, switchForegroundEffects, switchSettleStartCmds =
         userSwitchedWorkspaces
         |> List.fold
-            (fun (s: WmState, effects) ws ->
-                match (WorkspaceSet.stateOf ws s.Workspaces).Stack with
-                | None -> s, effects
-                | Some z ->
+            (fun (s: WmState, effects, cmds) ws ->
+                let focusTarget = (WorkspaceSet.stateOf ws s.Workspaces).Stack |> Option.map (fun z -> z.Focus)
+                let settleValue, settleCmds = Focus.startSwitchSettle now runtimePolicy.SwitchSettleMs focusTarget
+                let s = { s with Focus = { s.Focus with SwitchSettle = Some settleValue } }
+                match focusTarget with
+                | None -> s, effects, cmds @ settleCmds
+                | Some w ->
                     let rid, placementSt' = Placement.allocateRequestId s.Placement
-                    { s with Placement = placementSt' }, effects @ [ RequestForeground (rid, z.Focus) ])
-            (stateAfterMovability, [])
+                    { s with Placement = placementSt' }, effects @ [ RequestForeground (rid, w) ], cmds @ settleCmds)
+            (stateAfterMovability, [], [])
 
     // `UserCommand FocusNext`/`FocusPrevious`（§4.4「アクティブなWorkspaceのzipperを回す」、v2.33）：
     // `WorkspaceSet.rotateNext`/`rotatePrevious`は既にTiled/Floating両方を巡回する意味で実装済み
@@ -489,12 +515,21 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             | _ -> stateAfterMovability.Health, []
         | _ -> stateAfterMovability.Health, []
 
-    // Focus：SwitchSettleタイマーの発火。「再要求が必要な窓」はPlacement（RequestIdの採番元）が
-    // 無いためEffectへ変換できず、既知のギャップとして捨てる（TimerCommand（CancelTimer）だけは反映する）。
-    let focusAfterTimer, _switchSettleReRequest, switchSettleTimerCmds =
+    // Focus：SwitchSettleタイマーの発火（R4-5、v2.40で再要求を配線。以前は採番元が無いとして捨てていたが、
+    // 他のUserCommand同様`stateAfterMovability.Placement`から採番できる）。期限到達時点でまだ`focused`が
+    // 渡すべき窓`w`になっていなければ（hiddenなWorkspaceの窓に揺れたままか、あるいはまだElsewhereなら）
+    // `RequestForeground`を1回だけ再発行する。`focused`は`Foreground`信念とWorkspaces/Topologyだけで
+    // 決まり`SwitchSettle`自体は読まないので、タイマー処理前の`stateAfterMovability`で評価してよい。
+    let stateAfterMovability, focusAfterTimer, switchSettleTimerCmds, switchSettleReRequestEffects =
         match envelope.Input with
-        | TimerElapsed (TimerId.Focus WorkspaceSwitchSettle) -> Focus.onSwitchSettleTimerFired now focusAfterBelief
-        | _ -> focusAfterBelief, None, []
+        | TimerElapsed (TimerId.Focus WorkspaceSwitchSettle) ->
+            let focusAfterTimer, reRequestTarget, cmds = Focus.onSwitchSettleTimerFired now stateAfterMovability.Focus
+            match reRequestTarget with
+            | Some w when focused stateAfterMovability <> ManagedWindow w ->
+                let rid, placementSt' = Placement.allocateRequestId stateAfterMovability.Placement
+                { stateAfterMovability with Placement = placementSt' }, focusAfterTimer, cmds, [ RequestForeground (rid, w) ]
+            | _ -> stateAfterMovability, focusAfterTimer, cmds, []
+        | _ -> stateAfterMovability, stateAfterMovability.Focus, [], []
 
     let stateAfterBeliefs =
         { stateAfterMovability with
@@ -631,7 +666,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
           HiddenByWm = Set.empty
           NeedsRestore = Set.empty }
 
-    let gated, rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects @ switchForegroundEffects @ focusRotateEffects @ closeFocusedEffects @ focusMostRecentEffects)
+    let gated, rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects @ switchForegroundEffects @ focusRotateEffects @ closeFocusedEffects @ focusMostRecentEffects @ switchSettleReRequestEffects)
 
     // §7.2「GateRejected → Cancelled（Deadlineまで待たず同じstep内で即時に遷移する）」。
     let rejectedRequestIds = rejected |> List.choose fst
@@ -650,6 +685,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         topologyResponse.TimerCommands
         @ healthTimerCmds
         @ switchSettleTimerCmds
+        @ switchSettleStartCmds
         @ windowsTimerCmds
         @ vanishTimerCmds
         @ placementTimerCmds

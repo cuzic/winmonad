@@ -388,6 +388,80 @@ let ``SwitchWorkspaceでhiddenなWorkspaceへ切り替えると、新しくcurre
     Assert.Contains(effects, function RequestForeground (_, target) -> target = w2 | _ -> false)
 
 [<Fact>]
+let ``SwitchWorkspaceはSwitchSettleを開始し、揺れ(旧Workspaceの窓への一時的なフォアグラウンド化)でWorkspaceを戻さない(R4-5, v2.40)`` () =
+    let w1 = WindowId 1L
+    let afterW1 = settleOneMonitorThenDiscoverWindow w1
+    let ws0 = WorkspaceSet.workspaceOf w1 afterW1.Next.Workspaces |> Option.get
+
+    let hiddenWs = WorkspaceId 999
+    let w2 = WindowId 2L
+    let windows2 =
+        { afterW1.Next.Windows with
+            Records = Map.add w2 { WindowRecord.initial with Classification = Classified (EffTiled, ByUserOverride) } afterW1.Next.Windows.Records }
+    let workspaces2 = WorkspaceSet.addWindow hiddenWs w2 false afterW1.Next.Workspaces
+    let seeded2 = { afterW1.Next with Windows = windows2; Workspaces = workspaces2 }
+
+    let afterSwitch = step RuntimePolicy.defaults seeded2 (mkEnvelope 200L (UserCommand (SwitchWorkspace hiddenWs)))
+    match afterSwitch.Next.Focus.SwitchSettle with
+    | Some (Some target, deadline) ->
+        Assert.Equal(w2, target)
+        Assert.Equal(200L + RuntimePolicy.defaults.SwitchSettleMs, deadline)
+    | other -> failwithf "expected SwitchSettle to start with focusTarget=Some w2, got %A" other
+
+    // OSが隠しつつあるws0側のw1を一時的にフォアグラウンドにする「揺れ」を模す。SwitchSettleが
+    // 待ち中なので、R5-1のhiddenなWorkspaceへのForegroundFollow分岐は止まり、currentはhiddenWsの
+    // ままになる(戻らない)——戻ってしまうと切替そのものが巻き戻る。
+    let afterWobble = step RuntimePolicy.defaults afterSwitch.Next (mkEnvelope 250L (mkForegroundObserved 250L w1))
+    match displays afterWobble.Next.Topology with
+    | Displays (current, _) -> Assert.Equal(hiddenWs, current.Workspace)
+    | NoMonitors -> Assert.True(false, "expected a monitor")
+
+[<Fact>]
+let ``SwitchSettleタイマー発火時、まだfocusedが目的の窓でなければRequestForegroundを1回だけ再発行する(R4-5, v2.40)`` () =
+    let w1 = WindowId 1L
+    let afterW1 = settleOneMonitorThenDiscoverWindow w1
+    let hiddenWs = WorkspaceId 999
+    let w2 = WindowId 2L
+    let windows2 =
+        { afterW1.Next.Windows with
+            Records = Map.add w2 { WindowRecord.initial with Classification = Classified (EffTiled, ByUserOverride) } afterW1.Next.Windows.Records }
+    let workspaces2 = WorkspaceSet.addWindow hiddenWs w2 false afterW1.Next.Workspaces
+    let seeded2 = { afterW1.Next with Windows = windows2; Workspaces = workspaces2 }
+    let afterSwitch = step RuntimePolicy.defaults seeded2 (mkEnvelope 200L (UserCommand (SwitchWorkspace hiddenWs)))
+
+    // 実際のOSからのForegroundObservedがまだ届いていない(focused = Elsewhere)まま、期限が来る。
+    let deadline = 200L + RuntimePolicy.defaults.SwitchSettleMs
+    let afterTimer = step RuntimePolicy.defaults afterSwitch.Next (mkEnvelope deadline (TimerElapsed (TimerId.Focus WorkspaceSwitchSettle)))
+    Assert.Equal(None, afterTimer.Next.Focus.SwitchSettle)
+    let effects = afterTimer.Effects |> List.map GatedEffect.effect
+    Assert.Contains(effects, function RequestForeground (_, target) -> target = w2 | _ -> false)
+
+[<Fact>]
+let ``SwitchSettleタイマー発火時、既にfocusedが目的の窓なら再発行しない(R4-5, v2.40)`` () =
+    let w1 = WindowId 1L
+    let afterW1 = settleOneMonitorThenDiscoverWindow w1
+    let hiddenWs = WorkspaceId 999
+    let w2 = WindowId 2L
+    let windows2 =
+        { afterW1.Next.Windows with
+            Records = Map.add w2 { WindowRecord.initial with Classification = Classified (EffTiled, ByUserOverride) } afterW1.Next.Windows.Records }
+    let workspaces2 = WorkspaceSet.addWindow hiddenWs w2 false afterW1.Next.Workspaces
+    let seeded2 = { afterW1.Next with Windows = windows2; Workspaces = workspaces2 }
+    let afterSwitch = step RuntimePolicy.defaults seeded2 (mkEnvelope 200L (UserCommand (SwitchWorkspace hiddenWs)))
+
+    // 実際のOSからのForegroundObservedが先に届き、正しくw2がfocusedになった後に期限が来る。
+    let afterReallyFocused = step RuntimePolicy.defaults afterSwitch.Next (mkEnvelope 210L (mkForegroundObserved 210L w2))
+    match focused afterReallyFocused.Next with
+    | ManagedWindow target -> Assert.Equal(w2, target)
+    | Elsewhere -> Assert.True(false, "expected w2 to already be focused")
+
+    let deadline = 200L + RuntimePolicy.defaults.SwitchSettleMs
+    let afterTimer = step RuntimePolicy.defaults afterReallyFocused.Next (mkEnvelope deadline (TimerElapsed (TimerId.Focus WorkspaceSwitchSettle)))
+    Assert.Equal(None, afterTimer.Next.Focus.SwitchSettle)
+    let effects = afterTimer.Effects |> List.map GatedEffect.effect
+    Assert.DoesNotContain(effects, function RequestForeground _ -> true | _ -> false)
+
+[<Fact>]
 let ``FocusNext/FocusPreviousはアクティブなWorkspaceのzipperを回し、新しいFocusへRequestForegroundする(v2.33)`` () =
     // 3窓にする——2窓だと「次」と「前」が同じ結果になり、方向を取り違えるmutationを区別できない
     // （最初のmutation testingの試行で実際に踏んだ）。
