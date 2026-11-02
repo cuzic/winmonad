@@ -376,6 +376,24 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             { stateAfterMovability with Placement = placementSt' }, [ RequestClose (rid, w) ]
         | _ -> stateAfterMovability, []
 
+    // `UserCommand PromoteToMaster`/`SwapWithMaster`（§4.4「コマンドの意味」、v2.35）：`focused`が
+    // `ManagedWindow w`のときだけ、wが属するWorkspaceのzipperを並べ替える（xmonadの`shiftMaster`/
+    // `swapMaster`、`Zipper.promoteToMaster`/`swapWithMaster`参照）。フォーカス中の窓自体は変わらない
+    // （`z.Focus`は同じ値のまま並びの位置だけが変わる）のでRequestForegroundは発行しない——MasterStack
+    // Layoutでの見た目の並びが変わるだけなので、代わりに`shouldReconcile`（下記）を拡張してこの
+    // stepのReconcileが新しい並びでLayoutを計算し直すようにする。
+    let stateAfterMovability =
+        match envelope.Input, focused stateAfterMovability with
+        | UserCommand PromoteToMaster, ManagedWindow w ->
+            match WorkspaceSet.workspaceOf w stateAfterMovability.Workspaces with
+            | Some ws -> { stateAfterMovability with Workspaces = WorkspaceSet.promoteToMaster ws stateAfterMovability.Workspaces }
+            | None -> stateAfterMovability
+        | UserCommand SwapWithMaster, ManagedWindow w ->
+            match WorkspaceSet.workspaceOf w stateAfterMovability.Workspaces with
+            | Some ws -> { stateAfterMovability with Workspaces = WorkspaceSet.swapWithMaster ws stateAfterMovability.Workspaces }
+            | None -> stateAfterMovability
+        | _ -> stateAfterMovability
+
     // Health：ResponsivenessReprobeタイマーの発火と、PlacementのEffectCallReturned処理が`TargetHung`と
     // 判定した場合のResponsiveness修正（§7.2「EffectCallReturned(Error) → classify → TargetHung →
     // Cancelled ＋ Responsiveness:=Hung」。この信念修正自体はHealthの管轄なのでPlacement.fsではなく
@@ -438,6 +456,10 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         not (List.isEmpty windowsEvents)
         || (match envelope.Input with WindowRemoved _ -> true | _ -> false)
         || topologySettled
+        // PromoteToMaster/SwapWithMaster（v2.35）：Workspaceの所属は変えないが、並び順が変わるので
+        // MasterStack LayoutのTiledWindows順も変わる。windowsEvents（分類の変化）は出ないため、
+        // 明示的にここで引き金にする。
+        || (match envelope.Input with UserCommand PromoteToMaster | UserCommand SwapWithMaster -> true | _ -> false)
 
     let reconcileOneScreen (placementSt: PlacementState, effects, cmds) (screen: Screen) =
         let wsState = WorkspaceSet.stateOf screen.Workspace next.Workspaces

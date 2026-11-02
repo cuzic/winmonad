@@ -429,6 +429,80 @@ let ``CloseFocusedは、窓が存在してもフォーカスが無い(Elsewhere)
     let effects = afterClose.Effects |> List.map GatedEffect.effect
     Assert.DoesNotContain(effects, function RequestClose _ -> true | _ -> false)
 
+let private masterStackPolicy : RuntimePolicy =
+    { RuntimePolicy.defaults with
+        Policy = { RuntimePolicy.defaults.Policy with DefaultLayout = { Id = LayoutId "master-stack"; ApiVersion = 1; Args = NoArgs } } }
+
+/// stack側2窓の縦分割。masterStackPolicyの両テストで使う。
+let private masterStackRects (workArea: PixelRect) : PixelRect * PixelRect * PixelRect =
+    let masterRect = { workArea with Width = workArea.Width / 2 }
+    let stackArea = { workArea with X = masterRect.Width; Width = workArea.Width - masterRect.Width }
+    let stackTop = { stackArea with Height = stackArea.Height / 2 }
+    let stackBottom = { stackArea with Y = stackTop.Height; Height = stackArea.Height - stackTop.Height }
+    masterRect, stackTop, stackBottom
+
+/// `Desired`から現在の目標矩形を読む。`dispatchPlacements`は目標が変わらない窓にはSetRectを
+/// 再発行しないため（§7.3重複要求の禁止）、「このstepのEffects」ではなく「現在のDesired」で
+/// 各窓の実際の位置を確認する——変化が無い窓を`Effects`だけで確認しようとすると、何も起きていない
+/// ように見えてしまう（最初のテスト草稿がこれで落ちた。SwapWithMasterはw2を動かさないので、
+/// w2についてこの取り違えを実際に踏んだ）。
+let private desiredRectOf (state: PlacementState) (w: WindowId) : PixelRect option =
+    match Map.tryFind w state.Desired with
+    | Some (Shown (Some r)) -> Some r
+    | _ -> None
+
+/// 3窓にする——2窓だとPromoteToMaster（シフト、他の要素を押し出す）とSwapWithMaster（2要素だけの
+/// 交換）が同じ結果になり、取り違えるmutationを区別できない（FocusNext/FocusPreviousの方向違いと
+/// 同じ理由で、最初のmutation testingの試行で実際に踏んだ）。
+[<Fact>]
+let ``SwapWithMasterはfocusedとmasterの2要素だけを入れ替え、他の窓の相対順序は変えない(v2.35)`` () =
+    let w1, w2, w3 = WindowId 1L, WindowId 2L, WindowId 3L
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0 ]
+    let seeded = { initial masterStackPolicy with Topology = topology }
+    let afterW1 = step masterStackPolicy seeded (mkEnvelope 1L (visibleWindowObserved w1))
+    let afterW2 = step masterStackPolicy afterW1.Next (mkEnvelope 2L (visibleWindowObserved w2))
+    let afterW3 = step masterStackPolicy afterW2.Next (mkEnvelope 3L (visibleWindowObserved w3))
+    // 並び：master=w1、stack=[w2(top); w3(bottom)]。
+    let masterRect, stackTop, stackBottom = masterStackRects (mkMonitor 0).WorkArea
+    Assert.Equal(Some masterRect, desiredRectOf afterW3.Next.Placement w1)
+    Assert.Equal(Some stackTop, desiredRectOf afterW3.Next.Placement w2)
+    Assert.Equal(Some stackBottom, desiredRectOf afterW3.Next.Placement w3)
+
+    let afterFocusW3 = step masterStackPolicy afterW3.Next (mkEnvelope 4L (mkForegroundObserved 4L w3))
+    let afterSwap = step masterStackPolicy afterFocusW3.Next (mkEnvelope 5L (UserCommand SwapWithMaster))
+    // w3(focused)とw1(master)だけが入れ替わる。w2はstackのtopのまま(相対順序を変えない)。
+    Assert.Equal(Some masterRect, desiredRectOf afterSwap.Next.Placement w3)
+    Assert.Equal(Some stackTop, desiredRectOf afterSwap.Next.Placement w2)
+    Assert.Equal(Some stackBottom, desiredRectOf afterSwap.Next.Placement w1)
+    // フォーカス中の窓自体は変わらないので、RequestForegroundは発行しない。
+    let swapEffects = afterSwap.Effects |> List.map GatedEffect.effect
+    Assert.DoesNotContain(swapEffects, function RequestForeground _ -> true | _ -> false)
+
+[<Fact>]
+let ``PromoteToMasterはfocusedを先頭へ移し、他の窓は1つずつ後ろへずれる(v2.35)`` () =
+    let w1, w2, w3 = WindowId 1L, WindowId 2L, WindowId 3L
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0 ]
+    let seeded = { initial masterStackPolicy with Topology = topology }
+    let afterW1 = step masterStackPolicy seeded (mkEnvelope 1L (visibleWindowObserved w1))
+    let afterW2 = step masterStackPolicy afterW1.Next (mkEnvelope 2L (visibleWindowObserved w2))
+    let afterW3 = step masterStackPolicy afterW2.Next (mkEnvelope 3L (visibleWindowObserved w3))
+    // 並び：master=w1、stack=[w2(top); w3(bottom)]。
+
+    let afterFocusW3 = step masterStackPolicy afterW3.Next (mkEnvelope 4L (mkForegroundObserved 4L w3))
+    let afterPromote = step masterStackPolicy afterFocusW3.Next (mkEnvelope 5L (UserCommand PromoteToMaster))
+    let masterRect, stackTop, stackBottom = masterStackRects (mkMonitor 0).WorkArea
+    // w3(focused)がmasterへ。w1・w2は元の相対順序(w1,w2)を保ったままstackへ1つずれる
+    // （SwapWithMasterの結果（w1だけがstackへ移りw2はtopのまま）とはここで区別できる）。
+    Assert.Equal(Some masterRect, desiredRectOf afterPromote.Next.Placement w3)
+    Assert.Equal(Some stackTop, desiredRectOf afterPromote.Next.Placement w1)
+    Assert.Equal(Some stackBottom, desiredRectOf afterPromote.Next.Placement w2)
+    let promoteEffects = afterPromote.Effects |> List.map GatedEffect.effect
+    Assert.DoesNotContain(promoteEffects, function RequestForeground _ -> true | _ -> false)
+
+    // 続けてPromoteToMaster(今度はfocusedはまだw3=master)を呼んでも、既にmasterなので何も変わらない。
+    let afterPromoteAgain = step masterStackPolicy afterPromote.Next (mkEnvelope 6L (UserCommand PromoteToMaster))
+    Assert.Equal(afterPromote.Next.Workspaces, afterPromoteAgain.Next.Workspaces)
+
 [<Fact>]
 let ``WindowRemovedは同じstepでPlacement.Geometryも除く`` () =
     let state = initial RuntimePolicy.defaults

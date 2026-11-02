@@ -70,6 +70,20 @@ module Zipper =
             | last :: restBackward -> { Before = restBackward @ [ z.Focus ]; Focus = last; After = [] }
             | [] -> z
 
+    /// Focusを並びの先頭（master）へ移す。他の要素の相対順序は変えない（xmonadのshiftMaster、
+    /// §4.4のPromoteToMaster）。既にmaster（Before=[]）なら何もしない。
+    let promoteToMaster (z: Zipper<'T>) : Zipper<'T> =
+        match z.Before with
+        | [] -> z
+        | _ -> { Before = []; Focus = z.Focus; After = (List.rev z.Before) @ z.After }
+
+    /// Focusと先頭（master）を入れ替える。2要素だけが位置を交換し、他の要素の相対順序は変えない
+    /// （xmonadのswapMaster、§4.4のSwapWithMaster）。既にmasterなら何もしない。
+    let swapWithMaster (z: Zipper<'T>) : Zipper<'T> =
+        match List.rev z.Before with
+        | [] -> z
+        | master :: restOfBefore -> { Before = []; Focus = z.Focus; After = restOfBefore @ (master :: z.After) }
+
 type WorkspaceState = {
     Id: WorkspaceId
     /// 管理下の窓（Tiled/Floating）。Layoutに渡すTiledの並びはStackの順からFloatingを除いたもの。
@@ -155,6 +169,20 @@ module WorkspaceSet =
         match st.Stack with
         | None -> s
         | Some z -> setState { st with Stack = Some (Zipper.rotatePrevious z) } s
+
+    /// §4.4のPromoteToMaster。Zipper.promoteToMaster参照。
+    let promoteToMaster (ws: WorkspaceId) (s: WorkspaceSet) : WorkspaceSet =
+        let st = stateOf ws s
+        match st.Stack with
+        | None -> s
+        | Some z -> setState { st with Stack = Some (Zipper.promoteToMaster z) } s
+
+    /// §4.4のSwapWithMaster。Zipper.swapWithMaster参照。
+    let swapWithMaster (ws: WorkspaceId) (s: WorkspaceSet) : WorkspaceSet =
+        let st = stateOf ws s
+        match st.Stack with
+        | None -> s
+        | Some z -> setState { st with Stack = Some (Zipper.swapWithMaster z) } s
 
     /// Stackの所属は変えず、Floating集合への出入りだけを切り替える（§4.4のToggleFloating）。
     let toggleFloating (w: WindowId) (s: WorkspaceSet) : WorkspaceSet =
