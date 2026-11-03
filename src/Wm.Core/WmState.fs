@@ -667,22 +667,45 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             | NoMonitors -> None
             | Displays (current, visible) -> (current :: visible) |> List.tryFind (fun sc -> sc.Workspace = ws) |> Option.map (fun sc -> sc.Monitor.Id)
     let screenPhaseIsStable = match Topology.phase next.Topology with Stable -> true | _ -> false
+    // 1つの窓へ`checkUnattributedDrift`を適用し、打ち止めが実際にFloating劣化を要求した場合（v2.71、
+    // Opusレビュー§Q3・§Q5「ラウンド2」）は`Windows.onOscillationDegraded`へ中継する（`onMovabilityBecameNotMovable`
+    // と同じ「Placementの信号→WmStateが中継→Windowsの専用関数」経路、ADR-018）。`WindowObserved`（この窓自身の
+    // 観測、下記）と`ScreenGrace`満了時の全窓スキャン（v2.72、下記）の両方から呼ぶ共通部分。
+    let applyDriftCheck (w: WindowId) (next: WmState) : WmState * bool * bool =
+        let placement', corrected, shouldDegrade = Placement.checkUnattributedDrift now isTiled desiredMonitorOf screenPhaseIsStable w next.Placement
+        let next = { next with Placement = placement' }
+        let next =
+            if shouldDegrade then
+                let windowsAfterOscillation, oscillationEvents = Windows.onOscillationDegraded w next.Windows
+                { next with Windows = windowsAfterOscillation } |> fun s -> oscillationEvents |> List.fold applyWindowsEvent s
+            else
+                next
+        next, corrected, shouldDegrade
+    // `MoveCause.OsInduced`（v2.72、§4.4 R3-4、Opusレビュー§A・§Q5「ラウンド3」）：ラウンド1/2の検知は
+    // `WindowObserved`（この窓自身の新しい観測）に反応する形なので、OSがモニター構成を一時的に乱して
+    // 元の構成へ戻した場合（v2.69の赤いテストが固定した既知のギャップ）は、動かされた窓についてその後
+    // 新しい`WindowObserved`が届かない限り永遠に検知されない——grace window満了（`ScreenGrace`→Stable）
+    // 自体は`Topology.update`が何のDomainEventも出さない（Topology.fs:398-402）。このギャップを閉じるため、
+    // grace満了のこのstep（`ScreenPhase`が実際に`Grace`から`Stable`へ遷移した、その一致するstepに限る——
+    // 古い発火の空振りで二重に適用しないため）に限り、Placementが`Accepted`を持つ（＝一度は要求が
+    // 受け入れられた）全ての窓へ同じ検知を直接適用する——新しい観測を待たない（レビュー推奨どおり
+    // ラウンド1の部品をそのまま使う。新しいカウンタ・新しい`ClassifiedBy`は作らない）。
+    let screenGraceJustFired =
+        match envelope.Input, Topology.phase state.Topology, Topology.phase next.Topology with
+        | TimerElapsed (TimerId.Topology ScreenGrace), Grace _, Stable -> true
+        | _ -> false
     let next, driftCorrected, driftDegraded =
         match envelope.Input with
-        | WindowObserved snapshot ->
-            let placement', corrected, shouldDegrade = Placement.checkUnattributedDrift now isTiled desiredMonitorOf screenPhaseIsStable snapshot.Id next.Placement
-            let next = { next with Placement = placement' }
-            // `MoveCause.Unattributed`の振動の打ち止めが実際にFloating劣化を要求した場合（v2.71、
-            // Opusレビュー§Q3・§Q5「ラウンド2」）：`Windows.onOscillationDegraded`へ中継する
-            // （`onMovabilityBecameNotMovable`と同じ「Placementの信号→WmStateが中継→Windowsの
-            // 専用関数」経路、ADR-018）。
-            let next =
-                if shouldDegrade then
-                    let windowsAfterOscillation, oscillationEvents = Windows.onOscillationDegraded snapshot.Id next.Windows
-                    { next with Windows = windowsAfterOscillation } |> fun s -> oscillationEvents |> List.fold applyWindowsEvent s
-                else
-                    next
-            next, corrected, shouldDegrade
+        | WindowObserved snapshot -> applyDriftCheck snapshot.Id next
+        | _ when screenGraceJustFired ->
+            next.Placement.Accepted
+            |> Map.toList
+            |> List.map fst
+            |> List.fold
+                (fun (next, anyCorrected, anyDegraded) w ->
+                    let next, corrected, shouldDegrade = applyDriftCheck w next
+                    next, anyCorrected || corrected, anyDegraded || shouldDegrade)
+                (next, false, false)
         | _ -> next, false, false
 
     // Floating劣化（v2.71、上記`driftDegraded`）はWindows.Recordsの分類を変えるので、`reconcileOneScreen`
