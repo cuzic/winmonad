@@ -734,3 +734,22 @@ let ``onWindowVanishedはMinWidthも消す(v2.43)`` () =
     Assert.NotEmpty(Map.tryFind w afterDeadline.MinWidth |> Option.toList)
     let afterVanished, _ = onWindowVanished w afterDeadline
     Assert.Equal(None, Map.tryFind w afterVanished.MinWidth)
+
+// ===== DpiBehaviorの2段目自己リサイズ検出（checkDpiCrossing、v2.45） =====
+
+[<Fact>]
+let ``Coreが新しいSetRectを発行すると、未決着のDpiCrossingは帰属不能として消える(v2.45)`` () =
+    let w = WindowId 1L
+    let m0 = MonitorId 0L
+    let m1 = MonitorId 1L
+    let dpiOf (m: MonitorId) = if m = m0 then Some 96 elif m = m1 then Some 192 else None
+    let afterFirst, _, _ = onWindowObserved 10L (observedSnapshotWithMonitor w workArea m0 1L) initial
+    let oldMonitor = LatestWins.value (Map.find w afterFirst.Geometry).Monitor
+    let afterSecond, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m1 2L) afterFirst
+    let afterCrossCheck = checkDpiCrossing 20L dpiOf w oldMonitor afterSecond
+    Assert.Equal(Some workArea, Map.tryFind w afterCrossCheck.DpiCrossing)
+
+    // Coreが(別の理由で)この窓へ新しいSetRectを発行する——これより後の矩形変化はCore自身の要求で
+    // 説明できてしまうので、まだ決着していないDpiCrossingの記録は帰属不能として諦める。
+    let afterReconcile, _, _ = reconcileWorkspace 30L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterCrossCheck
+    Assert.Equal(None, Map.tryFind w afterReconcile.DpiCrossing)

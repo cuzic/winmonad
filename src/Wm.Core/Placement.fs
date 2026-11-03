@@ -125,18 +125,18 @@
 /// - ~~**`MinWidth`（Accumulating規則）**~~：v2.43で実装（`reviseMinWidth`、型直前のコメント参照）。
 ///   `Mismatch`（`observed.Width > TargetRect.Width`）を証拠に、観測時の窓のモニターDPIでDIPへ
 ///   正規化した値を`Inferred`の最小幅とする。`DpiBehavior = RescalesItself`の2段目リサイズ待ちを
-///   除外する規則（§4.5）は、**`DpiBehavior`信念自体がまだ実装されていない**ため対象外のまま
-///   （今は証拠としてそのまま採用する、既知のギャップ）。信念自体は`MinWidth`を読む`Policy`述語
-///   （`MinWidthAtLeast`、§5.4）やLayoutの`LayoutWindow.MinWidthDip`へまだ結線していない——
-///   値を蓄積するところまでがこのラウンドの範囲で、実際に配置・分類へ反映する消費側は専用のラウンドへ
-///   持ち越す（信念が無いと配置を変えようにも読む側が無いため、まずここから）。
-/// - ~~**`DpiBehavior`（Accumulating規則）**~~：v2.44で発見時の申告による初期値だけ実装
-///   （`reviseDpiBehaviorDeclaration`、型直前のコメント参照）。異なるDPIのモニター間を移動した後の
-///   2段目の自己リサイズの有無による修正（申告と実際の挙動の食い違いの検出）は、モニター間移動自体の
-///   検出（窓のMonitor信念が別のDPIのモニターへ変わったことを捉える仕組み）がこのラウンドでは未実装の
-///   ため対象外のまま——既知のギャップ、専用のラウンドへ持ち越す。これが無いと、`MinWidth`の
-///   `DpiBehavior = RescalesItself`の2段目待ち除外（§4.5）も実装できない（`MinWidth`の型直前の
-///   コメント参照）。
+///   除外する規則（§4.5）は、v2.45で`DpiBehavior`信念自体の2段目検出（下記）が実装された後も、
+///   `checkPendingSatisfied`/`isMismatch`側にこの信念を読んで除外する分岐をまだ追加していないため
+///   対象外のまま（今は証拠としてそのまま採用する、既知のギャップ）。信念自体は`MinWidth`を読む
+///   `Policy`述語（`MinWidthAtLeast`、§5.4）やLayoutの`LayoutWindow.MinWidthDip`へまだ結線していない
+///   ——値を蓄積するところまでがこのラウンドの範囲で、実際に配置・分類へ反映する消費側は専用の
+///   ラウンドへ持ち越す（信念が無いと配置を変えようにも読む側が無いため、まずここから）。
+/// - ~~**`DpiBehavior`（Accumulating規則）**~~：v2.44で発見時の申告による初期値、v2.45で2段目の
+///   自己リサイズ検出（`checkDpiCrossing`、型直前のコメント参照）を実装した。CIスパイクS22
+///   （docs/spikes.md）で`SetWindowPos`から`LOCATIONCHANGE`までの遅延が0〜1msと確認済みなので、
+///   架空のタイムアウトは設けず次の観測だけで判定する最小実装にした。残るのは`MinWidth`側の
+///   2段目待ち除外の消費（上記）と、`Movable`への確定（v2.24と同様の仕組み。今は`Inferred`のまま）
+///   ——専用のラウンドへ持ち越す。
 /// - **`TargetIntegrity`のProbeOnce規則が述べる「同じProcessKeyの間は再probeしない」の明示的な検査**：
 ///   このラウンドの実装では、確定（`Believed`）した窓を再probeする経路自体が無い（`WindowObserved`が
 ///   `TargetIntegrity = None`で届いても、既に`TargetIntegrity`マップにエントリがあれば何もしない）ため、
@@ -255,7 +255,9 @@ type PlacementState =
       /// §4.5「`Map`に無いことを『まだ証拠が無い』の意味に使う」）。`reviseMinWidth`参照。
       MinWidth: Map<WindowId, Belief<int>>
       /// §4.5「DPIの振る舞い」（Accumulating、S11）。`reviseDpiBehaviorDeclaration`の型直前のコメント参照。
-      DpiBehavior: Map<WindowId, Belief<DpiBehavior>> }
+      DpiBehavior: Map<WindowId, Belief<DpiBehavior>>
+      /// `DpiBehavior`の2段目自己リサイズ検出（v2.45）。`checkDpiCrossing`の型直前のコメント参照。
+      DpiCrossing: Map<WindowId, PixelRect> }
 
 let initial: PlacementState =
     { Geometry = Map.empty
@@ -270,7 +272,8 @@ let initial: PlacementState =
       RetryAttempts = Map.empty
       InFlightTargets = Map.empty
       MinWidth = Map.empty
-      DpiBehavior = Map.empty }
+      DpiBehavior = Map.empty
+      DpiCrossing = Map.empty }
 
 /// `WmState.step`が、Placement自身のReconcile以外の理由（Focus.SwitchSettleの再要求、
 /// `MoveFocusedToWorkspace`のRequestForeground等、v2.27）で新しいRequestIdが要るときに呼ぶ最小の窓口。
@@ -434,6 +437,44 @@ let onWindowObserved (now: int64) (snapshot: WindowSnapshot) (state: PlacementSt
     let pendingPresenceState, pendingPresenceTimerCmds = checkPendingPresenceSatisfied w pendingState
     pendingPresenceState, effects, timerCmds @ pendingTimerCmds @ pendingPresenceTimerCmds
 
+/// §4.5「DPIの振る舞い」の2段目自己リサイズによる修正（v2.45）：`onWindowObserved`が終わった直後に
+/// `WmState.step`が呼ぶ（`dpiOf`は他ドメインの状態を直接読まないための読み取り専用の投影、
+/// `MinWidth`の型直前のコメントと同じ考え方、ADR-018）。架空のタイマーは設けない最小実装——
+/// `oldMonitor`（この観測の前のMonitor信念）と、観測後の新しいMonitor信念が、異なるDPIの別モニターを
+/// 指していれば「DPIをまたいだ」と判定し、その時点の`VisibleFrameRect`を`DpiCrossing`へ記録する
+/// （同じ窓で前回の記録が残っていれば上書きする——新しい意図のEpochを進める`dispatchPlacements`と
+/// 同じ「最新の意図を信じる」考え方）。`DpiCrossing`に記録が残っている窓で、矩形が記録時点と異なる
+/// 観測が届けば、2段目の自己リサイズが実際に起きた証拠として`RescalesItself`を`Inferred`で記録し、
+/// 記録を消す。矩形が記録時点のまま（まだ変化無し）なら記録を残して待つ——タイムアウトは設けない。
+/// いつまでも変化が来なければ、v2.44の申告ベースの既定値をそのまま信じ続けるだけで安全側に倒れる
+/// （申告が間違っていても、`MinWidth`の2段目除外（まだ未実装）以外への実害は無い）。
+/// `dispatchPlacements`が同じ窓へ新しい`SetRect`を発行すると`DpiCrossing`を消す（型直前のコメント
+/// 参照）——これにより、ここで「矩形が変わった」と見る観測は、Core自身の要求ではまだ説明できない
+/// 変化だけに限られる（同じstepで要求が`Satisfied`になった場合でも、`Pending`の有無を見るのではなく
+/// 発行時点で先に記録を消しているので、取り違えない）。
+let checkDpiCrossing (now: int64) (dpiOf: MonitorId -> int option) (w: WindowId) (oldMonitor: MonitorId option) (state: PlacementState) : PlacementState =
+    let newMonitor = Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.Monitor)
+    let crossedDifferentDpi =
+        match oldMonitor, newMonitor with
+        | Some oldM, Some newM when oldM <> newM ->
+            match dpiOf oldM, dpiOf newM with
+            | Some dOld, Some dNew -> dOld <> dNew
+            | _ -> false
+        | _ -> false
+    let currentRect = Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.VisibleFrameRect)
+    let state =
+        match crossedDifferentDpi, currentRect with
+        | true, Some rect -> { state with DpiCrossing = Map.add w rect state.DpiCrossing }
+        | _ -> state
+    match Map.tryFind w state.DpiCrossing, currentRect with
+    | Some baseline, Some observed when observed <> baseline ->
+        let valueSeq = Map.tryFind w state.Geometry |> Option.bind (fun g -> g.VisibleFrameRect.ValueSeq)
+        let evidence = valueSeq |> Option.map Sample |> Option.toList
+        { state with
+            DpiCrossing = Map.remove w state.DpiCrossing
+            DpiBehavior = Map.add w { Value = RescalesItself; Confidence = Inferred evidence; LastRevisedAt = now } state.DpiBehavior }
+    | _ -> state // まだ変化無し、またはこの窓は対象外
+
 let onMinimizedStateChanged (now: int64) (w: WindowId) (obs: Observation<bool>) (state: PlacementState) : PlacementState =
     { state with Geometry = Map.add w (reviseMinimized now (Map.tryFind w state.Geometry |> Option.defaultValue geometryInitial) obs) state.Geometry }
 
@@ -497,7 +538,11 @@ let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: P
                         // 新しい意図（Reconcileが計算した新しいTarget）なので、古いTargetへのRetryの
                         // 試行回数は引き継がない（`RetryAttempts`はPendingDeadlineの再試行専用、型直前の
                         // コメント参照）。
-                        RetryAttempts = Map.remove p.Window st.RetryAttempts }
+                        RetryAttempts = Map.remove p.Window st.RetryAttempts
+                        // `DpiCrossing`（v2.45）：ここから先、この窓の矩形変化はCore自身の`SetRect`で
+                        // 説明できてしまうので、まだ決着していない2段目自己リサイズの観測機会があれば
+                        // 帰属不能として諦める（`checkDpiCrossing`の型直前のコメント参照）。
+                        DpiCrossing = Map.remove p.Window st.DpiCrossing }
                 st', effects @ [ SetRect (rid, p.Window, p.Target) ], cmds @ supersededCmds @ [ StartTimer (TimerId.Placement (PendingDeadline rid), pendingDeadlineMs) ])
         (state, [], [])
 
@@ -601,8 +646,9 @@ let private tryMismatchObservation (pr: PendingRequest) (state: PlacementState) 
 /// （`MinWidth`の型直前のコメント参照）。より小さい幅が観測されたら値を下げる——最新の証拠をそのまま
 /// 採用する単純な規則とし、具体的な閾値（何回観測されたら配置に反映するか）は実機Journalでの
 /// チューニングを待つ専用のラウンドへ持ち越す（§21）。`DpiBehavior = RescalesItself`の窓がモニター間を
-/// 移った直後の2段目リサイズ待ちを除外する規則（§4.5）は、`DpiBehavior`信念自体が未実装のため対象外
-/// のまま（ファイル冒頭「対象外」参照）——今は証拠としてそのまま採用する、既知のギャップ。
+/// 移った直後の2段目リサイズ待ちを除外する規則（§4.5）は、`DpiBehavior`信念自体はv2.45で実装された
+/// ものの、この関数側にそれを読んで除外する分岐をまだ追加していないため対象外のまま
+/// （ファイル冒頭「対象外」参照）——今は証拠としてそのまま採用する、既知のギャップ。
 let private toDip (dpi: int) (physicalPx: int) : int = physicalPx * 96 / dpi
 
 let private reviseMinWidth (now: int64) (evidence: EvidenceRef) (observedWidthDip: int) (current: Belief<int> option) : Belief<int> =
@@ -838,5 +884,6 @@ let onWindowVanished (w: WindowId) (state: PlacementState) : PlacementState * Ti
         RetryAttempts = Map.remove w state.RetryAttempts
         InFlightTargets = Map.remove w state.InFlightTargets
         MinWidth = Map.remove w state.MinWidth
-        DpiBehavior = Map.remove w state.DpiBehavior },
+        DpiBehavior = Map.remove w state.DpiBehavior
+        DpiCrossing = Map.remove w state.DpiCrossing },
     integrityCancel @ pendingCancel @ pendingPresenceCancel

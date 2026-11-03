@@ -249,3 +249,67 @@ let ``onWindowVanishedはDpiBehaviorも消す(v2.44)`` () =
     Assert.True(Map.containsKey (WindowId 1L) afterObserved.DpiBehavior)
     let afterVanished, _ = onWindowVanished (WindowId 1L) afterObserved
     Assert.False(Map.containsKey (WindowId 1L) afterVanished.DpiBehavior)
+
+// ===== DpiBehaviorの2段目自己リサイズ検出（checkDpiCrossing、v2.45） =====
+
+let private dpi96Then192 (m: MonitorId) : int option =
+    if m = MonitorId 0L then Some 96 elif m = MonitorId 1L then Some 192 else None
+
+[<Fact>]
+let ``異なるDPIのモニターへ移った直後、矩形がまだ変わらなければDpiCrossingへ記録して待つ(v2.45)`` () =
+    let w = WindowId 1L
+    let afterFirst, _, _ = onWindowObserved 10L (snapshotWith (Some (obs 1L rect)) (Some (obs 1L (MonitorId 0L))) None None None) initial
+    let oldMonitor = LatestWins.value (Map.find w afterFirst.Geometry).Monitor
+    let afterSecond, _, _ = onWindowObserved 20L (snapshotWith (Some (obs 2L rect)) (Some (obs 2L (MonitorId 1L))) None None None) afterFirst
+    let afterCheck = checkDpiCrossing 20L dpi96Then192 w oldMonitor afterSecond
+    Assert.Equal(Some rect, Map.tryFind w afterCheck.DpiCrossing)
+    // まだ実際の2段目リサイズを見ていないので、DpiBehaviorは(申告が無ければ)未確定のまま。
+    Assert.Equal(None, Map.tryFind w afterCheck.DpiBehavior)
+
+[<Fact>]
+let ``2段目の自己リサイズが実際に観測されたら、RescalesItselfをInferredで記録しDpiCrossingを消す(v2.45)`` () =
+    let w = WindowId 1L
+    let resizedRect = { rect with Width = rect.Width + 50 }
+    let afterFirst, _, _ = onWindowObserved 10L (snapshotWith (Some (obs 1L rect)) (Some (obs 1L (MonitorId 0L))) None None None) initial
+    let oldMonitor1 = LatestWins.value (Map.find w afterFirst.Geometry).Monitor
+    let afterSecond, _, _ = onWindowObserved 20L (snapshotWith (Some (obs 2L rect)) (Some (obs 2L (MonitorId 1L))) None None None) afterFirst
+    let afterCrossCheck = checkDpiCrossing 20L dpi96Then192 w oldMonitor1 afterSecond
+    // 2段目：自発的に別の矩形へ自己リサイズする(Monitorの再観測は無い、矩形だけ変わる)。
+    let afterThird, _, _ = onWindowObserved 30L (snapshotWith (Some (obs 3L resizedRect)) None None None None) afterCrossCheck
+    let oldMonitor2 = LatestWins.value (Map.find w afterThird.Geometry).Monitor // 3回目はMonitorを観測していないので不変
+    let afterFinalCheck = checkDpiCrossing 30L dpi96Then192 w oldMonitor2 afterThird
+    Assert.Equal(None, Map.tryFind w afterFinalCheck.DpiCrossing)
+    match Map.tryFind w afterFinalCheck.DpiBehavior with
+    | Some { Value = RescalesItself; Confidence = Inferred _ } -> ()
+    | other -> Assert.True(false, sprintf "expected an Inferred RescalesItself belief, got %A" other)
+
+[<Fact>]
+let ``同じDPIの別モニターへ移ってもDpiCrossingを記録しない(v2.45)`` () =
+    let w = WindowId 1L
+    let sameDpi (_: MonitorId) : int option = Some 96
+    let afterFirst, _, _ = onWindowObserved 10L (snapshotWith (Some (obs 1L rect)) (Some (obs 1L (MonitorId 0L))) None None None) initial
+    let oldMonitor = LatestWins.value (Map.find w afterFirst.Geometry).Monitor
+    let afterSecond, _, _ = onWindowObserved 20L (snapshotWith (Some (obs 2L rect)) (Some (obs 2L (MonitorId 1L))) None None None) afterFirst
+    let afterCheck = checkDpiCrossing 20L sameDpi w oldMonitor afterSecond
+    Assert.Equal(None, Map.tryFind w afterCheck.DpiCrossing)
+
+[<Fact>]
+let ``モニターのDPIが分からない場合はDpiCrossingを記録しない(v2.45)`` () =
+    let w = WindowId 1L
+    let unknownDpi (_: MonitorId) : int option = None
+    let afterFirst, _, _ = onWindowObserved 10L (snapshotWith (Some (obs 1L rect)) (Some (obs 1L (MonitorId 0L))) None None None) initial
+    let oldMonitor = LatestWins.value (Map.find w afterFirst.Geometry).Monitor
+    let afterSecond, _, _ = onWindowObserved 20L (snapshotWith (Some (obs 2L rect)) (Some (obs 2L (MonitorId 1L))) None None None) afterFirst
+    let afterCheck = checkDpiCrossing 20L unknownDpi w oldMonitor afterSecond
+    Assert.Equal(None, Map.tryFind w afterCheck.DpiCrossing)
+
+[<Fact>]
+let ``onWindowVanishedはDpiCrossingも消す(v2.45)`` () =
+    let w = WindowId 1L
+    let afterFirst, _, _ = onWindowObserved 10L (snapshotWith (Some (obs 1L rect)) (Some (obs 1L (MonitorId 0L))) None None None) initial
+    let oldMonitor = LatestWins.value (Map.find w afterFirst.Geometry).Monitor
+    let afterSecond, _, _ = onWindowObserved 20L (snapshotWith (Some (obs 2L rect)) (Some (obs 2L (MonitorId 1L))) None None None) afterFirst
+    let afterCheck = checkDpiCrossing 20L dpi96Then192 w oldMonitor afterSecond
+    Assert.True(Map.containsKey w afterCheck.DpiCrossing)
+    let afterVanished, _ = onWindowVanished w afterCheck
+    Assert.False(Map.containsKey w afterVanished.DpiCrossing)

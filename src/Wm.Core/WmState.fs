@@ -238,7 +238,12 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     let placementState', placementEffects, placementTimerCmds, effectCallFailure =
         match envelope.Input with
         | WindowObserved snapshot ->
+            // `checkDpiCrossing`（v2.45）：`onWindowObserved`が今回の観測でMonitor信念を上書きする前の
+            // 値を覚えておき、上書き後の新しい値と比較して「異なるDPIのモニターへ移った」かを判定する
+            // （Placement.fsの型直前のコメント参照）。
+            let oldMonitor = Map.tryFind snapshot.Id stateAfterWindows.Placement.Geometry |> Option.bind (fun g -> LatestWins.value g.Monitor)
             let s, e, t = Placement.onWindowObserved now snapshot stateAfterWindows.Placement
+            let s = Placement.checkDpiCrossing now dpiOf snapshot.Id oldMonitor s
             s, e, t, None
         | MinimizedStateChanged (w, obs) -> Placement.onMinimizedStateChanged now w obs stateAfterWindows.Placement, [], [], None
         | TimerElapsed (TimerId.Placement (IntegrityReprobe w)) ->
