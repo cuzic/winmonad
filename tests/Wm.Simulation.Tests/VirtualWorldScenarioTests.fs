@@ -46,6 +46,7 @@ let private visibleWindowObserved (w: WindowId) : InputEvent =
           VisibleFrameRect = None
           IsVisible = Some { Value = Ok true; SampleSequence = 0L; MonotonicTime = 0L; Source = "virtual-world" }
           IsMinimized = None
+          IsMaximized = None
           Cloak = None
           Monitor = None
           MinWidthHint = None
@@ -54,6 +55,11 @@ let private visibleWindowObserved (w: WindowId) : InputEvent =
           Presence = None
           DpiAwareness = None
           TitleMatches = None }
+
+let private visibleWindowObservedMaximized (w: WindowId) : InputEvent =
+    match visibleWindowObserved w with
+    | WindowObserved s -> WindowObserved { s with IsMaximized = Some { Value = Ok true; SampleSequence = 0L; MonotonicTime = 0L; Source = "virtual-world" } }
+    | other -> other
 
 let private settleTopology (reducer: Reducer) (monitors: MonitorSnapshot list) : unit =
     reducer.Submit 0L "virtual-world" (MonitorTopologyObserved monitors) |> ignore
@@ -94,6 +100,50 @@ let ``VirtualWorldに存在しない窓へのSetRectはERROR_INVALID_WINDOW_HAND
     // classify → TargetGone → Cancelled」）。
     Assert.Empty(reducer.State.Placement.Pending)
     Assert.Equal(None, Map.tryFind w reducer.State.Placement.Desired)
+
+[<Fact>]
+let ``最大化状態で発見された窓は、RestoreBeforeMoveがSetRectの直前に発行され、適用するとVirtualWorld側のIsMaximizedが解消される(v2.74)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    settleTopology reducer [ mkMonitor 0 ]
+    let w = WindowId 1L
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } Immediate
+    let world = { world with Windows = Map.add w { (Map.find w world.Windows) with IsMaximized = true } world.Windows }
+    let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObservedMaximized w)
+    let restoreEffects = discovery.Effects |> List.filter (fun g -> match GatedEffect.effect g with RestoreBeforeMove (_, w') -> w' = w | _ -> false)
+    let setRectEffects = discovery.Effects |> List.filter (fun g -> match GatedEffect.effect g with SetRect (_, w', _) -> w' = w | _ -> false)
+    match restoreEffects, setRectEffects with
+    | [ restoreGated ], [ _ ] ->
+        // discovery.Effectsの中でRestoreBeforeMoveがSetRectより先に現れること（ゲートのrestoreSeen判定の
+        // 前提、GatedEffect.fsの型直前のコメント参照）。
+        let indexOf (pred: Effect -> bool) = discovery.Effects |> List.findIndex (fun g -> pred (GatedEffect.effect g))
+        let restoreIndex = indexOf (function RestoreBeforeMove (_, w') -> w' = w | _ -> false)
+        let setRectIndex = indexOf (function SetRect (_, w', _) -> w' = w | _ -> false)
+        Assert.True(restoreIndex < setRectIndex)
+        let world', events, callReturns = applyEffect 1000L world restoreGated
+        Assert.Empty(events) // RestoreBeforeMoveは観測を生まない(fire-and-forget)
+        match callReturns with
+        | [ (_, Ok (), None) ] -> ()
+        | other -> Assert.True(false, sprintf "unexpected callReturns: %A" other)
+        Assert.False((Map.find w world'.Windows).IsMaximized)
+    | other -> Assert.True(false, sprintf "expected exactly 1 RestoreBeforeMove and 1 SetRect for the maximized window, got %A" other)
+
+[<Fact>]
+let ``VirtualWorldに存在しない窓へのRestoreBeforeMoveはERROR_INVALID_WINDOW_HANDLEになる(v2.74)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    settleTopology reducer [ mkMonitor 0 ]
+    let w = WindowId 1L
+    let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObservedMaximized w)
+    let restoreEffects = discovery.Effects |> List.filter (fun g -> match GatedEffect.effect g with RestoreBeforeMove (_, w') -> w' = w | _ -> false)
+    match restoreEffects with
+    | [ gated ] ->
+        let _, events, callReturns = applyEffect 1000L empty gated
+        Assert.Empty(events)
+        match callReturns with
+        | [ (_, Error record, dispatchSeq) ] ->
+            Assert.Equal(1400, record.Code)
+            Assert.Equal(None, dispatchSeq)
+        | other -> Assert.True(false, sprintf "unexpected callReturns: %A" other)
+    | other -> Assert.True(false, sprintf "expected exactly 1 RestoreBeforeMove effect, got %A" other)
 
 [<Fact>]
 let ``SwitchWorkspaceでhidden化された窓はSetPresence(shown=false)がVirtualWorldへ届き、PendingPresenceがSatisfiedになる(v2.50)`` () =
@@ -158,7 +208,7 @@ let ``ForgetWindowはVirtualWorldから窓を取り除くだけで、観測もEf
                   AppIdentity = emptyAppIdentity
                   Owner = None; IsDialog = None; NativeRect = None; VisibleFrameRect = None
                   IsVisible = Some { Value = Ok true; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" }
-                  IsMinimized = None; Cloak = None; Monitor = None; MinWidthHint = None
+                  IsMinimized = None; IsMaximized = None; Cloak = None; Monitor = None; MinWidthHint = None
                   TargetIntegrity = None; Responsiveness = None; Presence = None; DpiAwareness = None; TitleMatches = None }
         reducer.Submit 1L "virtual-world" (withProcess 1L 100) |> ignore
         let result = reducer.Submit 2L "virtual-world" (withProcess 2L 200)

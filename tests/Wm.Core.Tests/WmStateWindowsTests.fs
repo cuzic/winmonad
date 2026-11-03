@@ -48,6 +48,7 @@ let private visibleWindowObserved (w: WindowId) : InputEvent =
           VisibleFrameRect = None
           IsVisible = Some { Value = Ok true; SampleSequence = 1L; MonotonicTime = 1L; Source = "test" }
           IsMinimized = None
+          IsMaximized = None
           Cloak = None
           Monitor = None
           MinWidthHint = None

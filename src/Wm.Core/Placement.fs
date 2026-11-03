@@ -178,6 +178,7 @@ let private geometryInitial: GeometryBeliefs =
       VisibleFrameRect = LatestWins.unformed
       Monitor = LatestWins.unformed
       IsMinimized = LatestWins.unformed
+      IsMaximized = LatestWins.unformed
       Presence = LatestWins.unformed }
 
 /// `WindowSnapshot`から`GeometryBeliefs`をLatestWins規則で修正する（§4.5。`Beliefs.LatestWins.revise`を
@@ -190,6 +191,8 @@ let reviseGeometryFromSnapshot (now: int64) (current: GeometryBeliefs) (snapshot
         Monitor = snapshot.Monitor |> Option.map (LatestWins.revise now current.Monitor) |> Option.defaultValue current.Monitor
         IsMinimized =
             snapshot.IsMinimized |> Option.map (LatestWins.revise now current.IsMinimized) |> Option.defaultValue current.IsMinimized
+        IsMaximized =
+            snapshot.IsMaximized |> Option.map (LatestWins.revise now current.IsMaximized) |> Option.defaultValue current.IsMaximized
         Presence = snapshot.Presence |> Option.map (LatestWins.revise now current.Presence) |> Option.defaultValue current.Presence }
 
 /// `MinimizedStateChanged`（ADR-019実装順10のWm.Normalizationが既に定義していたが、`WmState.step`に
@@ -647,7 +650,22 @@ let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: P
                     match Map.tryFind p.Window st.Epochs with
                     | Some (IntentEpoch e) -> IntentEpoch (e + 1L)
                     | None -> IntentEpoch 0L
-                let rid = RequestId st.NextRequestId
+                // `RestoreBeforeMove`（v2.74、§6.2/§7.1、`GatedEffect.fs`の`NeedsRestore`型直前の
+                // コメント参照）：最大化中（CIスパイクS6bで確認済み——`SetWindowPos`自体はSW_RESTORE
+                // なしでも矩形を正しく動かすが、`IsZoomed`（WS_MAXIMIZE）フラグは外れたまま残る）の
+                // Tiled窓へ新しい意図を出す直前に、同じ`Effects`リスト内で先に`RestoreBeforeMove`を
+                // 発行する——`GatedEffect.gate`の`restoreSeen`判定（同一バッチ内で先行していなければ
+                // `SetRect`を`MissingRestoreBeforeMove`で拒否する）を満たすため。固有のRequestIdを
+                // 別途採番するが、`ShowWindowAsync(SW_RESTORE)`はfire-and-forget（`RequestForeground`
+                // と同じ`callBoolNoCode`、7.1）なのでPendingには乗せない——`EffectCallReturned`が
+                // 届いても対応する記録が無く無害に無視される（v2.69の`PendingPresence`と同じ整理）。
+                let isMaximized = Map.tryFind p.Window st.Geometry |> Option.bind (fun g -> LatestWins.value g.IsMaximized) |> Option.defaultValue false
+                let restoreRid, nextRequestIdAfterRestore =
+                    if isMaximized then
+                        Some (RequestId st.NextRequestId), st.NextRequestId + 1L
+                    else
+                        None, st.NextRequestId
+                let rid = RequestId nextRequestIdAfterRestore
                 let deadline = now + pendingDeadlineMs
                 // `Baseline`（v2.42）：発行時点の`VisibleFrameRect`信念。Mismatch判定の「何も変わって
                 // いない」除外に使う（型直前のコメント参照）。`DispatchSeq`は`EffectCallReturned`が
@@ -659,7 +677,7 @@ let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: P
                     { st with
                         Desired = Map.add p.Window (Shown (Some p.Target)) st.Desired
                         Pending = Map.add rid pendingRequest pendingWithoutOld
-                        NextRequestId = st.NextRequestId + 1L
+                        NextRequestId = nextRequestIdAfterRestore + 1L
                         Epochs = Map.add p.Window epoch' st.Epochs
                         InFlightTargets = inFlightTargets'
                         // 新しい意図（Reconcileが計算した新しいTarget）なので、古いTargetへのRetryの
@@ -674,7 +692,11 @@ let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: P
                         // 受け入れていないので消す——古い意図の`Accepted`を新しい意図と比べてドリフト
                         // 検知が誤発火することを防ぐ。
                         Accepted = Map.remove p.Window st.Accepted }
-                st', effects @ [ SetRect (rid, p.Window, p.Target) ], cmds @ supersededCmds @ [ StartTimer (TimerId.Placement (PendingDeadline rid), pendingDeadlineMs) ])
+                let restoreEffects =
+                    match restoreRid with
+                    | Some rrid -> [ RestoreBeforeMove (rrid, p.Window) ]
+                    | None -> []
+                st', effects @ restoreEffects @ [ SetRect (rid, p.Window, p.Target) ], cmds @ supersededCmds @ [ StartTimer (TimerId.Placement (PendingDeadline rid), pendingDeadlineMs) ])
         (state, [], [])
 
 /// 登録済みのLayoutを呼び、PlanValidatorで検証し、差分だけを`SetRect`として発行する。`ctx`/`management`/

@@ -33,6 +33,7 @@ let private visibleSnapshot (w: WindowId) : WindowSnapshot =
       VisibleFrameRect = None
       IsVisible = Some (obs 1L true)
       IsMinimized = None
+      IsMaximized = None
       Cloak = None
       Monitor = None
       MinWidthHint = None

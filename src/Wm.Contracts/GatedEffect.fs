@@ -18,8 +18,9 @@ type GateInput = {
     NotMovable: Set<WindowId>
     Hung: Set<WindowId>
     HiddenByWm: Set<WindowId>
-    /// 最大化/Snap状態でRestoreBeforeMoveが必要な窓（Placementの信念から得る想定。生産元のドメインが
-    /// まだ無いため、今は常に空集合——既知のギャップ。§6.2のMissingRestoreBeforeMove判定に使う）。
+    /// 最大化状態でRestoreBeforeMoveが必要な窓（v2.74でPlacementの`Geometry.IsMaximized`信念から
+    /// 実際に組み立てられるようになった。§6.2のMissingRestoreBeforeMove判定に使う。Aero Snap状態は
+    /// 検知手段が未調査のため依然対象外のまま）。
     NeedsRestore: Set<WindowId>
 }
 

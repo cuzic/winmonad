@@ -34,6 +34,12 @@
 /// 拒否する側（S17で実機確認済みの挙動）を模す`WindowBehavior`はまだ無いため、この既定だけを置く。
 /// `ApplyBatch`/`ObserveWindow`は依然`[]`のまま（前者は子Effectの集約規則が要る、後者はCoreがまだ
 /// 一度も発行していないため消費者が無い）。
+///
+/// **v2.74で`RestoreBeforeMove`を実装**：`Placement.dispatchPlacements`が最大化中のTiled窓への新しい
+/// `SetRect`の直前に発行するようになった（§6.2/§7.1の`NeedsRestore`、CIスパイクS6bで実機確認した
+/// `ShowWindowAsync(SW_RESTORE)`の効果）。`VirtualWindow`に`IsMaximized: bool`（既定`false`）を追加し、
+/// `RestoreBeforeMove`はこれを`false`へ戻す（対象が疑似OS側に無ければ`SetRect`と同じ
+/// `ERROR_INVALID_WINDOW_HANDLE`）。`ObserveAll`の完全観測にも`IsMaximized`を含めた。
 /// - `advanceClock`は`Scheduled`の発火だけを行い、`Reducer`のTimerキュー（`PendingDeadline`等）には
 ///   関与しない——両者を同じ呼び出しで進める結合は`ScenarioRunner.fs`冒頭コメントが明示的にシナリオ側の
 ///   責務としているため、ここでは2つの独立した時計（疑似OSの`Scheduled`とCoreのTimerキュー）を別々に
@@ -60,7 +66,17 @@ open Wm.Simulation.WindowBehaviors
 /// プロセスの整合性レベルの関係（§4.5 TargetIntegrityのProbeOnce規則、v2.51追加）。発見時は常に
 /// `NotHigher`（通常の非昇格テスト窓を模す既定——昇格窓を模すシナリオは`addWindow`呼び出し後に
 /// `{ world with Windows = Map.add w { vw with Integrity = Higher } world.Windows }`で上書きする）。
-type VirtualWindow = { Id: WindowId; Rect: PixelRect; Behavior: WindowBehavior; Shown: bool; Integrity: IntegrityRelation }
+/// `IsMaximized`（v2.74、§6.2/§7.1の`NeedsRestore`/`RestoreBeforeMove`）は発見時は常に`false`
+/// （既定は非最大化窓——最大化窓を模すシナリオは`addWindow`呼び出し後に同じ要領で上書きする）。
+/// `RestoreBeforeMove`を適用すると`false`へ戻る（CIスパイクS6bで確認した`ShowWindowAsync(SW_RESTORE)`
+/// の実際の効果）。
+type VirtualWindow =
+    { Id: WindowId
+      Rect: PixelRect
+      Behavior: WindowBehavior
+      Shown: bool
+      Integrity: IntegrityRelation
+      IsMaximized: bool }
 
 /// §12.1「`ScheduledSimEvent`」の最小形：`DelayedByMs`な`SetRect`が、`FireAtMs`に達するまで積まれる
 /// 未発火の観測。`Seed`はまだ`WindowBehaviors`のどの挙動も使わないため持たない。
@@ -75,7 +91,8 @@ type VirtualWorld =
 let empty: VirtualWorld = { Windows = Map.empty; ClockMs = 0L; NextSampleSequence = 0L; Scheduled = [] }
 
 let addWindow (w: WindowId) (rect: PixelRect) (behavior: WindowBehavior) (world: VirtualWorld) : VirtualWorld =
-    { world with Windows = Map.add w { Id = w; Rect = rect; Behavior = behavior; Shown = true; Integrity = NotHigher } world.Windows }
+    { world with
+        Windows = Map.add w { Id = w; Rect = rect; Behavior = behavior; Shown = true; Integrity = NotHigher; IsMaximized = false } world.Windows }
 
 let private emptySnapshot (w: WindowId) : WindowSnapshot =
     { Id = w
@@ -87,6 +104,7 @@ let private emptySnapshot (w: WindowId) : WindowSnapshot =
       VisibleFrameRect = None
       IsVisible = None
       IsMinimized = None
+      IsMaximized = None
       Cloak = None
       Monitor = None
       MinWidthHint = None
@@ -231,6 +249,13 @@ let applyEffect
         // 疑似OS側にはHWND対応表という概念そのものが無いので、単にその窓を取り除くだけでよい
         // （Coreは`ForgetWindow`を発行した後、このWindowIdへは二度と観測を期待しない、R4-14）。
         { world with Windows = Map.remove w world.Windows }, [], []
+    | RestoreBeforeMove (rid, w) ->
+        // v2.74、§6.2/§7.1。`ShowWindowAsync(SW_RESTORE)`相当（CIスパイクS6bで確認済み：最大化窓を
+        // 実際に非最大化状態へ戻す効果を持つ）。`SetRect`と同じ`callBoolNoCode`なので結果コードは
+        // 無く、対象が疑似OS側に無ければ`SetRect`と同じ`ERROR_INVALID_WINDOW_HANDLE`(1400)を返す。
+        match Map.tryFind w world.Windows with
+        | None -> world, [], [ rid, Error { Api = "ShowWindowAsync"; Space = Win32LastError; Code = 1400; ElapsedUs = 0L }, None ]
+        | Some vw -> { world with Windows = Map.add w { vw with IsMaximized = false } world.Windows }, [], [ rid, Ok (), None ]
     | Reprobe (w, KTargetIntegrity) ->
         match Map.tryFind w world.Windows with
         | None -> world, [], [] // Reprobeも`[]`返却に結果の通知先が無い（元の発行元はタイマーで再試行する）
@@ -262,7 +287,8 @@ let applyEffect
                             { emptySnapshot w with
                                 VisibleFrameRect = Some { Value = Ok vw.Rect; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" }
                                 Presence = Some { Value = Ok presence; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" }
-                                TargetIntegrity = Some { Value = Ok vw.Integrity; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" } }
+                                TargetIntegrity = Some { Value = Ok vw.Integrity; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" }
+                                IsMaximized = Some { Value = Ok vw.IsMaximized; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" } }
                     acc @ [ ev ], sampleSeq + 1L)
                 ([], world.NextSampleSequence)
         { world with NextSampleSequence = nextSeq }, observed, []

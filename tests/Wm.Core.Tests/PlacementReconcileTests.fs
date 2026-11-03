@@ -121,6 +121,7 @@ let private observedSnapshot (w: WindowId) (rect: PixelRect) (sequence: int64) :
       VisibleFrameRect = Some { Value = Ok rect; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" }
       IsVisible = None
       IsMinimized = None
+      IsMaximized = None
       Cloak = None
       Monitor = None
       MinWidthHint = None
@@ -139,6 +140,61 @@ let private observedSnapshotWithMonitor (w: WindowId) (rect: PixelRect) (monitor
 let private observedSnapshotMinimized (w: WindowId) (rect: PixelRect) (monitor: MonitorId) (sequence: int64) : WindowSnapshot =
     { observedSnapshotWithMonitor w rect monitor sequence with
         IsMinimized = Some { Value = Ok true; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" } }
+
+/// `observedSnapshot`に、`IsMaximized = true`の観測を付け加えたもの。`RestoreBeforeMove`の発行
+/// （v2.74、§6.2/§7.1）をテストするのに使う。
+let private observedSnapshotMaximized (w: WindowId) (rect: PixelRect) (sequence: int64) : WindowSnapshot =
+    { observedSnapshot w rect sequence with
+        IsMaximized = Some { Value = Ok true; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" } }
+
+// ===== RestoreBeforeMove（§6.2/§7.1、v2.74、CIスパイクS6bで実機確認） =====
+
+[<Fact>]
+let ``最大化中のTiled窓への新しいSetRectは、同じ直前にRestoreBeforeMoveを別RequestIdで発行する(v2.74)`` () =
+    let w = WindowId 1L
+    let afterDiscovered, _, _ = onWindowObserved 5L (observedSnapshotMaximized w workArea 1L) initial
+    let state', effects, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterDiscovered
+    match effects with
+    | [ RestoreBeforeMove (restoreRid, restoreWindow); SetRect (setRid, setWindow, rect) ] ->
+        Assert.Equal(w, restoreWindow)
+        Assert.Equal(w, setWindow)
+        Assert.NotEqual(restoreRid, setRid)
+        Assert.Equal(workArea, rect)
+    | other -> Assert.True(false, sprintf "expected [RestoreBeforeMove; SetRect], got %A" other)
+    // SetRectのRequestIdだけがPendingに乗る(RestoreBeforeMoveはfire-and-forgetで追跡しない)。
+    Assert.Equal(1, Map.count state'.Pending)
+
+[<Fact>]
+let ``最大化していないTiled窓への新しいSetRectはRestoreBeforeMoveを伴わない(回帰確認、v2.74)`` () =
+    let w = WindowId 1L
+    let state', effects, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    Assert.Equal<Effect list>([ SetRect (RequestId 0L, w, workArea) ], effects)
+    Assert.Equal(1, Map.count state'.Pending)
+
+[<Fact>]
+let ``最大化状態が観測で解消された後の新しいSetRectはRestoreBeforeMoveを伴わない(v2.74)`` () =
+    let w1, w2 = WindowId 1L, WindowId 2L
+    let afterDiscovered, _, _ = onWindowObserved 5L (observedSnapshotMaximized w1 workArea 1L) initial
+    // 最大化が解消されたという新しい観測(IsMaximized = false)が届く。
+    let restoredSnapshot = { observedSnapshot w1 workArea 2L with IsMaximized = Some { Value = Ok false; SampleSequence = 2L; MonotonicTime = 6L; Source = "test" } }
+    let afterRestored, _, _ = onWindowObserved 6L restoredSnapshot afterDiscovered
+    // w2が増えてLayoutの目標が変わる(全画面→MasterStackの左半分)ので、w1への新しいSetRectが出る。
+    let state', effects, _ =
+        reconcileWorkspace 10L registry (masterStackRef 0.5m) (ctxWith [ w1; w2 ]) (managementOf [ w1; w2 ]) (aliveOf [ w1; w2 ]) afterRestored
+    let w1Effects = effects |> List.filter (function RestoreBeforeMove (_, w) -> w = w1 | SetRect (_, w, _) -> w = w1 | _ -> false)
+    match w1Effects with
+    | [ SetRect _ ] -> ()
+    | other -> Assert.True(false, sprintf "expected only a SetRect for w1 (no RestoreBeforeMove), got %A" other)
+    Assert.Equal(2, Map.count state'.Pending)
+
+[<Fact>]
+let ``Desiredと同じ結果ならSetRectを再発行せず、最大化中でもRestoreBeforeMoveも出さない(§7.3重複要求の禁止、v2.74)`` () =
+    let w = WindowId 1L
+    let afterDiscovered, _, _ = onWindowObserved 5L (observedSnapshotMaximized w workArea 1L) initial
+    let state1, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterDiscovered
+    let state2, effects2, _ = reconcileWorkspace 20L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) state1
+    Assert.Empty(effects2)
+    Assert.Equal<Map<RequestId, PendingRequest>>(state1.Pending, state2.Pending)
 
 [<Fact>]
 let ``観測された矩形がPendingのTargetRectと一致すればSatisfiedになりPendingが消える`` () =
@@ -300,6 +356,7 @@ let private presenceSnapshot (w: WindowId) (presence: ObservedPresence) (sequenc
       VisibleFrameRect = None
       IsVisible = None
       IsMinimized = None
+      IsMaximized = None
       Cloak = None
       Monitor = None
       MinWidthHint = None

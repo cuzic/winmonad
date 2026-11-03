@@ -43,6 +43,7 @@ let private visibleWindowObserved (w: WindowId) : InputEvent =
           VisibleFrameRect = None
           IsVisible = Some { Value = Ok true; SampleSequence = 1L; MonotonicTime = 1L; Source = "test" }
           IsMinimized = None
+          IsMaximized = None
           Cloak = None
           Monitor = None
           MinWidthHint = None
@@ -67,12 +68,33 @@ let private visibleWindowObservedAtRectAndMonitor (w: WindowId) (rect: PixelRect
     | WindowObserved s -> WindowObserved { s with Monitor = Some { Value = Ok monitor; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" } }
     | other -> other
 
+/// `visibleWindowObserved`に、`IsMaximized = true`の観測を付け加えたもの。`RestoreBeforeMove`の発行と
+/// ゲートの`MissingRestoreBeforeMove`拒否を回避できることの結合テスト（v2.74）に使う。
+let private visibleWindowObservedMaximized (w: WindowId) : InputEvent =
+    match visibleWindowObserved w with
+    | WindowObserved s -> WindowObserved { s with IsMaximized = Some { Value = Ok true; SampleSequence = 1L; MonotonicTime = 1L; Source = "test" } }
+    | other -> other
+
 [<Fact>]
 let ``新規窓のWindowObservedは、同じstepでWindows.RecordsがAliveになるので、PlacementのReprobeがゲートを通過する`` () =
     let state = initial RuntimePolicy.defaults
     let result = step RuntimePolicy.defaults state (mkEnvelope 1L (visibleWindowObserved (WindowId 1L)))
     let effects = result.Effects |> List.map GatedEffect.effect
     Assert.Contains(Reprobe (WindowId 1L, KTargetIntegrity), effects)
+
+[<Fact>]
+let ``最大化状態で発見された窓のReconcileは、RestoreBeforeMoveがNeedsRestoreへ結線されゲートで拒否されず、SetRectの直前に発行される(v2.74)`` () =
+    let w = WindowId 1L
+    let settleMs = TopologyConfig.defaults.SettleMs
+    let afterMonitor0 = step RuntimePolicy.defaults (initial RuntimePolicy.defaults) (mkEnvelope 1L (MonitorTopologyObserved [ mkMonitor 0 ]))
+    let afterSettle0 = step RuntimePolicy.defaults afterMonitor0.Next (mkEnvelope (1L + settleMs) (TimerElapsed (TimerId.Topology ScreenSettle)))
+    let result = step RuntimePolicy.defaults afterSettle0.Next (mkEnvelope 100L (visibleWindowObservedMaximized w))
+    let effects = result.Effects |> List.map GatedEffect.effect
+    match effects |> List.filter (function RestoreBeforeMove (_, rw) -> rw = w | SetRect (_, sw, _) -> sw = w | _ -> false) with
+    | [ RestoreBeforeMove (_, rw); SetRect (_, sw, _) ] ->
+        Assert.Equal(w, rw)
+        Assert.Equal(w, sw)
+    | other -> Assert.True(false, sprintf "expected [RestoreBeforeMove; SetRect] for the maximized window (gate must not reject), got %A" other)
 
 [<Fact>]
 let ``MinimizedStateChangedはstep経由でPlacement.Geometry.IsMinimizedへ届く`` () =

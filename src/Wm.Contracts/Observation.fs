@@ -72,6 +72,8 @@ type WindowSnapshot = {
     VisibleFrameRect: Observation<PixelRect> option
     IsVisible: Observation<bool> option
     IsMinimized: Observation<bool> option
+    /// 最大化状態（`IsZoomed`相当、v2.74。§6.2/§7.1の`NeedsRestore`/`RestoreBeforeMove`の生産元）。
+    IsMaximized: Observation<bool> option
     Cloak: Observation<CloakState> option
     Monitor: Observation<MonitorId> option
     MinWidthHint: Observation<int> option

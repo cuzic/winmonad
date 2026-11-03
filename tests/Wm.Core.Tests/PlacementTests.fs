@@ -35,6 +35,7 @@ let private snapshotWith
       VisibleFrameRect = visibleFrameRect
       IsVisible = None
       IsMinimized = isMinimized
+      IsMaximized = None
       Cloak = None
       Monitor = monitor
       MinWidthHint = None

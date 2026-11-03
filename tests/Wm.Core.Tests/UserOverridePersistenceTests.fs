@@ -40,6 +40,7 @@ let private windowObserved (sequence: int64) (visible: bool) : InputEvent =
           VisibleFrameRect = None
           IsVisible = Some { Value = Ok visible; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" }
           IsMinimized = None
+          IsMaximized = None
           Cloak = None
           Monitor = None
           MinWidthHint = None

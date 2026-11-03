@@ -302,6 +302,7 @@ let private windowSnapshotToJson (s: WindowSnapshot) : JsonNode =
     o.["visibleFrameRect"] <- observationOptionToJson pixelRectToJson s.VisibleFrameRect
     o.["isVisible"] <- observationOptionToJson boolToJson s.IsVisible
     o.["isMinimized"] <- observationOptionToJson boolToJson s.IsMinimized
+    o.["isMaximized"] <- observationOptionToJson boolToJson s.IsMaximized
     o.["cloak"] <- observationOptionToJson cloakStateToJson s.Cloak
     o.["monitor"] <- observationOptionToJson monitorIdToJson s.Monitor
     o.["minWidthHint"] <- observationOptionToJson intToJson s.MinWidthHint
@@ -322,6 +323,7 @@ let private windowSnapshotOfJson (node: JsonNode) : WindowSnapshot =
       VisibleFrameRect = observationOptionOfJson pixelRectOfJson node.["visibleFrameRect"]
       IsVisible = observationOptionOfJson boolOfJson node.["isVisible"]
       IsMinimized = observationOptionOfJson boolOfJson node.["isMinimized"]
+      IsMaximized = observationOptionOfJson boolOfJson node.["isMaximized"]
       Cloak = observationOptionOfJson cloakStateOfJson node.["cloak"]
       Monitor = observationOptionOfJson monitorIdOfJson node.["monitor"]
       MinWidthHint = observationOptionOfJson intOfJson node.["minWidthHint"]

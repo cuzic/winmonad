@@ -823,8 +823,11 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     let next = { next with Placement = placementAfterReconcile }
 
     // 段⑧ゲート（§6.2/§7.1）：Windows/Placementの実装に伴い、Alive/Management/NotMovable/Hungを
-    // 実際の状態から組み立てる（HiddenByWm/NeedsRestoreはDesired全体の反映が無いため、引き続き空集合の
-    // まま、既知のギャップとして残す）。
+    // 実際の状態から組み立てる（HiddenByWmはDesired全体の反映が無いため、引き続き空集合のまま、
+    // 既知のギャップとして残す）。NeedsRestore（v2.74）はPlacementの`Geometry.IsMaximized`信念から
+    // 直接組み立てる——`dispatchPlacements`（Placement.fs）がこの信念を見て`SetRect`の直前に
+    // 自分で`RestoreBeforeMove`を発行するので、ここでの集合は「ゲートが見る構造的な前提」の役割
+    // （同じ窓へ他の経路から直接`SetRect`/`RestoreBeforeMove`を発行する将来の変更に対する防御）。
     let gateInput =
         { Alive = aliveWindows
           Management = managementByWindow
@@ -845,7 +848,12 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             |> Seq.map fst
             |> Set.ofSeq
           HiddenByWm = Set.empty
-          NeedsRestore = Set.empty }
+          NeedsRestore =
+            next.Placement.Geometry
+            |> Map.toSeq
+            |> Seq.filter (fun (_, g) -> LatestWins.value g.IsMaximized = Some true)
+            |> Seq.map fst
+            |> Set.ofSeq }
 
     let gated, rejected = GatedEffect.gate gateInput (reuseForgetEffects @ topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects @ switchForegroundEffects @ focusRotateEffects @ closeFocusedEffects @ focusMostRecentEffects @ switchSettleReRequestEffects)
 

@@ -42,6 +42,7 @@ let private observedWithProcess (sequence: int64) (w: WindowId) (pid: int) : Inp
           VisibleFrameRect = None
           IsVisible = Some { Value = Ok true; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" }
           IsMinimized = None
+          IsMaximized = None
           Cloak = None
           Monitor = None
           MinWidthHint = None

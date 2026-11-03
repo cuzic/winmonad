@@ -55,8 +55,10 @@ Phase 0は「要素技術の確認」ではなく、**捨てる前提の素朴�
 - **記録する内容**: アプリごとのイベント列、属性が確定するまでの遅延、`ApplicationFrameHost.exe`経由かどうか、(a)(b)(c)各手法の安定性比較。
 - **判定**: ほぼ確実に「型に反映」。Unknown暫定方針（5.4）の猶予時間や、`AppId`導出ロジック（5.3の`AppIs`の注記）に反映する。
 
-### S6. バッチ適用と最大化/Snapからの復元（A-4対応）【CI実機検証済み：failure-catalog.md F09-F10】
-**結果**：ハング窓を含む3窓を`DeferWindowPos`系で一括適用すると4000ms超ブロック。個別`SetWindowPos`+`SWP_ASYNCWINDOWPOS`では3窓全てが1ms以内にリターン。6.2の既定方針（個別+ASYNC）が実証された。最大化/Snap状態の窓での`RestoreBeforeMove`検証は未実施（実機デスクトップが必要）。
+### S6. バッチ適用と最大化/Snapからの復元（A-4対応）【CI実機検証済み：failure-catalog.md F09-F10、S6bでGitHub Actions windows-latest実機検証済み】
+**結果**：ハング窓を含む3窓を`DeferWindowPos`系で一括適用すると4000ms超ブロック。個別`SetWindowPos`+`SWP_ASYNCWINDOWPOS`では3窓全てが1ms以内にリターン。6.2の既定方針（個別+ASYNC）が実証された。
+
+**S6b（v2.74で追加、`spikes/Phase0CiSpikes/Program.fs`の`spikeS6b_MaximizedRestoreBeforeMove`）、結果**：GitHub Actions windows-latestランナー上で、最大化した窓へ`SW_RESTORE`を呼ばずに直接`SetWindowPos`を呼んだ場合、**API自体は`true`を返し、矩形は要求どおりに正しく動く**（Trial A：`IsZoomed`は呼出前`true`、呼出後も`true`のまま、矩形は`(-8,-8,1032,728)`→`(50,50,350,250)`で目標`(50,50,300,200)`どおりに動いた）。一方、`ShowWindow(SW_RESTORE)`を先に呼んだ場合は`IsZoomed`が正しく`false`へ戻り、その後の`SetWindowPos`も同様に正しく動く（Trial B）。つまり「`SetWindowPos`が最大化窓に対して効かない／失敗する」という当初の懸念は誤りだった——**実際の問題は、`SW_RESTORE`を呼ばないと`IsZoomed`（`WS_MAXIMIZE`）フラグが外れたまま残り続けること**である。この「矩形は動いたのに内部的には最大化のまま」という食い違った状態は、タイトルバーのダブルクリックやタスクバーのプレビュー、以後のユーザー操作でどう振る舞うかが未検証のまま残るため、`RestoreBeforeMove`を省略する選択はしない——v2.74はこのCI結果を根拠に、最大化中の窓へは`SetRect`の直前に必ず`RestoreBeforeMove`を発行する実装（`Placement.dispatchPlacements`/`GatedEffect`の`NeedsRestore`）で確定した。Aero Snap状態の検知手段は未調査のまま依然対象外。
 - **検証する前提**: 既定方針（個別`SetWindowPos` + `SWP_ASYNCWINDOWPOS`、feasibility.md §4でkomorebi/GlazeWM双方が採用していると確認済み）でちらつきが実用上問題になるか、`DeferWindowPos`系の方が明確に優れるか。最大化・Aero Snap状態の窓は`ShowWindow(SW_RESTORE)`を先に呼ばないと`SetWindowPos`が効かないか。
 - **方法**: `ThrowawayWm`に4〜6枚のウィンドウを並べ替えるコマンドを足し、(a)個別`SetWindowPos`+`SWP_ASYNCWINDOWPOS`版、(b)`DeferWindowPos`系版を見比べる（目視でちらつきを確認、可能なら画面キャプチャで比較）。(b)では1窓をハング状態にした場合に残りの窓の適用が完了するかも確認する（`DeferWindowPos`はドキュメント上失敗時は全体中止が推奨されており、ハング耐性に不利な可能性がある）。最大化・Snap状態の窓を含めて試す。
 - **記録する内容**: (a)(b)それぞれのちらつきの有無、`SW_RESTORE`が必要なケースの一覧、(b)でハング窓を含めた場合の挙動。

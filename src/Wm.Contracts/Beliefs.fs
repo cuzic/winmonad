@@ -240,5 +240,8 @@ type GeometryBeliefs = {
     VisibleFrameRect: LatestWins<PixelRect>
     Monitor: LatestWins<MonitorId>
     IsMinimized: LatestWins<bool>
+    /// 最大化状態（v2.74。§6.2/§7.1の`NeedsRestore`/`RestoreBeforeMove`の生産元、`GatedEffect.fs`の
+    /// 型直前のコメント参照）。
+    IsMaximized: LatestWins<bool>
     Presence: LatestWins<ObservedPresence>
 }
