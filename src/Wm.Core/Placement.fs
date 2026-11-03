@@ -870,6 +870,8 @@ let onPendingDeadlineTimerFired
     : PlacementState * Effect list * TimerCommand<TimerId> list =
     let isMinimized (w: WindowId) : bool =
         Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.IsMinimized) |> Option.defaultValue false
+    let isMaximized (w: WindowId) : bool =
+        Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.IsMaximized) |> Option.defaultValue false
     match Map.tryFind rid state.Pending with
     | Some pr when awaitDeadline (Some pr.Deadline) now && Set.contains pr.Window state.Dragging ->
         // 「ユーザーのドラッグ」の除外（v2.65、Opusレビューの条件6、ファイル冒頭`tryMismatchObservation`の
@@ -888,6 +890,17 @@ let onPendingDeadlineTimerFired
         // 確定しているとは限らない）は、この判定を`PendingDeadline`満了時点（既定2秒後、
         // `pendingDeadlineMs`）まで遅らせることで実質無害になる——実機で観測された順序の揺れは
         // この遅延より大幅に短い。
+        { state with
+            Pending = Map.remove rid state.Pending
+            RetryAttempts = Map.remove pr.Window state.RetryAttempts },
+        [], []
+    | Some pr when awaitDeadline (Some pr.Deadline) now && isMaximized pr.Window ->
+        // 「最大化」の除外（v2.77、条件5・6と同じ理由）：ユーザーが最大化すると観測される矩形は
+        // モニターのWorkArea全体になり、TargetRectとは一致しないのが普通——これはアプリが要求を
+        // 拒否した結果ではなくユーザー操作そのものの結果なので、Mismatch証拠にもTimeoutのRetry
+        // 対象にもしない。`IsMaximized`は`WindowObserved`の同じ観測内で`VisibleFrameRect`と一緒に
+        // revise されるため（`reviseGeometryFromSnapshot`、専用の即時イベントが無い——最小化の
+        // `MinimizedStateChanged`とは違う）、条件5で問題になった到着順序の揺れは構造的に起きない。
         { state with
             Pending = Map.remove rid state.Pending
             RetryAttempts = Map.remove pr.Window state.RetryAttempts },

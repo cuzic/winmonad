@@ -147,6 +147,13 @@ let private observedSnapshotMaximized (w: WindowId) (rect: PixelRect) (sequence:
     { observedSnapshot w rect sequence with
         IsMaximized = Some { Value = Ok true; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" } }
 
+/// `observedSnapshotWithMonitor`に、`IsMaximized = true`の観測も付け加えたもの。「最大化」の除外
+/// （v2.77）をテストするのに使う——`observedSnapshotMaximized`はMonitorを持たないため、
+/// MinWidthのDIP正規化（Monitorの信念からdpiOfを引く）を検査する場面では使えない。
+let private observedSnapshotMaximizedWithMonitor (w: WindowId) (rect: PixelRect) (monitor: MonitorId) (sequence: int64) : WindowSnapshot =
+    { observedSnapshotWithMonitor w rect monitor sequence with
+        IsMaximized = Some { Value = Ok true; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" } }
+
 // ===== RestoreBeforeMove（§6.2/§7.1、v2.74、CIスパイクS6bで実機確認） =====
 
 [<Fact>]
@@ -945,6 +952,45 @@ let ``最小化中の窓はPendingDeadline発火時にMismatch判定もRetryも�
     // 最小化中の観測はMinWidthの証拠にもしない(`-32000`付近の座標・幅はアプリの最小幅制約の
     // 証拠ではない——条件5の除外そのもの)。
     Assert.Equal(None, Map.tryFind w afterDeadline.MinWidth)
+
+[<Fact>]
+let ``最大化中の窓はPendingDeadline発火時にMismatch判定もRetryもせず、戦わずに終端する(v2.77)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    // ユーザーが最大化すると、観測される矩形はモニターのWorkArea全体になる(TargetRectとは不一致、
+    // 幅も要求より広い——MinWidthの証拠候補)。
+    let maximizedRect = { workArea with Width = workArea.Width + 500 }
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotMaximizedWithMonitor w maximizedRect m 10L) afterDispatched
+    let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
+    let afterDeadline, effects, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    Assert.Empty(afterDeadline.Pending) // 終端はする(Reevaluateと同じ、戦わない)
+    Assert.Empty(effects) // Retryしない
+    Assert.Equal(None, Map.tryFind w afterDeadline.RetryAttempts)
+    // 最大化中の観測はMinWidthの証拠にもしない(モニターのWorkArea幅はアプリの最小幅制約の
+    // 証拠ではない)。DpiOfが解決できる(=一般のMismatch経路なら証拠を記録できる)状態でもなお
+    // 記録しないことを確かめる。
+    Assert.Equal(None, Map.tryFind w afterDeadline.MinWidth)
+    // 一般のMismatch経路（Reevaluate）とは違い、Acceptedも更新しない(除外そのもの、
+    // 条件5・6と同じ終端)。
+    Assert.Equal(None, Map.tryFind w afterDeadline.Accepted)
+
+[<Fact>]
+let ``最大化から復元した後は通常どおりMismatch判定に戻る(回帰確認、v2.77)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let widerRect = { workArea with Width = 2000 }
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w widerRect m 10L) afterDispatched
+    let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
+    let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    match Map.tryFind w afterDeadline.MinWidth with
+    | Some { Confidence = Inferred _ } -> ()
+    | other -> Assert.True(false, sprintf "expected an Inferred MinWidth belief (normal Mismatch evidence capture), got %A" other)
 
 [<Fact>]
 let ``最小化から復元した後は通常どおりMismatch判定に戻る(回帰確認、v2.73)`` () =
