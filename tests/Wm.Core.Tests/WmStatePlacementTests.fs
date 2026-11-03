@@ -651,6 +651,23 @@ let ``ChangeLayoutはアクティブなWorkspaceのLayoutOverrideへ記録し、
     Assert.Equal(Some stackArea, desiredRectOf afterChange.Next.Placement w2)
 
 [<Fact>]
+let ``ChangeLayoutでColumns(v2.67)へ切り替えると、RuntimePolicy.defaultsのLayoutRegistryから解決されて2列に分割する`` () =
+    let w1, w2 = WindowId 1L, WindowId 2L
+    let afterW1 = settleOneMonitorThenDiscoverWindow w1
+    let afterW2 = step RuntimePolicy.defaults afterW1.Next (mkEnvelope 101L (visibleWindowObserved w2))
+    let ws0 = WorkspaceSet.workspaceOf w1 afterW2.Next.Workspaces |> Option.get
+    let workArea = (mkMonitor 0).WorkArea
+
+    let columnsRef : LayoutRef = { Id = LayoutId "columns"; ApiVersion = 1; Args = ColumnCount 2 }
+    let afterChange = step RuntimePolicy.defaults afterW2.Next (mkEnvelope 102L (UserCommand (ChangeLayout columnsRef)))
+    Assert.Equal(Some columnsRef, (WorkspaceSet.stateOf ws0 afterChange.Next.Workspaces).LayoutOverride)
+    // 2窓・2列なので、各窓がちょうど半分の幅を縦いっぱいに占める列になる。
+    let col0 = { workArea with Width = workArea.Width / 2 }
+    let col1 = { workArea with X = col0.Width; Width = workArea.Width - col0.Width }
+    Assert.Equal(Some col0, desiredRectOf afterChange.Next.Placement w1)
+    Assert.Equal(Some col1, desiredRectOf afterChange.Next.Placement w2)
+
+[<Fact>]
 let ``ChangeLayoutはアクティブなモニターが無い(NoMonitors)場合、何もしない`` () =
     let state = initial RuntimePolicy.defaults
     let someRef : LayoutRef = { Id = LayoutId "master-stack"; ApiVersion = 1; Args = NoArgs }

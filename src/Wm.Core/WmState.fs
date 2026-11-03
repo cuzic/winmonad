@@ -53,7 +53,8 @@ module RuntimePolicy =
           LayoutRegistry =
             Registry.empty
             |> Registry.register (Wm.Layouts.MasterStack.implementation "builtin-master-stack-v1")
-            |> Registry.register (Wm.Layouts.Monocle.implementation "builtin-monocle-v1") }
+            |> Registry.register (Wm.Layouts.Monocle.implementation "builtin-monocle-v1")
+            |> Registry.register (Wm.Layouts.Columns.implementation "builtin-columns-v1") }
 
 /// 親の状態。最初はTopologyのフィールドだけを持ち、ドメインを実装するたびにフィールドを追加する
 /// （ADR-019決定8。6フィールドを骨格だけ一括で用意する代替案は退けた）。Workspaces・Health・Focus・

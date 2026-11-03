@@ -9,6 +9,7 @@
     <Compile Include="TestHelpers.fs" />
     <Compile Include="MasterStackTests.fs" />
     <Compile Include="MonocleTests.fs" />
+    <Compile Include="ColumnsTests.fs" />
     <Compile Include="PlanValidatorTests.fs" />
   </ItemGroup>
 

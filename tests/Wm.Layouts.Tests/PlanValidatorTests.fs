@@ -141,6 +141,29 @@ let ``MasterStackの出力は、対応するManagement/Aliveと組み合わせ�
         | Error _ -> false
     | Error _ -> true // 退化したWorkArea等でLayout自体が拒否した場合はこの性質の対象外
 
+/// Columns（v2.67で追加）についても同じ結合を確認する。
+[<FsCheck.Xunit.Property>]
+let ``Columnsの出力は、対応するManagement/Aliveと組み合わせると常にvalidateを通る``
+    (x: int)
+    (y: int)
+    (w: FsCheck.PositiveInt)
+    (h: FsCheck.PositiveInt)
+    (count: int)
+    (colsRaw: int)
+    =
+    let area = mkWorkArea x y w h
+    let tiled = mkTiledWindows count
+    let ctx = mkContext area tiled
+    let cols = 1 + (abs colsRaw % 5)
+    match Columns.calculate (ColumnCount cols) ctx with
+    | Ok placements ->
+        let management = tiled |> List.map (fun t -> t.Id, EffTiled) |> Map.ofList
+        let input = { Context = ctx; Management = management; Alive = management |> Map.toList |> List.map fst |> Set.ofList }
+        match validate input placements with
+        | Ok _ -> true
+        | Error _ -> false
+    | Error _ -> true // 退化したWorkArea等でLayout自体が拒否した場合はこの性質の対象外
+
 // ===== §15.1 #15：smart constructorの構築経路（アーキテクチャテスト） =====
 //
 // 「ofDtoを経由しない構築経路（直接のリフレクション/シリアライザー等）が存在しないことを検査する」は

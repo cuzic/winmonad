@@ -8,6 +8,7 @@
     <Compile Include="LayoutRegistry.fs" />
     <Compile Include="MasterStack.fs" />
     <Compile Include="Monocle.fs" />
+    <Compile Include="Columns.fs" />
     <Compile Include="PlanValidator.fs" />
   </ItemGroup>
 
