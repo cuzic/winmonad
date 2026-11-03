@@ -41,16 +41,62 @@ let private splitVertically (columnArea: PixelRect) (n: int) : PixelRect list =
               Width = columnArea.Width
               Height = h } ]
 
-/// WorkAreaを`n`本の縦列に横方向へ等分する（余りピクセルは最後の列へ、`splitVertically`と同じ規則）。
-let private splitHorizontally (area: PixelRect) (n: int) : PixelRect list =
-    let baseWidth = area.Width / n
-    let remainder = area.Width - baseWidth * n
-    [ for i in 0 .. n - 1 ->
-        let w = if i = n - 1 then baseWidth + remainder else baseWidth
-        { X = area.X + i * baseWidth
-          Y = area.Y
-          Width = w
-          Height = area.Height } ]
+/// WorkAreaを`n`本の縦列に横方向へ等分する幅だけを求める（余りピクセルは最後の列へ、
+/// `splitVertically`と同じ規則）。矩形化（Xオフセットの確定）は`adjustForMinWidth`適用後に行う。
+let private naturalWidthsOf (totalWidth: int) (n: int) : int list =
+    let baseWidth = totalWidth / n
+    let remainder = totalWidth - baseWidth * n
+    [ for i in 0 .. n - 1 -> if i = n - 1 then baseWidth + remainder else baseWidth ]
+
+/// §6.2のMinWidth対応（v2.79、プロジェクトオーナー確認済みのv2.78「兄弟窓を縮めて調整する」方針を
+/// N列へ一般化）：`LayoutWindow.MinWidthDip`をこの画面のDPIで物理ピクセルへ戻す（`Placement.
+/// reviseMinWidth`の`toDip = px * 96 / dpi`の逆、`px = dip * dpi / 96`）。信念が無い窓は制約無し（0）。
+/// 列の最小幅は構成窓のうち最大値（列内の全窓が同じ列幅を共有するため、MasterStack.fsの
+/// `minWidthPxOf`と同じ考え方）。
+let private minWidthPxOf (dpi: int) (w: LayoutWindow) : int =
+    w.MinWidthDip |> Option.map (fun b -> b.Value * dpi / 96) |> Option.defaultValue 0
+
+/// N列の自然な等分幅を、各列のMinWidthを尊重できるよう再配分する（v2.79）。v2.78のMasterStack
+/// （master/stackの2者だけ）では「不足している側に、もう一方が丸ごと充てる」で済んだが、列が
+/// 3本以上あると「不足分をどの余裕列からどれだけ削るか」という2者には無かった新しい選択が生じる。
+/// ここでは「各余裕列（自然な幅がMinWidthを上回る列）の余裕（natural - min）の大きさに比例して
+/// 削る」規則を採る——この規則はN=2のときv2.78の「もう一方が全額負担する」と完全に一致する
+/// （余裕列が1本しか無いので、その1本が比例配分の100%を負担することになる）ため、新しい方針を
+/// 持ち込むのではなく、オーナーが既に選んだ方針の自然な拡張として選んだ。全列のMinWidthの合計が
+/// WorkArea幅を超える場合はどの列からも削りきれないので、v2.78と同じく「打ち止め」——自然な等分の
+/// ままにする（削る側を決める根拠が無い状態で無理に押し込むと、むしろ任意の判断を混入させてしまう、
+/// という理由もv2.78から変わらない）。各列のMinWidthの合計がWorkArea幅以下である限り、必ず
+/// 「余裕列の余裕の合計 ≧ 不足列の不足の合計」が成り立つ（自然な幅の合計＝WorkArea幅であることから
+/// 導ける）ので、比例配分で不足側を必ず満たせる——`totalSlack = 0`なのに`totalDeficit > 0`という
+/// 割り算不能な状態には構造的に陥らない。
+let private adjustForMinWidth (dpi: int) (naturalWidths: int list) (columns: LayoutWindow list list) : int list =
+    let minPxByColumn = columns |> List.map (fun col -> col |> List.map (minWidthPxOf dpi) |> List.fold max 0)
+    let totalWidth = List.sum naturalWidths
+    let totalMinPx = List.sum minPxByColumn
+    if totalMinPx > totalWidth then
+        naturalWidths
+    else
+        let slacks = List.map2 (fun nat minPx -> nat - minPx) naturalWidths minPxByColumn
+        let totalDeficit = slacks |> List.filter (fun s -> s < 0) |> List.sumBy (fun s -> -s)
+        if totalDeficit = 0 then
+            naturalWidths
+        else
+            let totalSlack = slacks |> List.filter (fun s -> s > 0) |> List.sum
+            let adjusted =
+                List.map2
+                    (fun nat slack ->
+                        if slack < 0 then
+                            nat - slack // 不足列：自然な幅をMinWidthまで引き上げる(nat + (-slack) = minPx)
+                        elif slack > 0 then
+                            nat - int (float slack * float totalDeficit / float totalSlack) // 余裕に比例して削る
+                        else
+                            nat)
+                    naturalWidths
+                    slacks
+            // 浮動小数の丸め誤差で合計がWorkArea幅と数px ずれることがあるため、最後の列で吸収する
+            // （`naturalWidthsOf`/`splitVertically`と同じ「余りは最後へ」規則）。
+            let diff = totalWidth - List.sum adjusted
+            adjusted |> List.mapi (fun i w -> if i = List.length adjusted - 1 then w + diff else w)
 
 let calculate: LayoutFunction =
     fun args ctx ->
@@ -61,13 +107,21 @@ let calculate: LayoutFunction =
             | [] -> Ok []
             | windows ->
                 let effectiveColumnCount = min n (List.length windows)
-                let columnAreas = splitHorizontally ctx.WorkArea effectiveColumnCount
                 let columns =
                     windows
                     |> List.indexed
                     |> List.groupBy (fun (i, _) -> i % effectiveColumnCount)
                     |> List.sortBy fst
                     |> List.map (fun (_, items) -> items |> List.map snd)
+                let naturalWidths = naturalWidthsOf ctx.WorkArea.Width effectiveColumnCount
+                let widths = adjustForMinWidth ctx.Dpi naturalWidths columns
+                let columnAreas =
+                    widths
+                    |> List.fold
+                        (fun (areas, x) w ->
+                            areas @ [ { X = x; Y = ctx.WorkArea.Y; Width = w; Height = ctx.WorkArea.Height } ], x + w)
+                        ([], ctx.WorkArea.X)
+                    |> fst
                 Ok (
                     List.zip columnAreas columns
                     |> List.collect (fun (area, colWindows) ->
