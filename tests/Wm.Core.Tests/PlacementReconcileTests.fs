@@ -860,3 +860,180 @@ let ``ドラッグ終了後は通常どおりMismatch判定に戻る(回帰確�
     match Map.tryFind w afterDeadline.MinWidth with
     | Some { Confidence = Inferred _ } -> ()
     | other -> Assert.True(false, sprintf "expected an Inferred MinWidth belief (normal Mismatch evidence capture), got %A" other)
+
+// ===== MoveCause.Unattributed：Accepted/ドリフト検知（§4.4 R3-4、v2.70、Opus敵対的レビュー
+// opus-review-unattributed-movecause.md。ラウンド1はクロスモニターのずれだけを対象にする） =====
+
+let private alwaysStable = true
+let private isTiledTrue (_: WindowId) = true
+let private isTiledFalse (_: WindowId) = false
+
+[<Fact>]
+let ``Satisfiedで観測された矩形がAcceptedに記録される(v2.70)`` () =
+    let w = WindowId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w workArea 1L) afterReconcile
+    Assert.Empty(afterObserved.Pending)
+    Assert.Equal(Some workArea, Map.tryFind w afterObserved.Accepted)
+
+[<Fact>]
+let ``Mismatch終端時は観測された矩形(Desiredではない)がAcceptedに記録される(v2.70、Opusレビュー§B-1)`` () =
+    let w = WindowId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let mismatchedRect = { workArea with X = workArea.X + 50 }
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w mismatchedRect 10L) afterDispatched
+    let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid noDpi afterObserved
+    Assert.Equal(Some mismatchedRect, Map.tryFind w afterDeadline.Accepted) // Desired(workArea)ではない
+
+[<Fact>]
+let ``新しい意図をdispatchPlacementsが出すとAcceptedは消える(v2.70)`` () =
+    let w = WindowId 1L
+    let afterReconcile1, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w workArea 1L) afterReconcile1
+    Assert.Equal(Some workArea, Map.tryFind w afterObserved.Accepted)
+    let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
+    let afterReconcile2, _, _ = reconcileWorkspace 30L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterObserved
+    Assert.Equal(None, Map.tryFind w afterReconcile2.Accepted)
+
+[<Fact>]
+let ``checkUnattributedDriftは、Pendingが無くAcceptedが有りモニターが食い違えば、Desiredを消しDriftCorrectionsへ記録する(v2.70)`` () =
+    let w = WindowId 1L
+    let m0, m1 = MonitorId 0L, MonitorId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
+    Assert.Equal(Some workArea, Map.tryFind w afterObserved.Accepted)
+    // OSが別モニターへ寄せた(MoveSizeイベントを伴わない)観測。
+    let afterMoved, _, _ = onWindowObserved 30L (observedSnapshotWithMonitor w workArea m1 2L) afterObserved
+    let afterDrift, corrected = checkUnattributedDrift 30L isTiledTrue (fun _ -> Some m0) alwaysStable w afterMoved
+    Assert.True(corrected)
+    Assert.Equal(None, Map.tryFind w afterDrift.Desired)
+    Assert.Equal<int64 list>([ 30L ], Map.tryFind w afterDrift.DriftCorrections |> Option.defaultValue [])
+
+[<Fact>]
+let ``checkUnattributedDriftは抑止区間中(ScreenPhase非Stable)は検知もカウントもしない(v2.70、Opusレビュー§Q4-1「必須」)`` () =
+    let w = WindowId 1L
+    let m0, m1 = MonitorId 0L, MonitorId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
+    let afterMoved, _, _ = onWindowObserved 30L (observedSnapshotWithMonitor w workArea m1 2L) afterObserved
+    let afterDrift, corrected = checkUnattributedDrift 30L isTiledTrue (fun _ -> Some m0) false w afterMoved
+    Assert.False(corrected)
+    Assert.Equal(Some (Shown (Some workArea)), Map.tryFind w afterDrift.Desired)
+    Assert.Empty(Map.tryFind w afterDrift.DriftCorrections |> Option.defaultValue [])
+
+[<Fact>]
+let ``checkUnattributedDriftはTiledでない窓には作用しない(v2.70、Opusレビュー§B-3)`` () =
+    let w = WindowId 1L
+    let m0, m1 = MonitorId 0L, MonitorId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
+    let afterMoved, _, _ = onWindowObserved 30L (observedSnapshotWithMonitor w workArea m1 2L) afterObserved
+    let afterDrift, corrected = checkUnattributedDrift 30L isTiledFalse (fun _ -> Some m0) alwaysStable w afterMoved
+    Assert.False(corrected)
+    Assert.Equal(Some (Shown (Some workArea)), Map.tryFind w afterDrift.Desired)
+
+[<Fact>]
+let ``checkUnattributedDriftはPendingが残っている窓には作用しない(v2.70)`` () =
+    // `dispatchPlacements`は新しい意図を出すたびに必ず`Accepted`を消す（型直前のコメント参照）ので、
+    // 「Pendingがある∧Acceptedがある」という組合せは通常の状態遷移では実際には作られない——
+    // Pending単体の除外条件を切り離して検査するため、ここでは意図的にその組合せを直接組み立てる
+    // （v2.68のDecisionTraceテストで「到達しないはずの組合せ」を直接作ったのと同じ手法）。
+    let w = WindowId 1L
+    let m0, m1 = MonitorId 0L, MonitorId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
+    Assert.Equal(Some workArea, Map.tryFind w afterObserved.Accepted)
+    // 先にGeometry.Monitorをm1へ観測させてから(この時点ではPendingが無いのでcheckPendingSatisfiedは
+    // 無関係)、Acceptedを保ったまま人為的にPendingを追加する——これなら`onWindowObserved`の
+    // Satisfied判定が割り込んでAccepted/Pendingを横取りしない。
+    let afterMoved0, _, _ = onWindowObserved 30L (observedSnapshotWithMonitor w workArea m1 2L) afterObserved
+    Assert.Equal(Some workArea, Map.tryFind w afterMoved0.Accepted) // Pendingが無いのでSatisfied判定は起きない
+    let artificialPending: PendingRequest =
+        { Window = w; Epoch = IntentEpoch 0L; TargetRect = { workArea with Width = workArea.Width - 1 }; IssuedAt = 30L; Deadline = 30L + pendingDeadlineMs; DispatchSeq = None; Baseline = None }
+    let afterMoved = { afterMoved0 with Pending = Map.ofList [ RequestId 999L, artificialPending ] }
+    let afterDrift, corrected = checkUnattributedDrift 30L isTiledTrue (fun _ -> Some m0) alwaysStable w afterMoved
+    Assert.False(corrected)
+
+[<Fact>]
+let ``checkUnattributedDriftはDragging中の窓には作用しない(v2.70)`` () =
+    let w = WindowId 1L
+    let m0, m1 = MonitorId 0L, MonitorId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
+    let afterMoved, _, _ = onWindowObserved 30L (observedSnapshotWithMonitor w workArea m1 2L) afterObserved
+    let afterDragging = onMoveSizeStarted w afterMoved
+    let afterDrift, corrected = checkUnattributedDrift 30L isTiledTrue (fun _ -> Some m0) alwaysStable w afterDragging
+    Assert.False(corrected)
+
+[<Fact>]
+let ``checkUnattributedDriftはAcceptedが無い(一度も受け入れられていない)窓には作用しない(v2.70)`` () =
+    let w = WindowId 1L
+    let m0, m1 = MonitorId 0L, MonitorId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    // まだ一度もSatisfiedになっていない(Acceptedが無い)。Pendingも消して「Pending無し」の条件だけを
+    // 単独で満たす人為的な状態を作る——Acceptedが無ければ検知しないことだけを確認する。
+    let rid = pendingRidFor afterReconcile w
+    let afterCancelled = { afterReconcile with Pending = Map.remove rid afterReconcile.Pending }
+    let afterMoved, _, _ = onWindowObserved 30L (observedSnapshotWithMonitor w workArea m1 2L) afterCancelled
+    let afterDrift, corrected = checkUnattributedDrift 30L isTiledTrue (fun _ -> Some m0) alwaysStable w afterMoved
+    Assert.False(corrected)
+
+[<Fact>]
+let ``checkUnattributedDriftは同じモニターなら何もしない(v2.70)`` () =
+    let w = WindowId 1L
+    let m0 = MonitorId 0L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
+    let afterDrift, corrected = checkUnattributedDrift 30L isTiledTrue (fun _ -> Some m0) alwaysStable w afterObserved
+    Assert.False(corrected)
+
+[<Fact>]
+let ``checkUnattributedDriftの補正は意図をまたいでもリセットされず、上限で打ち止めになる(v2.70、Opusレビュー§Q2)`` () =
+    let w = WindowId 1L
+    let m0, m1 = MonitorId 0L, MonitorId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
+
+    // 1〜3回目：補正が出る(unattributedCorrectionLimit=3)。`desiredMonitorOf`をm1(観測m0と食い違う)に
+    // 固定し、毎回「新しい意図」を手で再現する必要は無い——Desiredが消えてもAccepted/Pendingはそのまま
+    // なので、次の呼び出しも同じ条件で検知できる。
+    let afterDrift1, c1 = checkUnattributedDrift 1_000L isTiledTrue (fun _ -> Some m1) alwaysStable w afterObserved
+    Assert.True(c1)
+    let afterDrift2, c2 = checkUnattributedDrift 2_000L isTiledTrue (fun _ -> Some m1) alwaysStable w afterDrift1
+    Assert.True(c2)
+    let afterDrift3, c3 = checkUnattributedDrift 3_000L isTiledTrue (fun _ -> Some m1) alwaysStable w afterDrift2
+    Assert.True(c3)
+    Assert.Equal(3, Map.tryFind w afterDrift3.DriftCorrections |> Option.defaultValue [] |> List.length)
+
+    // 4回目(直近unattributedWindowMs=30秒以内)：打ち止め。補正しない。
+    let afterDrift4, c4 = checkUnattributedDrift 4_000L isTiledTrue (fun _ -> Some m1) alwaysStable w afterDrift3
+    Assert.False(c4)
+    Assert.Equal(3, Map.tryFind w afterDrift4.DriftCorrections |> Option.defaultValue [] |> List.length)
+
+[<Fact>]
+let ``checkUnattributedDriftの打ち止めは時間窓の外では再び補正できるようになる(v2.70)`` () =
+    let w = WindowId 1L
+    let m0, m1 = MonitorId 0L, MonitorId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
+    let afterDrift1, _ = checkUnattributedDrift 1_000L isTiledTrue (fun _ -> Some m1) alwaysStable w afterObserved
+    let afterDrift2, _ = checkUnattributedDrift 2_000L isTiledTrue (fun _ -> Some m1) alwaysStable w afterDrift1
+    let afterDrift3, _ = checkUnattributedDrift 3_000L isTiledTrue (fun _ -> Some m1) alwaysStable w afterDrift2
+    // unattributedWindowMs(30秒)より後：直近の補正が時間窓から外れるので再び補正できる。
+    let farFuture = 3_000L + unattributedWindowMs + 1L
+    let afterDrift4, c4 = checkUnattributedDrift farFuture isTiledTrue (fun _ -> Some m1) alwaysStable w afterDrift3
+    Assert.True(c4)
+
+[<Fact>]
+let ``onWindowVanishedはAccepted・DriftCorrectionsも消す(v2.70)`` () =
+    let w = WindowId 1L
+    let m0 = MonitorId 0L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
+    let afterDrift, _ = checkUnattributedDrift 1_000L isTiledTrue (fun _ -> Some (MonitorId 1L)) alwaysStable w afterObserved
+    Assert.NotEmpty(Map.tryFind w afterDrift.DriftCorrections |> Option.defaultValue [])
+    let afterVanished, _ = onWindowVanished w afterDrift
+    Assert.Equal(None, Map.tryFind w afterVanished.Accepted)
+    Assert.Equal(None, Map.tryFind w afterVanished.DriftCorrections)

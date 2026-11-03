@@ -59,6 +59,14 @@ let private visibleWindowObservedAtRect (w: WindowId) (rect: PixelRect) (sequenc
     | WindowObserved s -> WindowObserved { s with VisibleFrameRect = Some { Value = Ok rect; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" } }
     | other -> other
 
+/// `visibleWindowObservedAtRect`に、観測されたモニター(`Geometry.Monitor`)も付け加えたもの。
+/// `MoveCause.Unattributed`のクロスモニタードリフト検知（v2.70）をテストするのに使う——
+/// `checkUnattributedDrift`は`Geometry.Monitor`信念を見るので、`VisibleFrameRect`だけでは検知しない。
+let private visibleWindowObservedAtRectAndMonitor (w: WindowId) (rect: PixelRect) (monitor: MonitorId) (sequence: int64) : InputEvent =
+    match visibleWindowObservedAtRect w rect sequence with
+    | WindowObserved s -> WindowObserved { s with Monitor = Some { Value = Ok monitor; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" } }
+    | other -> other
+
 [<Fact>]
 let ``新規窓のWindowObservedは、同じstepでWindows.RecordsがAliveになるので、PlacementのReprobeがゲートを通過する`` () =
     let state = initial RuntimePolicy.defaults
@@ -1045,3 +1053,45 @@ let ``OsInduced：Reconfiguring中にOSが寄せた窓は、復帰後も元のDe
     // （architecture.md「grace window終了後に意図した配置(Desired)を再適用する」）。
     let effects = afterSettle.Effects @ afterGrace.Effects |> List.map GatedEffect.effect
     Assert.Contains(effects, function SetRect (_, target, rect) -> target = w && rect = workArea | _ -> false)
+
+// ===== MoveCause.Unattributed（§4.4 R3-4、ラウンド1、v2.70、Opus敵対的レビュー
+// opus-review-unattributed-movecause.md） =====
+
+[<Fact>]
+let ``Stable中にMoveSizeイベントを伴わず別モニターへ漂った窓は、Workspaceは変えずに元のモニターへ戻すSetRectを発行する(v2.70)`` () =
+    let topology, current, visibleScreen = twoMonitorTopologyAndScreens ()
+    let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+    let w = WindowId 1L
+    let afterW = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved w))
+    Assert.Equal(Some current.Workspace, WorkspaceSet.workspaceOf w afterW.Next.Workspaces)
+    // Satisfiedにする(Acceptedを作る)。
+    let afterSatisfied = step RuntimePolicy.defaults afterW.Next (mkEnvelope 2L (visibleWindowObservedAtRectAndMonitor w current.Monitor.WorkArea current.Monitor.Id 2L))
+    Assert.Empty(afterSatisfied.Next.Placement.Pending)
+    Assert.Equal(Some current.Monitor.WorkArea, Map.tryFind w afterSatisfied.Next.Placement.Accepted)
+
+    // MoveSizeStarted/Endedを一切経由せず、別モニターの矩形がそのまま観測される
+    // （アプリ自身の位置変更やWin+Shift+矢印を模す）。
+    let afterDrifted = step RuntimePolicy.defaults afterSatisfied.Next (mkEnvelope 3L (visibleWindowObservedAtRectAndMonitor w visibleScreen.Monitor.WorkArea visibleScreen.Monitor.Id 3L))
+
+    // 所属Workspaceは変わらない(UserDragとは違い、Unattributedは所属を変えない)。
+    Assert.Equal(Some current.Workspace, WorkspaceSet.workspaceOf w afterDrifted.Next.Workspaces)
+    // 元のモニターのWorkAreaへ戻すSetRectが発行される。
+    let effects = afterDrifted.Effects |> List.map GatedEffect.effect
+    Assert.Contains(effects, function SetRect (_, target, rect) -> target = w && rect = current.Monitor.WorkArea | _ -> false)
+
+[<Fact>]
+let ``MoveSizeEndedを経由した(UserDragの)別モニターへの移動はUnattributedのドリフト補正を誘発しない(回帰確認、v2.70)`` () =
+    let topology, current, visibleScreen = twoMonitorTopologyAndScreens ()
+    let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+    let w = WindowId 1L
+    let afterW = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved w))
+    let afterSatisfied = step RuntimePolicy.defaults afterW.Next (mkEnvelope 2L (visibleWindowObservedAtRect w current.Monitor.WorkArea 2L))
+
+    let rectObs: Observation<PixelRect> = { Value = Ok visibleScreen.Monitor.WorkArea; SampleSequence = 1L; MonotonicTime = 3L; Source = "test" }
+    let monitorObs: Observation<MonitorId> = { Value = Ok visibleScreen.Monitor.Id; SampleSequence = 1L; MonotonicTime = 3L; Source = "test" }
+    let afterDragEnd = step RuntimePolicy.defaults afterSatisfied.Next (mkEnvelope 3L (MoveSizeEnded (w, rectObs, monitorObs)))
+    // UserDrag経由でWorkspace自体がvisibleScreenへ移るので、新しい所属での全画面が目標になり、
+    // 「元のモニターへ戻す」補正にはならない。
+    Assert.Equal(Some visibleScreen.Workspace, WorkspaceSet.workspaceOf w afterDragEnd.Next.Workspaces)
+    let effects = afterDragEnd.Effects |> List.map GatedEffect.effect
+    Assert.DoesNotContain(effects, function SetRect (_, target, rect) -> target = w && rect = current.Monitor.WorkArea | _ -> false)

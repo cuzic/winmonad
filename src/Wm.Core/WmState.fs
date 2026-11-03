@@ -654,6 +654,26 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         |> Seq.choose (fun (w, r) -> match r.Classification with Classified (eff, _) -> Some (w, eff) | _ -> None)
         |> Map.ofSeq
 
+    // `MoveCause.Unattributed`のドリフト検知（v2.70、§4.4 R3-4、`Placement.checkUnattributedDrift`の
+    // 型直前のコメント参照）：`WindowObserved`のたびに、観測されたモニターとそのWorkspaceを表示中の
+    // モニターが食い違っていないかを確かめる。`isTiled`/`desiredMonitorOf`/`screenPhaseIsStable`は
+    // Placementが他ドメインの型を直接知らないための読み取り専用の投影（`dpiOf`と同じ考え方、ADR-018）。
+    let isTiled (w: WindowId) : bool = Map.tryFind w managementByWindow = Some EffTiled
+    let desiredMonitorOf (w: WindowId) : MonitorId option =
+        match WorkspaceSet.workspaceOf w next.Workspaces with
+        | None -> None
+        | Some ws ->
+            match Topology.displays next.Topology with
+            | NoMonitors -> None
+            | Displays (current, visible) -> (current :: visible) |> List.tryFind (fun sc -> sc.Workspace = ws) |> Option.map (fun sc -> sc.Monitor.Id)
+    let screenPhaseIsStable = match Topology.phase next.Topology with Stable -> true | _ -> false
+    let next, driftCorrected =
+        match envelope.Input with
+        | WindowObserved snapshot ->
+            let placement', corrected = Placement.checkUnattributedDrift now isTiled desiredMonitorOf screenPhaseIsStable snapshot.Id next.Placement
+            { next with Placement = placement' }, corrected
+        | _ -> next, false
+
     // 段⑦相当（Placement、Reconcile）：WindowClassified/WindowUnmanaged（windowsEvents）・WindowRemoved・
     // TopologySettled（v2.29。上で一括取り消したPendingの代わりを同じstepで発行する必要があるため）の
     // いずれかでWorkspaceの構成が変わった可能性がある場合に限り、現在表示されている全てのWorkspace
@@ -686,6 +706,10 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         // Workspaceが対象になる（`reconcileOneScreen`は現在表示中の全Workspaceを毎回走査するため、
         // どちらのWorkspaceを個別に指定する必要も無い）。
         || crossMonitorDropMoved
+        // `MoveCause.Unattributed`のドリフト補正（v2.70、上記`driftCorrected`）：`checkUnattributedDrift`が
+        // `Desired`を消しただけなので、ここで明示的に引き金にしないとReconcile自体が走らず、消した
+        // `Desired`の代わりが発行されない。
+        || driftCorrected
 
     let reconcileOneScreen (placementSt: PlacementState, effects, cmds) (screen: Screen) =
         let wsState = WorkspaceSet.stateOf screen.Workspace next.Workspaces

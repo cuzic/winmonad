@@ -281,7 +281,28 @@ type PlacementState =
       /// `reconcileOneScreen`がこの集合に含まれる窓をこのstepの対象（Alive）から外す。§4.4の
       /// Suspended（単一の状態ではなく各ドメインが自分の理由で持つ「配置対象から一時的に外す」条件の
       /// 和、architecture.md 976行目）のうち、このドメインが持つ理由。`onWindowVanished`で除く。
-      Dragging: Set<WindowId> }
+      Dragging: Set<WindowId>
+      /// `MoveCause.Unattributed`のドリフト検知が比べる基準（v2.70、Opus敵対的レビュー
+      /// `opus-review-unattributed-movecause.md` §B-1）。「今の意図について最後に受け入れた観測」——
+      /// `Desired`と比べてはいけない理由：`Mismatch → Reevaluate`（v2.42）後は`Desired`が目標のまま
+      /// 残るので、`Desired`と比べると再評価済みの窓と無限に戦い続ける（セル単位に丸める端末等）。
+      /// `checkPendingSatisfied`のSatisfiedで目標矩形を、`onPendingDeadlineTimerFired`のMismatch終端で
+      /// そのとき観測された矩形を書き込む。`dispatchPlacements`が新しい意図を出すときに消す
+      /// （新しい意図に対してはまだ何も受け入れていないため）。
+      Accepted: Map<WindowId, PixelRect>
+      /// `MoveCause.Unattributed`の振動検知（v2.70、architecture.md §7.3「振動検知」はPlacementの持ち物。
+      /// `Windows.WindowRecord.ManagementChangedAt`とは別目的なので混ぜない——Opusレビュー§Q2参照）。
+      /// 実際に補正（`Desired`の取消）を出した時刻のリスト（検知しても打ち止めで補正しなかった回数は
+      /// 数えない）。`RetryAttempts`と違い新しい意図が来てもリセットしない——「意図をまたいで外から
+      /// 戻された回数」を数えるのが目的で、Layoutが少しでも動くたびに数え直すと、戦い続けるアプリを
+      /// 永久に劣化させられなくなる。
+      DriftCorrections: Map<WindowId, int64 list> }
+
+/// `MoveCause.Unattributed`の振動の打ち止め閾値（v2.70。実機測定が無いため暫定値、Opusレビュー§Q2）。
+/// `unattributedWindowMs`は`limit × (pendingDeadlineMs + アプリの遅延)`より長くなければ、Pending満了を
+/// 待ってから動かし直すアプリを捕まえ損なう（Opusレビューの計算）。
+let unattributedCorrectionLimit = 3
+let unattributedWindowMs = 30_000L
 
 let initial: PlacementState =
     { Geometry = Map.empty
@@ -298,7 +319,9 @@ let initial: PlacementState =
       MinWidth = Map.empty
       DpiBehavior = Map.empty
       DpiCrossing = Map.empty
-      Dragging = Set.empty }
+      Dragging = Set.empty
+      Accepted = Map.empty
+      DriftCorrections = Map.empty }
 
 /// `WmState.step`が、Placement自身のReconcile以外の理由（Focus.SwitchSettleの再要求、
 /// `MoveFocusedToWorkspace`のRequestForeground等、v2.27）で新しいRequestIdが要るときに呼ぶ最小の窓口。
@@ -354,7 +377,10 @@ let private checkPendingSatisfied (now: int64) (w: WindowId) (state: PlacementSt
                 // 往復するだけ（例：MasterStackで窓数が変わるたびに同じ数種類の矩形を行き来する）の窓では
                 // 無限に積み重なり、それらの矩形が将来Mismatchの証拠として検出されなくなる既知のギャップ
                 // だった。
-                InFlightTargets = Map.remove w state.InFlightTargets },
+                InFlightTargets = Map.remove w state.InFlightTargets
+                // `Accepted`（v2.70、`MoveCause.Unattributed`のドリフト検知が比べる基準、型直前のコメント
+                // 参照）：この意図について実際に受け入れられた矩形を記録する。
+                Accepted = Map.add w rect state.Accepted },
             [ CancelTimer (TimerId.Placement (PendingDeadline rid)) ]
         | None -> state, []
 
@@ -509,6 +535,51 @@ let checkDpiCrossing (now: int64) (dpiOf: MonitorId -> int option) (w: WindowId)
             DpiBehavior = Map.add w { Value = RescalesItself; Confidence = Inferred evidence; LastRevisedAt = now } state.DpiBehavior }
     | _ -> state // まだ変化無し、またはこの窓は対象外
 
+/// `MoveCause.Unattributed`のドリフト検知（v2.70、§4.4 R3-4、Opus敵対的レビュー
+/// `opus-review-unattributed-movecause.md`で設計）。ラウンド1はクロスモニターのずれだけを対象にする
+/// （レビュー§Q1「範囲を絞る提案」）——同じモニター内のずれは最大化・最小化・セル単位の丸め等の
+/// 誤検知源が多く、§7.4自体が規則を持たない既知のギャップのため対象外のまま。
+///
+/// 検知の条件（全てAND）：
+/// 1. `screenPhaseIsStable`（抑止区間中は検知もカウントもしない、Opusレビュー§Q4-1「必須」）。
+/// 2. `isTiled w`（Floating/Excluded/UnplacedはDesiredが古いまま残っていても対象外、レビュー§B-3）。
+/// 3. `w`宛てのPendingが無い（`checkPendingSatisfied`の後に呼ぶので、同じstepでSatisfiedになった
+///    窓はこの時点で既にPendingが無い——かつ`Accepted`も同じstepで観測した値へ更新済みなので、
+///    観測=Acceptedとなり誤検知しない）。
+/// 4. `Dragging`に含まれない（ユーザーのドラッグ中は対象外、v2.65と同じ理由）。
+/// 5. `Accepted`に値がある（＝この窓についてこれまでに一度も「受け入れられた」という証拠が無ければ、
+///    比べる基準が無いので検知しない）。
+/// 6. 観測されたモニター（`Geometry.Monitor`）と`desiredMonitorOf w`が異なる。
+///
+/// 検知した場合でも、直近`unattributedWindowMs`以内の補正回数が`unattributedCorrectionLimit`に
+/// 達していれば打ち止めにする（レビュー§Q2「意図をまたいでリセットしない」）——補正もカウントも
+/// しない、`Desired`も`Accepted`もそのままにする（Windowsへの再分類・Floating化はラウンド2へ
+/// 持ち越す、レビュー§Q3/§Q5）。打ち止めでなければ`Desired`を消して`WmState.step`の`shouldReconcile`
+/// を真にする——Epoch/InFlight/Baseline/RetryAttempts/Pendingの既存の仕組みを`dispatchPlacements`の
+/// まま使い回せる（レビュー§Q1-4）。
+let checkUnattributedDrift
+    (now: int64)
+    (isTiled: WindowId -> bool)
+    (desiredMonitorOf: WindowId -> MonitorId option)
+    (screenPhaseIsStable: bool)
+    (w: WindowId)
+    (state: PlacementState)
+    : PlacementState * bool =
+    if not screenPhaseIsStable || not (isTiled w) || (state.Pending |> Map.exists (fun _ pr -> pr.Window = w)) || Set.contains w state.Dragging then
+        state, false
+    else
+        match Map.tryFind w state.Accepted, Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.Monitor), desiredMonitorOf w with
+        | Some _, Some observedMonitor, Some desiredMon when observedMonitor <> desiredMon ->
+            let recentCorrections = Map.tryFind w state.DriftCorrections |> Option.defaultValue [] |> List.filter (fun t -> now - t < unattributedWindowMs)
+            if List.length recentCorrections >= unattributedCorrectionLimit then
+                state, false // 打ち止め：補正しない、戦わない（レビュー§Q2「どちらの誤りもユーザーから見え、ToggleFloatingで取り消せる」）
+            else
+                { state with
+                    Desired = Map.remove w state.Desired
+                    DriftCorrections = Map.add w (now :: recentCorrections) state.DriftCorrections },
+                true
+        | _ -> state, false
+
 let onMinimizedStateChanged (now: int64) (w: WindowId) (obs: Observation<bool>) (state: PlacementState) : PlacementState =
     { state with Geometry = Map.add w (reviseMinimized now (Map.tryFind w state.Geometry |> Option.defaultValue geometryInitial) obs) state.Geometry }
 
@@ -593,7 +664,11 @@ let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: P
                         // `DpiCrossing`（v2.45）：ここから先、この窓の矩形変化はCore自身の`SetRect`で
                         // 説明できてしまうので、まだ決着していない2段目自己リサイズの観測機会があれば
                         // 帰属不能として諦める（`checkDpiCrossing`の型直前のコメント参照）。
-                        DpiCrossing = Map.remove p.Window st.DpiCrossing }
+                        DpiCrossing = Map.remove p.Window st.DpiCrossing
+                        // `Accepted`（v2.70、型直前のコメント参照）：新しい意図に対してはまだ何も
+                        // 受け入れていないので消す——古い意図の`Accepted`を新しい意図と比べてドリフト
+                        // 検知が誤発火することを防ぐ。
+                        Accepted = Map.remove p.Window st.Accepted }
                 st', effects @ [ SetRect (rid, p.Window, p.Target) ], cmds @ supersededCmds @ [ StartTimer (TimerId.Placement (PendingDeadline rid), pendingDeadlineMs) ])
         (state, [], [])
 
@@ -773,7 +848,12 @@ let onPendingDeadlineTimerFired
             { state with
                 Pending = Map.remove rid state.Pending
                 RetryAttempts = Map.remove pr.Window state.RetryAttempts
-                MinWidth = minWidth' },
+                MinWidth = minWidth'
+                // `Accepted`（v2.70、型直前のコメント参照）：Reevaluate後、観測された（Mismatchの）
+                // 矩形を「今の意図について受け入れた」ものとして記録する——`Desired`（要求した目標）
+                // ではなくこれを以後のドリフト検知の基準にすることで、Reevaluate済みの窓と無限に
+                // 戦わない（Opusレビュー§B-1）。
+                Accepted = Map.add pr.Window observed state.Accepted },
             [], []
         | None -> retryOrGiveUp now rid pr state
     | _ -> state, [], []
@@ -958,5 +1038,7 @@ let onWindowVanished (w: WindowId) (state: PlacementState) : PlacementState * Ti
         MinWidth = Map.remove w state.MinWidth
         DpiBehavior = Map.remove w state.DpiBehavior
         DpiCrossing = Map.remove w state.DpiCrossing
-        Dragging = Set.remove w state.Dragging },
+        Dragging = Set.remove w state.Dragging
+        Accepted = Map.remove w state.Accepted
+        DriftCorrections = Map.remove w state.DriftCorrections },
     integrityCancel @ pendingCancel @ pendingPresenceCancel
