@@ -808,7 +808,7 @@ let ``onMoveSizeStartedはDraggingへ加え、onMoveSizeEndedは外す`` () =
     Assert.False(Set.contains w afterEnd.Dragging)
 
 [<Fact>]
-let ``Dragging中の窓はPendingDeadline発火時にMismatch判定もRetryもせず、戦わずに終端する(v2.65、Opusレビューの条件5)`` () =
+let ``Dragging中の窓はPendingDeadline発火時にMismatch判定もRetryもせず、戦わずに終端する(v2.65、Opusレビューの条件6)`` () =
     let w = WindowId 1L
     let m = MonitorId 1L
     let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
@@ -824,7 +824,7 @@ let ``Dragging中の窓はPendingDeadline発火時にMismatch判定もRetryも�
     Assert.Empty(effects) // Retryしない
     Assert.Equal(None, Map.tryFind w afterDeadline.RetryAttempts)
     // ドラッグ中の観測はMinWidthの証拠にもしない(幅が広くても、ユーザー操作の結果であって
-    // アプリの最小幅制約の証拠ではない——条件5の除外そのもの)。
+    // アプリの最小幅制約の証拠ではない——条件6の除外そのもの)。
     Assert.Equal(None, Map.tryFind w afterDeadline.MinWidth)
 
 [<Fact>]
