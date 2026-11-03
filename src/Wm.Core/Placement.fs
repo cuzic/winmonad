@@ -564,21 +564,24 @@ let checkUnattributedDrift
     (screenPhaseIsStable: bool)
     (w: WindowId)
     (state: PlacementState)
-    : PlacementState * bool =
+    : PlacementState * bool * bool =
     if not screenPhaseIsStable || not (isTiled w) || (state.Pending |> Map.exists (fun _ pr -> pr.Window = w)) || Set.contains w state.Dragging then
-        state, false
+        state, false, false
     else
         match Map.tryFind w state.Accepted, Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.Monitor), desiredMonitorOf w with
         | Some _, Some observedMonitor, Some desiredMon when observedMonitor <> desiredMon ->
             let recentCorrections = Map.tryFind w state.DriftCorrections |> Option.defaultValue [] |> List.filter (fun t -> now - t < unattributedWindowMs)
             if List.length recentCorrections >= unattributedCorrectionLimit then
-                state, false // 打ち止め：補正しない、戦わない（レビュー§Q2「どちらの誤りもユーザーから見え、ToggleFloatingで取り消せる」）
+                // 打ち止め（v2.70）：補正しない、戦わない。v2.71で、打ち止め自体をFloatingへの劣化の
+                // 契機にした（`shouldDegrade = true`、Opusレビュー§Q3・§Q5「ラウンド2」）——
+                // `WmState.step`が`Windows.onOscillationDegraded`を呼ぶ。
+                state, false, true
             else
                 { state with
                     Desired = Map.remove w state.Desired
                     DriftCorrections = Map.add w (now :: recentCorrections) state.DriftCorrections },
-                true
-        | _ -> state, false
+                true, false
+        | _ -> state, false, false
 
 let onMinimizedStateChanged (now: int64) (w: WindowId) (obs: Observation<bool>) (state: PlacementState) : PlacementState =
     { state with Geometry = Map.add w (reviseMinimized now (Map.tryFind w state.Geometry |> Option.defaultValue geometryInitial) obs) state.Geometry }

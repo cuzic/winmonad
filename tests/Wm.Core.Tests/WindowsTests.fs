@@ -519,3 +519,87 @@ let ``reconsiderは「起こり得ない組合せ」(UserOverride=NoneなのにC
     match traces with
     | [ InconsistencySuspected (domain, _) ] -> Assert.Equal("Windows", domain)
     | other -> Assert.True(false, sprintf "expected exactly one InconsistencySuspected trace, got %A" other)
+
+// ===== MoveCause.Unattributedラウンド2：Floating劣化（§4.4 R3-4、v2.71、Opus敵対的レビュー
+// opus-review-unattributed-movecause.md §Q3） =====
+
+[<Fact>]
+let ``onOscillationDegradedはTiled窓をFloating・ByOscillationへ劣化させ、WindowClassifiedを出す`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "r" 10 AnyWindow Tiled ] }
+    let ctx = ctxWith policy 0L
+    let w = WindowId 1L
+    let registry1, _, _, _ = onWindowObserved ctx (visibleSnapshot w) initial
+    match (Map.find w registry1.Records).Classification with
+    | Classified (EffTiled, ByPolicy _) -> ()
+    | other -> Assert.True(false, sprintf "expected Tiled first, got %A" other)
+    let registry2, events = onOscillationDegraded w registry1
+    Assert.Equal<DomainEvent list>([ WindowClassified (w, EffFloating, None) ], events)
+    let record = Map.find w registry2.Records
+    match record.Classification with
+    | Classified (EffFloating, ByOscillation) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+    Assert.True(record.UserOverride.IsNone)
+
+[<Fact>]
+let ``onOscillationDegradedは、ByUserOverride(ユーザーが明示的にTiledへ指定した)窓も劣化させ、UserOverrideをNoneへ戻す(プロジェクトオーナー確認済み)`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "r" 10 AnyWindow Tiled ] }
+    let ctx = ctxWith policy 0L
+    let w = WindowId 1L
+    let registry1, _, _, _ = onWindowObserved ctx (visibleSnapshot w) initial
+    let registry2, _, _, _ = onUserCommand ctx (ToggleFloating w) registry1
+    let registry3, _, _, _ = onUserCommand ctx (ToggleFloating w) registry2 // Floating→Tiled、ByUserOverrideのまま
+    match (Map.find w registry3.Records).Classification with
+    | Classified (EffTiled, ByUserOverride) -> ()
+    | other -> Assert.True(false, sprintf "expected ByUserOverride Tiled, got %A" other)
+    let registry4, events = onOscillationDegraded w registry3
+    Assert.Equal<DomainEvent list>([ WindowClassified (w, EffFloating, None) ], events)
+    let record = Map.find w registry4.Records
+    match record.Classification with
+    | Classified (EffFloating, ByOscillation) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+    Assert.True(record.UserOverride.IsNone) // UserOverride=Some _ ⇔ Classified(_, ByUserOverride)の対応を保つ
+
+[<Fact>]
+let ``onOscillationDegradedは既にByOscillationの窓には何もしない(冪等)`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "r" 10 AnyWindow Tiled ] }
+    let ctx = ctxWith policy 0L
+    let w = WindowId 1L
+    let registry1, _, _, _ = onWindowObserved ctx (visibleSnapshot w) initial
+    let registry2, _ = onOscillationDegraded w registry1
+    let registry3, events = onOscillationDegraded w registry2
+    Assert.Empty(events)
+    Assert.Equal(registry2, registry3)
+
+[<Fact>]
+let ``onOscillationDegradedは管理下に無い窓には何もしない`` () =
+    let registry', events = onOscillationDegraded (WindowId 99L) initial
+    Assert.Equal<WindowRegistry>(initial, registry')
+    Assert.Empty(events)
+
+[<Fact>]
+let ``reconsiderはByOscillationになった窓を二度と再分類しない(固定、プロジェクトオーナー確認済み)`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "r" 10 AnyWindow Tiled ] }
+    let ctx = ctxWith policy 0L
+    let w = WindowId 1L
+    let registry1, _, _, _ = onWindowObserved ctx (visibleSnapshot w) initial
+    let registry2, _ = onOscillationDegraded w registry1
+    // 以後WindowObservedが来ても再分類しない(ByTimeoutの1回きりの再分類とは違い、再分類の機会自体を
+    // 一切与えない——劣化→戻る→戦う→劣化という分類の振動を防ぐ、Opusレビュー§Q3(a))。
+    let registry3, events3, _, _ = onWindowObserved ctx (visibleSnapshot w) registry2
+    Assert.Empty(events3)
+    match (Map.find w registry3.Records).Classification with
+    | Classified (EffFloating, ByOscillation) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+
+[<Fact>]
+let ``ClearUserOverrideはByOscillationの窓にも作用し、Policyの分類へ戻す(ユーザーの明示的な操作は常に優先される)`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "r" 10 AnyWindow Tiled ] }
+    let ctx = ctxWith policy 0L
+    let w = WindowId 1L
+    let registry1, _, _, _ = onWindowObserved ctx (visibleSnapshot w) initial
+    let registry2, _ = onOscillationDegraded w registry1
+    let registry3, events, _, _ = onUserCommand ctx (ClearUserOverride w) registry2
+    Assert.Equal<DomainEvent list>([ WindowClassified (w, EffTiled, Some (WorkspaceId 0)) ], events)
+    match (Map.find w registry3.Records).Classification with
+    | Classified (EffTiled, ByPolicy (Some (PolicyRuleId "r"))) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)

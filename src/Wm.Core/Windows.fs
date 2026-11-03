@@ -48,6 +48,17 @@ type ClassifiedBy =
     | ByPolicy of PolicyRuleId option
     | ByTimeout
     | ByUserOverride
+    /// `MoveCause.Unattributed`の振動検知が補正を打ち止めた後のFloating劣化（v2.71、§4.4 R3-4、
+    /// Opus敵対的レビュー`opus-review-unattributed-movecause.md`§Q3）。`ByUserOverride`を使わない
+    /// 理由：`UserOverride = Some _` ⇔ `Classified (_, ByUserOverride)`という不変条件
+    /// （v2.68で破れたらDecisionTraceに記録するようにした、まさにその対応）を自分から破ることになる
+    /// ため。永続化（所属ヒント、v2.64）経由でシステムの劣化が再起動後に「ユーザーが選んだ」として
+    /// 復元されてしまう問題もある。一度`ByOscillation`になった窓は、（Policyの再評価では）二度と
+    /// 元に戻らない——プロジェクトオーナー確認済み。`ByUserOverride`の窓（ユーザーが明示的にTiledへ
+    /// 指定した窓）がアプリと戦う場合も劣化させる（同じくオーナー確認済み。`onMovabilityBecameNotMovable`
+    /// のように劣化させない選択肢もあったが、「実際に動かせない」事実を優先する）——
+    /// `UserOverride`は`ByOscillation`へ遷移する際に`None`へ戻す（上記の不変条件を保つため）。
+    | ByOscillation
 
 type ClassificationState =
     | NotCandidate
@@ -293,6 +304,13 @@ let private reconsider
             | Classified (_, ByPolicy _) ->
                 // ByPolicyで確定済みの窓の増分再分類はこのラウンドでは対象外（ファイル冒頭コメント参照）。
                 record, [], [], []
+            | Classified (_, ByOscillation) ->
+                // `ByOscillation`（v2.71、型直前のコメント参照）は一度確定したら窓が消えるまで固定——
+                // Policyの再評価では二度と元に戻らない（プロジェクトオーナー確認済み）。`ByTimeout`の
+                // 1回きりの再分類とは違い、再分類の機会を一切与えない（ここで戻せるようにすると
+                // 「劣化→Tiledへ戻る→戦う→劣化」という分類自体の振動が新たに生まれる、Opusレビュー
+                // §Q3(a)）。
+                record, [], [], []
             | Classified (eff, ByTimeout) when not record.LateReclassifyUsed ->
                 match tryClassify ctx w identity inputs with
                 | Resolved (m', ruleId) ->
@@ -461,6 +479,24 @@ let onMovabilityBecameNotMovable (w: WindowId) (registry: WindowRegistry) : Wind
             let record' = { record with Classification = Classified (EffUnplaced, by) }
             { registry with Records = Map.add w record' registry.Records }, [ WindowUnmanaged w ]
         | _ -> registry, []
+
+/// `MoveCause.Unattributed`の振動検知が補正を打ち止めた後のFloating劣化（v2.71、§4.4 R3-4、
+/// `Placement.checkUnattributedDrift`が打ち止めを検知した窓について`WmState.step`が呼ぶ。
+/// `onMovabilityBecameNotMovable`と同じ「Placementの信号→WmStateが中継→Windowsの専用関数」という
+/// 経路、ADR-018）。`ByUserOverride`の窓（ユーザーが明示的にTiledへ指定した窓）も対象にする——
+/// 「実際に動かせない」という事実を、ユーザーの指定より優先する（プロジェクトオーナー確認済み、
+/// Opusレビュー§Q3(b)とは逆の判断）。`UserOverride`は必ず`None`へ戻す（`ClassifiedBy`の型直前の
+/// コメント参照、`UserOverride = Some _` ⇔ `Classified (_, ByUserOverride)`の不変条件を保つため）。
+/// 既に`ByOscillation`・管理下に無い窓には何もしない（冪等）。
+let onOscillationDegraded (w: WindowId) (registry: WindowRegistry) : WindowRegistry * DomainEvent list =
+    match Map.tryFind w registry.Records with
+    | None -> registry, []
+    | Some record ->
+        match record.Classification with
+        | Classified (_, ByOscillation) -> registry, [] // 既に劣化済み（冪等）
+        | _ ->
+            let record' = { record with Classification = Classified (EffFloating, ByOscillation); UserOverride = None }
+            { registry with Records = Map.add w record' registry.Records }, [ WindowClassified (w, EffFloating, None) ]
 
 /// 窓の消滅時、`Records`/`Identity`/`ClassInputs`を除く（§4.4「Windows.Recordsと各ドメインの信念は
 /// 窓が消滅した時点でのみ除去する」）。`WmState.vanishWindow`から呼ぶ。

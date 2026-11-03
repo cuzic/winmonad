@@ -667,12 +667,41 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             | NoMonitors -> None
             | Displays (current, visible) -> (current :: visible) |> List.tryFind (fun sc -> sc.Workspace = ws) |> Option.map (fun sc -> sc.Monitor.Id)
     let screenPhaseIsStable = match Topology.phase next.Topology with Stable -> true | _ -> false
-    let next, driftCorrected =
+    let next, driftCorrected, driftDegraded =
         match envelope.Input with
         | WindowObserved snapshot ->
-            let placement', corrected = Placement.checkUnattributedDrift now isTiled desiredMonitorOf screenPhaseIsStable snapshot.Id next.Placement
-            { next with Placement = placement' }, corrected
-        | _ -> next, false
+            let placement', corrected, shouldDegrade = Placement.checkUnattributedDrift now isTiled desiredMonitorOf screenPhaseIsStable snapshot.Id next.Placement
+            let next = { next with Placement = placement' }
+            // `MoveCause.Unattributed`の振動の打ち止めが実際にFloating劣化を要求した場合（v2.71、
+            // Opusレビュー§Q3・§Q5「ラウンド2」）：`Windows.onOscillationDegraded`へ中継する
+            // （`onMovabilityBecameNotMovable`と同じ「Placementの信号→WmStateが中継→Windowsの
+            // 専用関数」経路、ADR-018）。
+            let next =
+                if shouldDegrade then
+                    let windowsAfterOscillation, oscillationEvents = Windows.onOscillationDegraded snapshot.Id next.Windows
+                    { next with Windows = windowsAfterOscillation } |> fun s -> oscillationEvents |> List.fold applyWindowsEvent s
+                else
+                    next
+            next, corrected, shouldDegrade
+        | _ -> next, false, false
+
+    // Floating劣化（v2.71、上記`driftDegraded`）はWindows.Recordsの分類を変えるので、`reconcileOneScreen`
+    // が読む`managementByWindow`/`aliveWindows`（劣化前に組み立てた投影）をここで最新の状態へ作り直す
+    // ——作り直さないと、Layoutは（Workspace.Floatingが先に更新されているので）劣化後の窓を正しく
+    // 除外して計算するのに、`PlanValidator.checkNoMissingPlacement`は古い`managementByWindow`の
+    // `EffTiled`のまま見てしまい、「計画にあるべき窓が無い」という誤検知で`RejectWholePlan`になる
+    // （mutation testingで実際に踏んだ食い違い）。
+    let aliveWindows, managementByWindow =
+        if driftDegraded then
+            let aliveWindows' = next.Windows.Records |> Map.toSeq |> Seq.map fst |> Set.ofSeq
+            let managementByWindow' =
+                next.Windows.Records
+                |> Map.toSeq
+                |> Seq.choose (fun (w, r) -> match r.Classification with Classified (eff, _) -> Some (w, eff) | _ -> None)
+                |> Map.ofSeq
+            aliveWindows', managementByWindow'
+        else
+            aliveWindows, managementByWindow
 
     // 段⑦相当（Placement、Reconcile）：WindowClassified/WindowUnmanaged（windowsEvents）・WindowRemoved・
     // TopologySettled（v2.29。上で一括取り消したPendingの代わりを同じstepで発行する必要があるため）の
@@ -710,6 +739,10 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         // `Desired`を消しただけなので、ここで明示的に引き金にしないとReconcile自体が走らず、消した
         // `Desired`の代わりが発行されない。
         || driftCorrected
+        // Floating劣化（v2.71、上記`driftDegraded`）：`WindowClassified`は`windowsEvents`（段①⑤の
+        // Windows分、このstepのPlacement段よりも前に確定済み）には含まれないので、明示的にここで
+        // 引き金にする——劣化した窓を外した残りのTiled構成でLayoutを計算し直す必要がある。
+        || driftDegraded
 
     let reconcileOneScreen (placementSt: PlacementState, effects, cmds) (screen: Screen) =
         let wsState = WorkspaceSet.stateOf screen.Workspace next.Workspaces

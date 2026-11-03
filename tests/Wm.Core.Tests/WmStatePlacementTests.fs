@@ -1095,3 +1095,45 @@ let ``MoveSizeEndedを経由した(UserDragの)別モニターへの移動はUna
     Assert.Equal(Some visibleScreen.Workspace, WorkspaceSet.workspaceOf w afterDragEnd.Next.Workspaces)
     let effects = afterDragEnd.Effects |> List.map GatedEffect.effect
     Assert.DoesNotContain(effects, function SetRect (_, target, rect) -> target = w && rect = current.Monitor.WorkArea | _ -> false)
+
+[<Fact>]
+let ``繰り返しクロスモニターへ漂う窓は、補正の打ち止め後にFloating・ByOscillationへ劣化する(v2.71、Opusレビュー§Q3・§Q5「ラウンド2」)`` () =
+    // masterStackPolicyを使う：劣化によってTiledが1窓だけ残ったとき、Reconcileが実際に再計算して
+    // 残りの窓を全画面へ広げることまで確認する(劣化がshouldReconcileを引き金にすることのテスト、
+    // mutation testingで「driftDegradedをshouldReconcileへ足し忘れる」変更を検出するのに必要)。
+    let topology, current, visibleScreen = twoMonitorTopologyAndScreens ()
+    let seeded = { initial masterStackPolicy with Topology = topology }
+    let w1, w2 = WindowId 1L, WindowId 2L
+    let afterW1 = step masterStackPolicy seeded (mkEnvelope 1L (visibleWindowObserved w1))
+    let afterW2 = step masterStackPolicy afterW1.Next (mkEnvelope 2L (visibleWindowObserved w2))
+    // w1=master(半分)、w2=stack(半分、1窓なのでstackArea全体)。
+    let masterRect = { current.Monitor.WorkArea with Width = current.Monitor.WorkArea.Width / 2 }
+    let stackArea = { current.Monitor.WorkArea with X = masterRect.Width; Width = current.Monitor.WorkArea.Width - masterRect.Width }
+    Assert.Equal(Some masterRect, desiredRectOf afterW2.Next.Placement w1)
+    Assert.Equal(Some stackArea, desiredRectOf afterW2.Next.Placement w2)
+    let afterSatisfied0 = step masterStackPolicy afterW2.Next (mkEnvelope 3L (visibleWindowObservedAtRectAndMonitor w1 masterRect current.Monitor.Id 3L))
+
+    // unattributedCorrectionLimit(3)回、w1が漂う→補正→再び受け入れる、を繰り返す。
+    let drift (prev: StepResult) (seq: int64) : StepResult =
+        let afterDrifted = step masterStackPolicy prev.Next (mkEnvelope seq (visibleWindowObservedAtRectAndMonitor w1 visibleScreen.Monitor.WorkArea visibleScreen.Monitor.Id seq))
+        step masterStackPolicy afterDrifted.Next (mkEnvelope (seq + 1L) (visibleWindowObservedAtRectAndMonitor w1 masterRect current.Monitor.Id (seq + 1L)))
+    let afterSatisfied1 = drift afterSatisfied0 4L
+    let afterSatisfied2 = drift afterSatisfied1 6L
+    let afterSatisfied3 = drift afterSatisfied2 8L
+    // まだTiledのまま(3回目までは補正されるだけ)、w2は依然stackArea(w1がmasterのまま)。
+    match (Map.find w1 afterSatisfied3.Next.Windows.Records).Classification with
+    | Classified (EffTiled, _) -> ()
+    | other -> Assert.True(false, sprintf "expected still Tiled after 3 corrections, got %A" other)
+    Assert.Equal(Some stackArea, desiredRectOf afterSatisfied3.Next.Placement w2)
+
+    // 4回目の漂い：打ち止めに達し、補正ではなくFloating化が起きる。
+    let afterDegraded = step masterStackPolicy afterSatisfied3.Next (mkEnvelope 10L (visibleWindowObservedAtRectAndMonitor w1 visibleScreen.Monitor.WorkArea visibleScreen.Monitor.Id 10L))
+    match (Map.find w1 afterDegraded.Next.Windows.Records).Classification with
+    | Classified (EffFloating, ByOscillation) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+    // Floatingになった窓はWorkspaceのFloating集合に入る(所属Workspace自体は変わらない)。
+    Assert.Equal(Some current.Workspace, WorkspaceSet.workspaceOf w1 afterDegraded.Next.Workspaces)
+    Assert.True(Set.contains w1 (WorkspaceSet.stateOf current.Workspace afterDegraded.Next.Workspaces).Floating)
+    // w1が抜けたので、w2が唯一のTiled窓として全画面へ広がる——劣化が同じstepでshouldReconcileを
+    // 引き金にしていることの確認(引き金にし忘れると、w2はstackAreaのまま変化しない)。
+    Assert.Equal(Some current.Monitor.WorkArea, desiredRectOf afterDegraded.Next.Placement w2)
