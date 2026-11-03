@@ -160,6 +160,24 @@ let applyEffect
                                 VisibleFrameRect = Some { Value = Ok rect; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" } } ]
                     dispatchedSeq <- Some dispatchSeq
                     Ok ()
+                | MinimumWidth minWidthPx ->
+                    // 要求幅が`minWidthPx`未満なら、観測される幅はそこへ丸められる（§12.1
+                    // 「MinimumWidth(700)」、Phase 0スパイクS23で確認した「丸め済みの最終幅だけが
+                    // 1回のLOCATIONCHANGEで届く」挙動と整合——中間の未丸め矩形の観測は無い）。
+                    // このMismatch（要求r・観測o>r）が`Placement.reviseMinWidth`（v2.43）の証拠になる。
+                    let enforcedRect = if rect.Width < minWidthPx then { rect with Width = minWidthPx } else rect
+                    let dispatchSeq = world.NextSampleSequence
+                    let sampleSeq = dispatchSeq + 1L
+                    dispatchedWorld <-
+                        { world with
+                            Windows = Map.add w { vw with Rect = enforcedRect } world.Windows
+                            NextSampleSequence = sampleSeq + 1L }
+                    dispatchedEvents <-
+                        [ WindowObserved
+                            { emptySnapshot w with
+                                VisibleFrameRect = Some { Value = Ok enforcedRect; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" } } ]
+                    dispatchedSeq <- Some dispatchSeq
+                    Ok ()
             match executeEffectProtocol probe dispatch w with
             | Ok () -> dispatchedWorld, dispatchedEvents, [ rid, Ok (), dispatchedSeq ]
             | Error record -> world, [], [ rid, Error record, None ]

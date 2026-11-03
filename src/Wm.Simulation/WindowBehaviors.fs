@@ -12,9 +12,16 @@
 /// OS内部基準と一致、architecture.md 2069行目）：`now < startMs`は`Responsive`、
 /// `startMs <= now < startMs+5000`は`HungPending`（`dispatch`はまだ呼ばれる）、
 /// `now >= startMs+5000`は`HungConfirmed`（`dispatch`は呼ばれず即座に`TargetHung`相当の
-/// `NativeCallRecord`を返す）。`MinimumWidth`/`IgnoreMove`/`SelfRepositionAfterMs`/`DisappearOnMove`/
-/// `Compose`は依然対象外（`MinWidth`/`DpiBehavior`等、まだ`VirtualWorld`側に対応する信念更新の受け口が
-/// 無い——1ラウンドで実装するには判断点が多すぎる）。
+/// `NativeCallRecord`を返す）。
+/// ~~`MinimumWidth`は対象外（まだ`VirtualWorld`側に対応する信念更新の受け口が無い）~~：**v2.61で実装**。
+/// `Placement.reviseMinWidth`（v2.43）・`MinWidth`のPolicy/Layout消費側（v2.48）は既にテスト済みだが、
+/// この信念が実際に蓄積する根拠（`SetRect`で幅`r`を要求して幅`o > r`が観測された`Mismatch`）を
+/// 実際のパイプラインで生む経路が無かった——`HungAfterMs`がv2.59の`executeEffectProtocol`テストで
+/// 満たされたのと同じ構図（消費側は既にあるが、証拠を生む側のシミュレーションが無い）。要求幅が
+/// `minWidthPx`未満なら観測される幅を`minWidthPx`へ丸める（Windowsの`WM_GETMINMAXINFO`の
+/// `MinTrackSize`相当、Phase 0スパイクS23で実機確認した「丸め済みの最終幅だけが1回のLOCATIONCHANGEで
+/// 届く」挙動と整合）。`IgnoreMove`/`SelfRepositionAfterMs`/`DisappearOnMove`/`Compose`は依然対象外
+/// （1ラウンドで実装するには判断点が多すぎる——特に`Compose`は複数挙動の確率的な組合せ規則が要る）。
 module Wm.Simulation.WindowBehaviors
 
 type WindowBehavior =
@@ -24,3 +31,6 @@ type WindowBehavior =
     /// 時刻は`VirtualWorld`の他の時刻と同じ`int64`ミリ秒（架空のpseudocodeの`int`注記はここでは
     /// `VirtualWorld.ClockMs`/`now`との型の一貫性を優先して`int64`にする）。
     | HungAfterMs of startMs: int64
+    /// §12.1「`MinimumWidth(700)`」。要求された幅が`minWidthPx`未満なら、観測される幅は
+    /// `minWidthPx`に丸められる（高さ・X/Yは要求どおり）。物理ピクセル（`SetRect`の矩形と同じ単位）。
+    | MinimumWidth of minWidthPx: int

@@ -334,3 +334,48 @@ let ``HungAfterMsの窓もstartMs未満(Responsive)ならSetRectは普通に成�
     let workArea: PixelRect = (mkMonitor 0).WorkArea
     Assert.Equal(workArea, (Map.find w finalWorld.Windows).Rect)
     Assert.Empty(reducer.State.Placement.Pending)
+
+/// v2.61：`VirtualWorld.applyEffect`の`SetRect`が`MinimumWidth`挙動を実際に模すようになったので、
+/// 初めてここで検査する。`§12.1「MinimumWidth(700)」`が実際に要求幅を丸めることを直接確認する——
+/// Mismatch（要求r・観測o>r）を経由した`Placement.MinWidth`信念の蓄積自体はv2.43のテスト
+/// （`PlacementReconcileTests.fs`、hand-builtな観測）で既に検証済みなので、ここでは「証拠を生む側」
+/// （疑似OSが実際に丸めた幅を観測として返す）だけを検査する。
+
+[<Fact>]
+let ``MinimumWidthより狭いSetRect要求は、観測される幅がMinimumWidthへ丸められる(v2.61)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    settleTopology reducer [ mkMonitor 0 ]
+    let w = WindowId 1L
+    // MonocleはモニターのWorkArea幅(1920)をそのまま要求するので、MinimumWidthを2000にすれば
+    // 「要求(1920) < MinimumWidth(2000)」が必ず成り立つ。
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } (MinimumWidth 2000)
+    let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
+    let gated = discovery.Effects |> List.filter (fun g -> match GatedEffect.effect g with SetRect _ -> true | _ -> false) |> List.exactlyOne
+    match GatedEffect.effect gated with
+    | SetRect (_, _, requested) -> Assert.Equal(1920, requested.Width) // 要求自体はモニター幅そのまま
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+
+    let world', events, callReturns = applyEffect 1000L world gated
+    Assert.Equal(2000, (Map.find w world'.Windows).Rect.Width) // 疑似OS側が実際に丸めた
+    match events with
+    | [ WindowObserved snapshot ] ->
+        match snapshot.VisibleFrameRect with
+        | Some { Value = Ok observed } -> Assert.Equal(2000, observed.Width)
+        | other -> Assert.True(false, sprintf "unexpected: %A" other)
+    | other -> Assert.True(false, sprintf "unexpected events: %A" other)
+    match callReturns with
+    | [ (_, Ok (), Some _) ] -> ()
+    | other -> Assert.True(false, sprintf "unexpected callReturns: %A" other)
+
+[<Fact>]
+let ``MinimumWidth以上の要求幅はそのまま観測される(丸めは「未満の時だけ」)(v2.61)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    settleTopology reducer [ mkMonitor 0 ]
+    let w = WindowId 1L
+    // MinimumWidth(100) < WorkArea幅(1920)なので丸めは発生しない。
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } (MinimumWidth 100)
+    let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
+    let finalWorld = settle 1000L reducer world discovery.Effects
+    let workArea: PixelRect = (mkMonitor 0).WorkArea
+    Assert.Equal(workArea, (Map.find w finalWorld.Windows).Rect)
+    Assert.Empty(reducer.State.Placement.Pending) // 要求どおりに観測されたのでSatisfied
