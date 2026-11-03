@@ -205,6 +205,10 @@ module Native =
     [<DllImport("user32.dll")>]
     extern bool IsIconic(IntPtr hWnd)
 
+    // S6b: is the window currently maximized (WS_MAXIMIZE)?
+    [<DllImport("user32.dll")>]
+    extern bool IsZoomed(IntPtr hWnd)
+
     [<DllImport("user32.dll")>]
     extern bool IsWindow(IntPtr hWnd)
 
@@ -751,6 +755,94 @@ let spikeS2c_RestoreAsync (exePath: string) =
             )
     finally
         killProcessSafely p2
+
+// S6b (continuation of S6): docs/spikes.md's S6 entry left "maximized/Snap状態の窓での
+// RestoreBeforeMove検証は未実施" unverified. This spike actually tests the premise behind
+// GatedEffect.fs's NeedsRestore/RestoreBeforeMove machinery (fully typed since ADR-014/R2-4
+// but never populated on the producer side, WmState.fs:848 hardcodes NeedsRestore = Set.empty):
+// does SetWindowPos silently no-op (or otherwise misbehave) on a maximized window unless
+// ShowWindow(SW_RESTORE) is called first? Uses a plain (non-hung) window maximized by this
+// same process -- no child process needed, since the thing under test is SetWindowPos's own
+// behavior against WS_MAXIMIZE, not hang tolerance (S2c already covers RestoreBeforeMove's
+// ShowWindowAsync hang-safety against a hung maximized window).
+let spikeS6b_MaximizedRestoreBeforeMove () =
+    let SW_RESTORE = 9
+    let SWP_NOZORDER = 0x0004u
+    let SWP_ASYNCWINDOWPOS = 0x4000u
+
+    let rectOf (hwnd: IntPtr) : RECT =
+        let mutable r = RECT()
+        GetWindowRect(hwnd, &r) |> ignore
+        r
+
+    // Trial A: SetWindowPos directly on a maximized window, WITHOUT SW_RESTORE first.
+    use formA = new Form(Text = "S6bA", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(0, 0, 300, 200))
+    formA.Show()
+    pump 5
+    formA.WindowState <- FormWindowState.Maximized
+    pump 5
+    let zoomedBeforeA = IsZoomed(formA.Handle)
+    let rectBeforeA = rectOf formA.Handle
+    let targetA = (50, 50, 300, 200)
+    let (tx, ty, tw, th) = targetA
+    let apiOkA = SetWindowPos(formA.Handle, IntPtr.Zero, tx, ty, tw, th, SWP_NOZORDER ||| SWP_ASYNCWINDOWPOS)
+    pump 5
+    let zoomedAfterA = IsZoomed(formA.Handle)
+    let rectAfterA = rectOf formA.Handle
+    log (
+        sprintf
+            "- Trial A: SetWindowPos WITHOUT SW_RESTORE first, on a maximized window: API returned=%b. IsZoomed before=%b after=%b. Rect before=(%d,%d,%d,%d) after=(%d,%d,%d,%d), target=(%d,%d,%d,%d). Rect actually moved to target=%b"
+            apiOkA
+            zoomedBeforeA
+            zoomedAfterA
+            rectBeforeA.Left
+            rectBeforeA.Top
+            rectBeforeA.Right
+            rectBeforeA.Bottom
+            rectAfterA.Left
+            rectAfterA.Top
+            rectAfterA.Right
+            rectAfterA.Bottom
+            tx
+            ty
+            tw
+            th
+            (rectAfterA.Left = tx && rectAfterA.Top = ty && rectAfterA.Right - rectAfterA.Left = tw && rectAfterA.Bottom - rectAfterA.Top = th)
+    )
+
+    // Trial B: same shape, but ShowWindow(SW_RESTORE) is called first (the documented/specified
+    // RestoreBeforeMove approach, architecture.md 7.1 -- using the synchronous ShowWindow here
+    // since this is not a hung window; S2c already covers the Async-vs-hang distinction).
+    use formB = new Form(Text = "S6bB", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(0, 0, 300, 200))
+    formB.Show()
+    pump 5
+    formB.WindowState <- FormWindowState.Maximized
+    pump 5
+    let zoomedBeforeB = IsZoomed(formB.Handle)
+    ShowWindow(formB.Handle, SW_RESTORE) |> ignore
+    pump 5
+    let zoomedAfterRestore = IsZoomed(formB.Handle)
+    let targetB = (50, 50, 300, 200)
+    let (tx2, ty2, tw2, th2) = targetB
+    let apiOkB = SetWindowPos(formB.Handle, IntPtr.Zero, tx2, ty2, tw2, th2, SWP_NOZORDER ||| SWP_ASYNCWINDOWPOS)
+    pump 5
+    let rectAfterB = rectOf formB.Handle
+    log (
+        sprintf
+            "- Trial B: ShowWindow(SW_RESTORE) THEN SetWindowPos, on a maximized window: IsZoomed before=%b, after SW_RESTORE=%b. SetWindowPos API returned=%b. Rect after=(%d,%d,%d,%d), target=(%d,%d,%d,%d). Rect actually moved to target=%b"
+            zoomedBeforeB
+            zoomedAfterRestore
+            apiOkB
+            rectAfterB.Left
+            rectAfterB.Top
+            rectAfterB.Right
+            rectAfterB.Bottom
+            tx2
+            ty2
+            tw2
+            th2
+            (rectAfterB.Left = tx2 && rectAfterB.Top = ty2 && rectAfterB.Right - rectAfterB.Left = tw2 && rectAfterB.Bottom - rectAfterB.Top = th2)
+    )
 
 // S6: DeferWindowPos batch vs individual SetWindowPos+SWP_ASYNCWINDOWPOS, with one
 // window in the batch being hung, to see whether the hung window stalls the others.
@@ -2134,6 +2226,7 @@ let main argv =
         tryRun "S2b 事前確認のタイムアウト値の実測(ADR-014)" (fun () -> spikeS2b_PreCheckTiming exePath)
         tryRun "S2c RestoreBeforeMoveのShowWindowAsync化(ADR-014/R2-4)" (fun () -> spikeS2c_RestoreAsync exePath)
         tryRun "S6 バッチ適用(DeferWindowPos vs 個別SetWindowPos+ASYNC)" (fun () -> spikeS6_BatchApply exePath)
+        tryRun "S6b 最大化状態でのSetWindowPos(SW_RESTORE有無、RestoreBeforeMoveの前提検証)" spikeS6b_MaximizedRestoreBeforeMove
         tryRun "S7 プロセスの整合性レベル" spikeS7_IntegrityLevel
         tryRun "S10 Explorer再起動時のTaskbarCreated前提" spikeS10_ExplorerRestart
         tryRun "S4r 無関係な第三者プロセスからのフォーカス奪取(実デスクトップ限定)" spikeS4r_ThirdPartyFocus
