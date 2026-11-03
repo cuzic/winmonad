@@ -116,29 +116,53 @@ let applyEffect
             // 対象に届いていないので観測との照合対象にならない）。
             world, [], [ rid, Error { Api = "SetWindowPos"; Space = Win32LastError; Code = 1400; ElapsedUs = 0L }, None ]
         | Some vw ->
-            match vw.Behavior with
-            | Immediate ->
-                let dispatchSeq = world.NextSampleSequence
-                let sampleSeq = dispatchSeq + 1L
-                let world' =
-                    { world with
-                        Windows = Map.add w { vw with Rect = rect } world.Windows
-                        NextSampleSequence = sampleSeq + 1L }
-                let observed =
-                    WindowObserved
-                        { emptySnapshot w with
-                            VisibleFrameRect = Some { Value = Ok rect; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" } }
-                world', [ observed ], [ rid, Ok (), Some dispatchSeq ]
-            | DelayedByMs delayMs ->
-                // 呼び出し自体は即座に成功する（SetWindowPosはOSに受理された時点で返る）。要求どおりの
-                // 矩形の観測だけが`FireAtMs`まで遅れる（`advanceClock`参照）。
-                let dispatchSeq = world.NextSampleSequence
-                let world' =
-                    { world with
-                        Windows = Map.add w { vw with Rect = rect } world.Windows
-                        NextSampleSequence = dispatchSeq + 1L
-                        Scheduled = { FireAtMs = now + delayMs; Window = w; Rect = rect } :: world.Scheduled }
-                world', [], [ rid, Ok (), Some dispatchSeq ]
+            // §7.1「事前確認→ASYNC呼出」をShellと共有する`executeEffectProtocol`（v2.59でテスト済み）
+            // を通す（v2.60）。`probe`は`HungAfterMs`挙動だけを実際に判定し（§12.1：`startMs`以降は
+            // `HungPending`、`start+5000ms`以降は`HungConfirmed`）、他の挙動は常に`Responsive`
+            // （事前確認では引っかからない）。`dispatch`は既存の`Immediate`/`DelayedByMs`の適用ロジック
+            // をそのまま持つ——`HungAfterMs`はハングが確定するまでの間（Responsive/HungPending）は
+            // `Immediate`と同じ即座反映で模す（`executeEffectProtocol`は`HungPending`でも`dispatch`を
+            // 呼ぶ、§7.1「判定未確定の間は呼出自体を止めない」）。`dispatch`自身は`Result`しか返せない
+            // ので、更新後の`world`/観測/`dispatchSeq`はこの関数のローカルな可変変数で持ち出す
+            // （呼び出し元には見えない、この関数内に閉じた実装都合）。
+            let probe (_: WindowId) : ProbeOutcome =
+                match vw.Behavior with
+                | HungAfterMs startMs when now >= startMs + 5000L -> HungConfirmed
+                | HungAfterMs startMs when now >= startMs -> HungPending (int (now - startMs))
+                | _ -> Responsive
+            let mutable dispatchedWorld = world
+            let mutable dispatchedEvents: InputEvent list = []
+            let mutable dispatchedSeq: int64 option = None
+            let dispatch () : Result<unit, NativeCallRecord> =
+                match vw.Behavior with
+                | DelayedByMs delayMs ->
+                    // 呼び出し自体は即座に成功する（SetWindowPosはOSに受理された時点で返る）。要求
+                    // どおりの矩形の観測だけが`FireAtMs`まで遅れる（`advanceClock`参照）。
+                    let dispatchSeq = world.NextSampleSequence
+                    dispatchedWorld <-
+                        { world with
+                            Windows = Map.add w { vw with Rect = rect } world.Windows
+                            NextSampleSequence = dispatchSeq + 1L
+                            Scheduled = { FireAtMs = now + delayMs; Window = w; Rect = rect } :: world.Scheduled }
+                    dispatchedSeq <- Some dispatchSeq
+                    Ok ()
+                | Immediate
+                | HungAfterMs _ ->
+                    let dispatchSeq = world.NextSampleSequence
+                    let sampleSeq = dispatchSeq + 1L
+                    dispatchedWorld <-
+                        { world with
+                            Windows = Map.add w { vw with Rect = rect } world.Windows
+                            NextSampleSequence = sampleSeq + 1L }
+                    dispatchedEvents <-
+                        [ WindowObserved
+                            { emptySnapshot w with
+                                VisibleFrameRect = Some { Value = Ok rect; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" } } ]
+                    dispatchedSeq <- Some dispatchSeq
+                    Ok ()
+            match executeEffectProtocol probe dispatch w with
+            | Ok () -> dispatchedWorld, dispatchedEvents, [ rid, Ok (), dispatchedSeq ]
+            | Error record -> world, [], [ rid, Error record, None ]
     | SetPresence (rid, w, shown) ->
         match Map.tryFind w world.Windows with
         | None -> world, [], [ rid, Error { Api = "ShowWindow"; Space = Win32LastError; Code = 1400; ElapsedUs = 0L }, None ]

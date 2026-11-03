@@ -266,3 +266,71 @@ let ``2つ目の窓が現れても、両方がMonocleで全画面に配置され
     Assert.Equal(workArea, (Map.find w1 finalWorld.Windows).Rect)
     Assert.Equal(workArea, (Map.find w2 finalWorld.Windows).Rect)
     Assert.Empty(reducer.State.Placement.Pending)
+
+/// v2.60：`VirtualWorld.applyEffect`の`SetRect`が`executeEffectProtocol`（v2.59でテスト済み）を実際に
+/// 通るようになったので、`HungAfterMs`挙動を初めてここで検査する。
+
+[<Fact>]
+let ``HungAfterMsの窓はstartMs+5000ms以降、SetRectがHungConfirmedとして即座に失敗しTargetHungになる(v2.60)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    settleTopology reducer [ mkMonitor 0 ]
+    let w = WindowId 1L
+    // startMs=0なので、now>=5000なら常にHungConfirmed。
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } (HungAfterMs 0L)
+    let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
+    let setRectEffects = discovery.Effects |> List.filter (fun g -> match GatedEffect.effect g with SetRect _ -> true | _ -> false)
+    let gated = List.exactlyOne setRectEffects
+
+    // 発行自体はnow=1000だが、hangが確定しているnow=6000の時点でEffect適用スレッドがこれを処理した、
+    // という想定で`applyEffect`を直接呼ぶ(`settle`経由だと`now`は発行と同じ値に固定されてしまうため)。
+    let world', events, callReturns = applyEffect 6000L world gated
+    Assert.Empty(events) // dispatchは呼ばれていないので観測も無い
+    Assert.Equal<Map<WindowId, VirtualWindow>>(world.Windows, world'.Windows) // 矩形は変わっていない
+
+    let rid, errorRecord =
+        match callReturns with
+        | [ (rid, Error record, dispatchSeq) ] ->
+            Assert.Equal("SendMessageTimeout", record.Api)
+            Assert.Equal(1460, record.Code)
+            Assert.Equal(None, dispatchSeq)
+            Assert.Equal(Wm.Contracts.ErrorTypes.TargetHung, Wm.Contracts.ErrorTypes.classify record)
+            rid, record
+        | other -> failwithf "unexpected callReturns: %A" other
+
+    // このEffectCallReturnedを実際にCoreへ戻すと、Health.Responsivenessが確定でHungになる。
+    reducer.Submit 6000L "virtual-world" (EffectCallReturned (rid, Error errorRecord, None)) |> ignore
+    match Map.tryFind w reducer.State.Health.Responsiveness with
+    | Some { Value = Hung; Confidence = Confirmed } -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+
+[<Fact>]
+let ``HungAfterMsの窓もstartMs+5000ms未満(HungPending)ならSetRectは普通に成功する(v2.60)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    settleTopology reducer [ mkMonitor 0 ]
+    let w = WindowId 1L
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } (HungAfterMs 1000L)
+    let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
+    let gated = discovery.Effects |> List.filter (fun g -> match GatedEffect.effect g with SetRect _ -> true | _ -> false) |> List.exactlyOne
+
+    // now=2000：startMs(1000) <= now < startMs+5000(6000) なのでHungPending——判定未確定の間は
+    // dispatch自体は止めない(executeEffectProtocolのHungPending分岐、v2.59で確認済み)ので成功する。
+    let world', events, callReturns = applyEffect 2000L world gated
+    Assert.NotEmpty(events)
+    let workArea: PixelRect = (mkMonitor 0).WorkArea
+    Assert.Equal(workArea, (Map.find w world'.Windows).Rect)
+    match callReturns with
+    | [ (_, Ok (), Some _) ] -> ()
+    | other -> Assert.True(false, sprintf "unexpected callReturns: %A" other)
+
+[<Fact>]
+let ``HungAfterMsの窓もstartMs未満(Responsive)ならSetRectは普通に成功する(v2.60)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    settleTopology reducer [ mkMonitor 0 ]
+    let w = WindowId 1L
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } (HungAfterMs 5000L)
+    let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
+    let gated = discovery.Effects |> List.filter (fun g -> match GatedEffect.effect g with SetRect _ -> true | _ -> false) |> List.exactlyOne
+    let finalWorld = settle 1000L reducer world discovery.Effects
+    let workArea: PixelRect = (mkMonitor 0).WorkArea
+    Assert.Equal(workArea, (Map.find w finalWorld.Windows).Rect)
+    Assert.Empty(reducer.State.Placement.Pending)
