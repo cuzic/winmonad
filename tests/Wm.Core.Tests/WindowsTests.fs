@@ -53,7 +53,8 @@ let private ctxWith (policy: PolicyIR) (now: int64) : ClassificationCtx =
       ActiveWorkspace = Some (WorkspaceId 0)
       ForegroundWindow = None
       ClassificationTimeoutMs = 1_000L
-      Movability = Map.empty }
+      Movability = Map.empty
+      MinWidth = Map.empty }
 
 let private identityInit: IdentityBeliefs =
     { Exe = Unformed []; HostExe = Unformed []; Aumid = Unformed []; CoreWindowExe = Unformed []; Process = Unformed [] }
@@ -154,6 +155,47 @@ let ``Processが初めて観測される(Unformedから)場合はHWND再利用�
     let ctx = ctxWith policy 0L
     let _, events, _ = onWindowObserved ctx (withProcess (WindowId 1L) 1L 100) initial
     Assert.DoesNotContain(WindowVanishedByReuse (WindowId 1L), events)
+
+// ===== classificationView / ctx.MinWidth（v2.48） =====
+
+[<Fact>]
+let ``classificationViewはctx.MinWidthに信念があればBelievedとして渡す`` () =
+    let w = WindowId 1L
+    let belief: Belief<int> = { Value = 500; Confidence = Inferred [ Sample 1L ]; LastRevisedAt = 10L }
+    let ctx = { ctxWith basePolicy 0L with MinWidth = Map.ofList [ w, belief ] }
+    let view = classificationView ctx w identityInit (visibleSnapshot w |> fun s -> reviseClassInputsFromSnapshot 0L classInputsWithVisible s)
+    Assert.Equal(Believed belief, view.MinWidthDip)
+
+[<Fact>]
+let ``classificationViewはctx.MinWidthに信念が無ければUnformedを渡す`` () =
+    let w = WindowId 1L
+    let ctx = ctxWith basePolicy 0L
+    let view = classificationView ctx w identityInit (visibleSnapshot w |> fun s -> reviseClassInputsFromSnapshot 0L classInputsWithVisible s)
+    Assert.True(match view.MinWidthDip with Unformed [ UnknownMinSize w' ] -> w' = w | _ -> false)
+
+[<Fact>]
+let ``MinWidthAtLeastを使うルールは、ctx.MinWidthに十分な信念があれば実際にそのルールへ一致する(v2.48)`` () =
+    let w = WindowId 1L
+    let policy = { basePolicy with WindowRules = [ windowRule "wide-floats" 10 (MinWidthAtLeast 400) Floating ] }
+    let ctx = { ctxWith policy 0L with MinWidth = Map.ofList [ w, { Value = 500; Confidence = Inferred [ Sample 1L ]; LastRevisedAt = 0L } ] }
+    let registry', events, _ = onWindowObserved ctx (visibleSnapshot w) initial
+    match (Map.find w registry'.Records).Classification with
+    | Classified (EffFloating, ByPolicy (Some (PolicyRuleId "wide-floats"))) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+    Assert.Equal<DomainEvent list>([ WindowClassified (w, EffFloating, Some (WorkspaceId 0)) ], events)
+
+[<Fact>]
+let ``MinWidthAtLeastを使うルールは、ctx.MinWidthに信念が無ければUnknownのままAwaitingEvidenceになる(v2.48)`` () =
+    // §5.4のUnknown処理：最優先ルールがUnknownな間は、より低優先のAnyWindowへフォールバックせず
+    // 証拠を待つ（期限超過後にByTimeoutへ解決する既存の経路、ここでは「即座にwide-floatsへ誤って
+    // 一致しない」ことだけを検査する）。
+    let w = WindowId 1L
+    let policy = { basePolicy with WindowRules = [ windowRule "wide-floats" 10 (MinWidthAtLeast 400) Floating; windowRule "fallback" 0 AnyWindow Tiled ] }
+    let ctx = ctxWith policy 0L
+    let registry', _, _ = onWindowObserved ctx (visibleSnapshot w) initial
+    match (Map.find w registry'.Records).Classification with
+    | AwaitingEvidence _ -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
 
 // ===== onWindowObserved / 分類 =====
 

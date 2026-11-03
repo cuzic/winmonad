@@ -126,10 +126,13 @@
 ///   `Mismatch`（`observed.Width > TargetRect.Width`）を証拠に、観測時の窓のモニターDPIでDIPへ
 ///   正規化した値を`Inferred`の最小幅とする。`DpiBehavior = RescalesItself`の2段目リサイズ待ちを
 ///   除外する規則（§4.5）はv2.45で`onPendingDeadlineTimerFired`に結線済み（`isMidDpiTransition`、
-///   `reviseMinWidth`の型直前のコメント参照）。信念自体は`MinWidth`を読む`Policy`述語
-///   （`MinWidthAtLeast`、§5.4）やLayoutの`LayoutWindow.MinWidthDip`へまだ結線していない——値を
-///   蓄積するところまでがこのラウンドの範囲で、実際に配置・分類へ反映する消費側は専用のラウンドへ
-///   持ち越す（信念が無いと配置を変えようにも読む側が無いため、まずここから）。
+///   `reviseMinWidth`の型直前のコメント参照）。~~信念自体は`MinWidth`を読む`Policy`述語
+///   （`MinWidthAtLeast`、§5.4）やLayoutの`LayoutWindow.MinWidthDip`へまだ結線していない~~：**v2.48で
+///   両方の射影を配線した**（`Windows.ClassificationCtx.MinWidth`/`classificationView`、`WmState.
+///   reconcileOneScreen`のLayoutContext.TiledWindows構築）。ただし`LayoutFunction`実装
+///   （MasterStack/Monocle）側が`MinWidthDip`を実際に読んで強制する処理（§6.2「推定最小サイズは
+///   ソフト制約、満たせない場合は調整・Floating・Suspended等へ劣化させる」）は、具体的な劣化手順が
+///   本書に数値・アルゴリズムとして無いため依然未実装のまま——専用のラウンドへ持ち越す。
 /// - ~~**`DpiBehavior`（Accumulating規則）**~~：v2.44で発見時の申告による初期値、v2.45で2段目の
 ///   自己リサイズ検出（`checkDpiCrossing`、型直前のコメント参照）、同じラウンドで`MinWidth`側の
 ///   2段目待ち除外（上記）も結線した。CIスパイクS22（docs/spikes.md）で`SetWindowPos`から

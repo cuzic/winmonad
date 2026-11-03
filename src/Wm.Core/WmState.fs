@@ -170,7 +170,8 @@ let private classificationCtx (runtimePolicy: RuntimePolicy) (now: int64) (state
       ActiveWorkspace = activeWorkspace state
       ForegroundWindow = LatestWins.value state.Focus.Foreground |> Option.flatten
       ClassificationTimeoutMs = runtimePolicy.ClassificationTimeoutMs
-      Movability = state.Placement.Movability }
+      Movability = state.Placement.Movability
+      MinWidth = state.Placement.MinWidth }
 
 /// Windowsが出した`WindowClassified`/`WindowUnmanaged`をWorkspaces/Focusへ反映する（§7.1段⑤→Workspaces）。
 /// `WindowClassified`の`home`が`None`（「新しい好みは無い」、Windows.fsの`resolveHome`参照）なら、
@@ -648,7 +649,12 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         let ctx: LayoutContext =
             { WorkArea = screen.Monitor.WorkArea
               Dpi = screen.Monitor.Dpi
-              TiledWindows = tiledIds |> List.map (fun w -> { Id = w; MinWidthDip = None })
+              // v2.48：Placement.MinWidthの実際の信念を渡すようになった（それまでは決め打ちの`None`で、
+              // LayoutFunction実装（MasterStack/Monocle）がそもそも読んでいないので観測可能な挙動は
+              // 変わらない——§6.2が述べる「推定最小サイズをソフト制約として扱い、満たせない場合は
+              // 調整・Floating・Suspended等へ劣化させる」という実際の強制ロジックは、具体的な劣化方法が
+              // 本書に数値・手順として無いため依然未実装のまま、専用のラウンドへ持ち越す）。
+              TiledWindows = tiledIds |> List.map (fun w -> { Id = w; MinWidthDip = Map.tryFind w placementSt.MinWidth })
               Focused = focusedTiled }
         let monitorWidthDip = screen.Monitor.WorkArea.Width * 96 / screen.Monitor.Dpi
         // §4.4「ChangeLayoutの記録」（v2.37）：`LayoutOverride`が明示的に設定されていればそれを使い、

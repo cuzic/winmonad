@@ -97,6 +97,12 @@ type ClassificationCtx = {
     /// `WmState.step`がstep開始時点のPlacement状態からその場で渡す（v2.23追加、Core.Windowsの
     /// 次ラウンドでMovabilityを実際に読むまでは常に空だった既知のギャップを塞ぐ）。
     Movability: Map<WindowId, Belief<Movability>>
+    /// Placement `MinWidth`（DIP、Accumulating）の読み取り専用の写し（§4.5「Policyの評価とLayoutが
+    /// 読む『ビュー』」）。`Movability`と同じ理由・同じ仕組みで`WmState.step`がその場で渡す
+    /// （v2.48追加。`reviseMinWidth`はv2.43から存在していたが、`classificationView`は長らく
+    /// `Unformed`を返す決め打ちのままだった——`Policy.MinWidthAtLeast`述語が実際には一度も
+    /// 機能していなかった既知のギャップを塞ぐ）。
+    MinWidth: Map<WindowId, Belief<int>>
 }
 
 // ===== 信念の修正（§4.5） =====
@@ -183,15 +189,23 @@ let private movabilityBeliefOf (ctx: ClassificationCtx) (w: WindowId) : Belief<M
 
 let private movabilityOf (ctx: ClassificationCtx) (w: WindowId) : Movability = (movabilityBeliefOf ctx w).Value
 
+/// `ctx.MinWidth`に無ければ証拠が無い（§4.5「`Map`に無いことを『まだ証拠が無い』の意味に使う」、
+/// R6-12）ので`Unformed [UnknownMinSize w]`を返す（v2.48）。
+let private minWidthSlotOf (ctx: ClassificationCtx) (w: WindowId) : BeliefSlot<int> =
+    match Map.tryFind w ctx.MinWidth with
+    | Some b -> Believed b
+    | None -> Unformed [ UnknownMinSize w ]
+
 /// Policyの述語が読む信念だけを集めた最小限の投影（§4.5「Policyの評価とLayoutが読むビュー」、
-/// PolicyEvaluator.fsのドキュメンテーションコメント参照）。`MinWidthDip`はPlacementの信念だが、
-/// 収集はできてもまだ蓄積する修正関数が無いため、既定どおりUnknownを返す（Placement.fsのファイル
-/// 冒頭コメント参照）。`Movability`はv2.23で`ctx.Movability`から実際の値を読むようになった。
+/// PolicyEvaluator.fsのドキュメンテーションコメント参照）。`Movability`はv2.23で`ctx.Movability`から
+/// 実際の値を読むようになり、`MinWidthDip`もv2.48で`ctx.MinWidth`から実際の値を読むようになった
+/// （`Placement.reviseMinWidth`自体はv2.43から存在していたが、このビューは長らく`Unformed`を
+/// 返す決め打ちのままで、`Policy.MinWidthAtLeast`述語が実際には一度も機能していなかった）。
 let classificationView (ctx: ClassificationCtx) (w: WindowId) (identity: IdentityBeliefs) (inputs: ClassInputBeliefs) : ClassificationView =
     { Identity = identity
       IsDialog = inputs.IsDialog.Slot
       TitleMatches = inputs.TitleMatches.Slot
-      MinWidthDip = Unformed [ UnknownMinSize w ]
+      MinWidthDip = minWidthSlotOf ctx w
       Movability = Believed (movabilityBeliefOf ctx w) }
 
 let private tryClassify (ctx: ClassificationCtx) (w: WindowId) (identity: IdentityBeliefs) (inputs: ClassInputBeliefs) : ClassificationResult =

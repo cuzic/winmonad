@@ -16,6 +16,7 @@ open Wm.Core.Workspaces
 open Wm.Core.Windows
 open Wm.Core.Placement
 open Wm.Core.WmState
+open Wm.Layouts.LayoutRegistry
 
 let private mkEnvelope (sequence: int64) (input: InputEvent) : EventEnvelope<InputEvent> =
     { Sequence = sequence; MonotonicTime = sequence; Source = "test"; SessionId = "test-session"; Input = input }
@@ -138,6 +139,26 @@ let ``EffectCallReturnedのDenied OtherDenialは、同じstepでMovability修正
     let effects = afterSecondWindow.Effects |> List.map GatedEffect.effect
     let setRectsForW = effects |> List.choose (function SetRect (_, target, _) when target = w -> Some target | _ -> None)
     Assert.Empty(setRectsForW)
+
+[<Fact>]
+let ``Placement.MinWidthの信念は段⑦のLayoutContext.TiledWindowsへ実際に渡る(v2.48)`` () =
+    let captured = ref Option<LayoutContext>.None
+    let capturingMonocle: LayoutImplementation =
+        { Id = LayoutId "monocle"
+          ApiVersion = 1
+          ImplementationDigest = "test-capture"
+          Calculate = fun args ctx -> captured.Value <- Some ctx; (Wm.Layouts.Monocle.implementation "builtin").Calculate args ctx }
+    let rp = { RuntimePolicy.defaults with LayoutRegistry = Registry.register capturingMonocle RuntimePolicy.defaults.LayoutRegistry }
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0 ]
+    let belief: Belief<int> = { Value = 500; Confidence = Inferred [ Sample 1L ]; LastRevisedAt = 0L }
+    let seeded = { initial rp with Topology = topology; Placement = { (initial rp).Placement with MinWidth = Map.ofList [ WindowId 1L, belief ] } }
+    step rp seeded (mkEnvelope 1L (visibleWindowObserved (WindowId 1L))) |> ignore
+    match captured.Value with
+    | Some ctx ->
+        match ctx.TiledWindows |> List.tryFind (fun tw -> tw.Id = WindowId 1L) with
+        | Some tw -> Assert.Equal(Some belief, tw.MinWidthDip)
+        | None -> Assert.True(false, "window not found in TiledWindows")
+    | None -> Assert.True(false, "layout implementation was never invoked")
 
 [<Fact>]
 let ``2台のモニターそれぞれにWorkspaceが表示されていると、Reconcileはアクティブでない方の窓も配置する`` () =

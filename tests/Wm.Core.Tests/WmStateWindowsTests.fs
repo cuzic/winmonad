@@ -4,6 +4,7 @@ module Wm.Core.Tests.WmStateWindowsTests
 
 open Xunit
 open Wm.Contracts.Identifiers
+open Wm.Contracts.Beliefs
 open Wm.Contracts.Observation
 open Wm.Contracts.SharedVocabulary
 open Wm.Contracts.Timers
@@ -104,6 +105,17 @@ let ``同じProcessが繰り返し観測されてもHWND再利用とは判定さ
     Assert.True(Map.containsKey (WindowId 1L) result.Next.Windows.Records)
     Assert.Equal(Some (WorkspaceId 0), WorkspaceSet.workspaceOf (WindowId 1L) result.Next.Workspaces)
     Assert.DoesNotContain(ForgetWindow (WindowId 1L), result.Effects |> List.map GatedEffect.effect)
+
+[<Fact>]
+let ``Placement.MinWidthの信念は段⑤のClassificationViewへ実際に渡り、MinWidthAtLeastルールが機能する(v2.48)`` () =
+    let widePolicy = { policy with WindowRules = [ { Id = PolicyRuleId "wide-floats"; Priority = 10; When = MinWidthAtLeast 400; Apply = Floating } ] }
+    let rp = { runtimePolicy with Policy = widePolicy; PatternSet = Wm.Policy.PolicyEvaluator.buildTitlePatternSet widePolicy }
+    let state = seedState ()
+    let seeded = { state with Placement = { state.Placement with MinWidth = Map.ofList [ WindowId 1L, { Value = 500; Confidence = Inferred [ Sample 1L ]; LastRevisedAt = 0L } ] } }
+    let result = step rp seeded (mkEnvelope 1L (visibleWindowObserved (WindowId 1L)))
+    match (Map.find (WindowId 1L) result.Next.Windows.Records).Classification with
+    | Classified (EffFloating, ByPolicy (Some (PolicyRuleId "wide-floats"))) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
 
 [<Fact>]
 let ``SetManagement Excludedは同じstepでWorkspacesから除くが、Windows.Recordsの信念は保持する(管理外化)`` () =
