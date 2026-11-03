@@ -58,6 +58,13 @@ let private managementOf (raw: int) : Management =
 /// kind mod 6：0=WindowObserved(可視)、1=WindowObserved(不可視→候補条件を外れる)、2=VisibilityChanged、
 /// 3=CloakChanged、4=SetManagement、5=ClearUserOverride。discoveredになるまで(4)(5)はCore側で
 /// 無視される（`onUserCommand`の`Map.containsKey`ガード）ので、モデル側も同じガードを再現する。
+/// 注意：`Windows.withRecord`は`Records`に無ければ`WindowRecord.initial`を既定値として使い、その場で
+/// `Records`へ書き込む（`onWindowObserved`だけでなく`onVisibilityChanged`/`onCloakChanged`が内部で
+/// 呼ぶ`withBeliefUpdate`も同じ経路を通る）——つまり`VisibilityChanged`/`CloakChanged`も`Records`への
+/// エントリを作り、`discovered`を真にする。最初はこれを見落とし（kind 2/3では`discovered`を素通り
+/// させるだけにしていた）、`WindowObserved`無しで`VisibilityChanged`→`SetManagement`という順の操作列
+/// だけで実際に性質が破れる反例が稀に出てからこの誤りに気付いた（FsCheckのデフォルトseedでは
+/// 高確率で素通りし、全体テストスイートを何度か回すまで再現しなかった）。
 let private applyOp (idx: int) (discovered: bool, expected: Management option) (state: WmState) (kind: int, raw: int) : WmState * (bool * Management option) =
     let sequence = int64 (idx + 1)
     match (abs kind) % 6 with
@@ -65,11 +72,11 @@ let private applyOp (idx: int) (discovered: bool, expected: Management option) (
     | 1 -> (step rp state (mkEnvelope sequence (windowObserved sequence false))).Next, (true, expected)
     | 2 ->
         let obs: Observation<bool> = { Value = Ok (abs raw % 2 = 0); SampleSequence = sequence; MonotonicTime = sequence; Source = "test" }
-        (step rp state (mkEnvelope sequence (VisibilityChanged (w, obs)))).Next, (discovered, expected)
+        (step rp state (mkEnvelope sequence (VisibilityChanged (w, obs)))).Next, (true, expected)
     | 3 ->
         let cloak: CloakState = { App = abs raw % 2 = 0; Shell = false; Inherited = false }
         let obs: Observation<CloakState> = { Value = Ok cloak; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" }
-        (step rp state (mkEnvelope sequence (CloakChanged (w, obs)))).Next, (discovered, expected)
+        (step rp state (mkEnvelope sequence (CloakChanged (w, obs)))).Next, (true, expected)
     | 4 ->
         let m = managementOf raw
         let next = (step rp state (mkEnvelope sequence (UserCommand (SetManagement (w, m))))).Next
