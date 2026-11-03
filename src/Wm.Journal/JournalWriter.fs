@@ -584,6 +584,11 @@ let private inputEventOfJson (node: JsonNode) : InputEvent =
 /// どこにも存在しないため（`EffectBatchReturned`の生産元`ApplyBatch`自体がVirtualWorld側でも
 /// 未実装、既知のギャップ）、依然このラウンドの対象外とし、書込み時のフォールバック表示
 /// （`sprintf "%A"`）・読込み時の`failwithf`のまま残す。
+/// **v2.82で訂正**：`EffectCallReturnedPayload`は`CoreCommand.EffectCallReturned`の`dispatchSeq`
+/// （`Mismatch → Reevaluate`の判定に使う）を運べないため、`Wm.Runtime.Reducer`はこのKindを
+/// `InputPayload`（無損失）と組にして書く設計へ変更した（型直前のコメント、`entryOfJson`の
+/// `EffectCallReturnedKind`分岐参照）。この符号化関数自体は型としての`EffectCallReturnedPayload`
+/// 値をJSON化できるよう残すが、実際にはどこからも呼ばれない（Reducerはこの値を構築しない）。
 let private payloadToJson (payload: JournalPayload) : JsonNode =
     match payload with
     | InputPayload input -> inputEventToJson input
@@ -665,16 +670,19 @@ let private entryOfJson (node: JsonNode) : JournalEntry =
     let payload =
         match kind with
         | InputReceived
-        | ObservationReceived ->
+        | ObservationReceived
+        | EffectCallReturnedKind ->
             // `ObservationReceived`専用のPayloadケースは無い（`WindowObserved`等は元から`InputEvent`の
             // 1ケースなので、`InputPayload`をそのまま再利用する——Kindタグだけが「これは観測だった」
-            // という分類を運ぶ）。
+            // という分類を運ぶ）。`EffectCallReturnedKind`も同様（v2.82）：専用の`EffectCallReturnedPayload`
+            // （v2.81で追加）は`dispatchSeq`フィールドを持たず、`Mismatch → Reevaluate`の判定に使う
+            // `PendingRequest.DispatchSeq`（`Placement.onEffectCallReturned`経由）をReplayで欠落させて
+            // しまう——`Wm.Runtime.Reducer`はこのKindを`InputPayload`（無損失）と組にして書くので、
+            // ここでもその組だけを復元する。`EffectCallReturnedPayload`自体は型として残すが、この
+            // Kindからは到達しない（手動で`{Kind=EffectCallReturnedKind; Payload=EffectCallReturnedPayload _}`
+            // を組み立てて書き込んだ場合はここで誤って`InputPayload`として解釈しようとし例外になる——
+            // 他のKind/Payloadの組合せ違いと同じ「誤用は例外」という既存の規約のまま）。
             InputPayload (inputEventOfJson node.["payload"])
-        | EffectCallReturnedKind ->
-            EffectCallReturnedPayload (
-                RequestId (node.["payload"].["requestId"].GetValue<int64>()),
-                unitResultOfJson node.["payload"].["result"]
-            )
         | InternalFaultKind -> InternalFaultPayload (stringOfJsonAllowNull node.["payload"].["componentName"])
         | JournalDegradedKind -> JournalDegradedPayload (node.["payload"].["since"].GetValue<int64>())
         | JournalRecoveredKind ->

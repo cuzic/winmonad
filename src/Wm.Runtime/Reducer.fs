@@ -27,6 +27,20 @@ type Reducer(runtimePolicy: RuntimePolicy, sessionId: string, coreBuildId: strin
 
         journalPath
         |> Option.iter (fun path ->
+            // v2.82：`Kind`だけを入力の種類で分類する（`Payload`は常に`InputPayload input`のまま、
+            // 無損失の既存の符号化——`inputEventToJson`/`inputEventOfJson`、v2.57以来の往復対応）。
+            // `EffectCallReturned`を専用の`EffectCallReturnedPayload`（v2.81で追加）へ乗せる案を
+            // 検討したが、その型は`dispatchSeq`フィールドを持たず（`CoreCommand.fs`の`EffectCallReturned`
+            // 自身は`RequestId * Result<unit, NativeCallRecord> * dispatchSeq: int64 option`の3つ組）、
+            // `dispatchSeq`は`Placement.onEffectCallReturned`経由で`PendingRequest.DispatchSeq`へ渡り
+            // `Mismatch → Reevaluate`（v2.42）の判定そのものに使われる——Replayで`dispatchSeq`が
+            // 欠落すると、同じ入力列のはずなのにReplay時の`step`の分岐が実行時と食い違う（§9.2
+            // 「stepの入力分岐 ⊆ Journalの往復可能集合」違反）。`InputPayload`は`EffectCallReturned`の
+            // 3つ組全体を無損失に運ぶので、こちらを使う。
+            let kind =
+                match input with
+                | EffectCallReturned _ -> EffectCallReturnedKind
+                | _ -> InputReceived
             let entry =
                 { SchemaVersion = 1
                   SessionId = sessionId
@@ -37,7 +51,7 @@ type Reducer(runtimePolicy: RuntimePolicy, sessionId: string, coreBuildId: strin
                   CausationId = None
                   PolicyArtifactHash = policyArtifactHash
                   CoreBuildId = coreBuildId
-                  Kind = InputReceived
+                  Kind = kind
                   Payload = InputPayload input }
             Wm.Journal.JournalWriter.appendEntry path entry)
 

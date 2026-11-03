@@ -48,5 +48,31 @@ let ``MonitorTopologyObserved後、タイマーを仮想時計で発火すると
         // Journalに入力が書かれ、読み戻せること（9.1 Replay Input）。
         let entries = Wm.Journal.JournalWriter.readAll journalPath |> List.ofSeq
         Assert.Equal(2, entries.Length)
+        // v2.82：MonitorTopologyObserved/TimerElapsedはどちらもInputReceivedのまま(回帰確認)。
+        Assert.True(entries |> List.forall (fun e -> e.Kind = Wm.Contracts.JournalTypes.InputReceived))
+    finally
+        if File.Exists journalPath then File.Delete journalPath
+
+/// v2.82：`Reducer.Submit`が`EffectCallReturned`を受け取った時だけ`Kind`を`EffectCallReturnedKind`へ
+/// 分類し、`Payload`は無損失な`InputPayload`のままにすることを確認する（専用の`EffectCallReturnedPayload`
+/// だと`dispatchSeq`を失い`Mismatch → Reevaluate`がReplayで食い違う、`Reducer.fs`の型直前のコメント参照）。
+[<Fact>]
+let ``EffectCallReturnedを投入すると、JournalのKindがEffectCallReturnedKindになり、dispatchSeqを含めて無損失に往復する(v2.82)`` () =
+    let journalPath = Path.Combine(Path.GetTempPath(), sprintf "wm-journal-smoke-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    try
+        let reducer = Reducer(RuntimePolicy.defaults, "test-session", "test-build", "test-policy-hash", Some journalPath)
+        reducer.Submit 1000L "test" (MonitorTopologyObserved [ mkMonitor 0 ]) |> ignore
+        reducer.Submit 1001L "test" (EffectCallReturned (RequestId 42L, Ok (), Some 7L)) |> ignore
+
+        let entries = Wm.Journal.JournalWriter.readAll journalPath |> List.ofSeq
+        match entries with
+        | [ _; effectEntry ] ->
+            Assert.Equal(Wm.Contracts.JournalTypes.EffectCallReturnedKind, effectEntry.Kind)
+            match effectEntry.Payload with
+            | Wm.Contracts.JournalTypes.InputPayload (EffectCallReturned (RequestId rid, Ok (), Some seq)) ->
+                Assert.Equal(42L, rid)
+                Assert.Equal(7L, seq) // dispatchSeqが欠落していない
+            | other -> Assert.True(false, sprintf "unexpected payload: %A" other)
+        | other -> Assert.True(false, sprintf "expected exactly 2 entries, got %A" other)
     finally
         if File.Exists journalPath then File.Delete journalPath

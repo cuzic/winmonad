@@ -14,6 +14,7 @@ module Wm.Journal.Tests.RoundTripTests
 
 open System
 open System.IO
+open Xunit
 open FsCheck
 open FsCheck.Xunit
 open Wm.Contracts.Identifiers
@@ -224,10 +225,25 @@ let ``MoveSizeEndedは任意のrect/monitor観測(Ok/Error含む)でも往復し
 let private mkEntryWithKind (kind: JournalKind) (payload: JournalPayload) : JournalEntry =
     { mkEntry payload with Kind = kind }
 
+/// v2.82で訂正：v2.81は`EffectCallReturnedKind`を専用の`EffectCallReturnedPayload`と組にしていたが、
+/// その型は`dispatchSeq`（`Mismatch → Reevaluate`の判定に使う、`CoreCommand.EffectCallReturned`の
+/// 3つ組の一部）を運べず、Replayで欠落させてしまうことが分かった（`Wm.Runtime.Reducer`の型直前の
+/// コメント参照）。`Wm.Runtime.Reducer`は`EffectCallReturnedKind`を無損失な`InputPayload`と組にして
+/// 書くよう変更したので、ここもその組合せを検査する（`EffectCallReturnedPayload`自体は型として
+/// 残るが、もうこのKindとは組まない——手動でその組合せを作った場合は例外になることを別途確認する）。
 [<Property>]
-let ``EffectCallReturnedPayloadは往復しても一致する(Ok/Error全て)(v2.81)`` (rid: int) (result: Result<unit, NativeCallRecord>) =
-    let entry = mkEntryWithKind EffectCallReturnedKind (EffectCallReturnedPayload (RequestId (int64 (abs rid)), result))
+let ``EffectCallReturnedKindはInputPayload(無損失)と組んで往復しても一致する(v2.82)``
+    (rid: int)
+    (result: Result<unit, NativeCallRecord>)
+    (dispatchSeq: int64 option)
+    =
+    let entry = mkEntryWithKind EffectCallReturnedKind (InputPayload (EffectCallReturned (RequestId (int64 (abs rid)), result, dispatchSeq)))
     roundTrip entry = entry
+
+[<Fact>]
+let ``EffectCallReturnedKindを専用のEffectCallReturnedPayloadと手動で組み合わせると、読込み時に例外になる(v2.82、誤用の検出)`` () =
+    let entry = mkEntryWithKind EffectCallReturnedKind (EffectCallReturnedPayload (RequestId 1L, Ok ()))
+    Assert.ThrowsAny<exn>(fun () -> roundTrip entry |> ignore) |> ignore
 
 [<Property>]
 let ``InternalFaultPayloadは往復しても一致する(v2.81)`` (componentName: NonNull<string>) =
