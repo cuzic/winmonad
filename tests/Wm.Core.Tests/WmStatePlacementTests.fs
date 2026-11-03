@@ -553,6 +553,45 @@ let ``SwitchWorkspaceでhiddenなWorkspaceへ切り替えると、新しくcurre
     let effects = afterSwitch.Effects |> List.map GatedEffect.effect
     Assert.Contains(effects, function RequestForeground (_, target) -> target = w2 | _ -> false)
 
+/// v2.86：`SwitchWorkspace`で窓が隠れても(`onWorkspaceHidden`、v2.31)、その窓宛ての既存の`Pending`
+/// （`SetRect`、隠れる直前にReconcileが発行した分）はここでは一切取り消されない（`onTopologySettled`の
+/// 一括Supersededはモニター構成が確定した時だけ発火し、`SwitchWorkspace`は踏まない）——このPendingの
+/// `PendingDeadline`がその後満了すると、`retryOrGiveUp`（Placement.fs）が同じ窓へ新しい`SetRect`を
+/// 無条件に再発行していた。`GateInput.HiddenByWm`（v2.86でようやく`Placement.Desired`から実際に
+/// 組み立てられるようになった、それまで`Set.empty`の決め打ち）がこれを捕まえ、ゲートで拒否する
+/// ことを確認する。
+[<Fact>]
+let ``SwitchWorkspaceで隠れた窓の、隠れる前からの既存Pendingが満了して再試行されても、HiddenByWmのゲートで拒否される(v2.86)`` () =
+    let w1 = WindowId 1L
+    let afterW1 = settleOneMonitorThenDiscoverWindow w1
+    let ws0 = WorkspaceSet.workspaceOf w1 afterW1.Next.Workspaces |> Option.get
+    let rid = afterW1.Next.Placement.Pending |> Map.toSeq |> Seq.map fst |> Seq.exactlyOne
+
+    let hiddenWs = WorkspaceId 999
+    let w2 = WindowId 2L
+    let windows2 =
+        { afterW1.Next.Windows with
+            Records = Map.add w2 { WindowRecord.initial with Classification = Classified (EffTiled, ByUserOverride) } afterW1.Next.Windows.Records }
+    let workspaces2 = WorkspaceSet.addWindow hiddenWs w2 false afterW1.Next.Workspaces
+    let seeded2 = { afterW1.Next with Windows = windows2; Workspaces = workspaces2 }
+    let afterSwitch = step RuntimePolicy.defaults seeded2 (mkEnvelope 200L (UserCommand (SwitchWorkspace hiddenWs)))
+
+    // 前提：切替後もw1宛ての古いPendingがまだ生きている(onTopologySettledの一括Supersededを踏まない)。
+    Assert.Equal(Some ws0, WorkspaceSet.workspaceOf w1 afterSwitch.Next.Workspaces)
+    Assert.True(Map.containsKey rid afterSwitch.Next.Placement.Pending)
+    Assert.Equal(Some HiddenByWm, Map.tryFind w1 afterSwitch.Next.Placement.Desired)
+
+    // 古いPendingのPendingDeadlineが満了する。観測が一度も来ていないので`retryOrGiveUp`が新しいSetRectを
+    // 再発行しようとするが、w1は`HiddenByWm`なのでゲートが拒否するはず。
+    let afterDeadline = step RuntimePolicy.defaults afterSwitch.Next (mkEnvelope (100L + pendingDeadlineMs) (TimerElapsed (TimerId.Placement (PendingDeadline rid))))
+    let effects = afterDeadline.Effects |> List.map GatedEffect.effect
+    Assert.DoesNotContain(effects, function SetRect (_, target, _) -> target = w1 | _ -> false)
+
+    // ゲートに拒否されても(onGateRejected、Placement.fs)、Desiredの`HiddenByWm`マーカーは取り消されない
+    // （PendingPresence拒否・PresenceDeadline満了と同じ「Desiredは取り消さない」規則、型直前のコメント参照）。
+    Assert.Equal(Some HiddenByWm, Map.tryFind w1 afterDeadline.Next.Placement.Desired)
+    Assert.False(afterDeadline.Next.Placement.Pending |> Map.toSeq |> Seq.exists (fun (_, (pr: PendingRequest)) -> pr.Window = w1))
+
 [<Fact>]
 let ``SwitchWorkspaceはSwitchSettleを開始し、揺れ(旧Workspaceの窓への一時的なフォアグラウンド化)でWorkspaceを戻さない(R4-5, v2.40)`` () =
     let w1 = WindowId 1L

@@ -471,6 +471,21 @@ let ``onGateRejectedはそのRequestIdのPendingとDesiredを取り消し、Canc
     Assert.Equal(None, Map.tryFind w state'.Desired)
     Assert.NotEmpty(timerCmds)
 
+/// v2.86：`Desired`が`HiddenByWm`な窓宛ての`Pending`(`SetRect`)がゲートで拒否されても、拒否の原因である
+/// `HiddenByWm`マーカー自体は取り消さない——`PendingPresence`拒否・`PresenceDeadline`満了（下記）と同じ
+/// 「Desiredは取り消さない」規則（`onGateRejected`の型直前のコメント参照）。通常のTiled窓（`Shown _`
+/// または`None`）は上記のテストが示すとおり従来どおり取り消す。
+[<Fact>]
+let ``onGateRejectedは、DesiredがHiddenByWmなら取り消さない(v2.86)`` () =
+    let w = WindowId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
+    let hidden = { afterReconcile with Desired = Map.add w HiddenByWm afterReconcile.Desired }
+    let state', timerCmds = onGateRejected [ rid ] hidden
+    Assert.Empty(state'.Pending)
+    Assert.Equal(Some HiddenByWm, Map.tryFind w state'.Desired)
+    Assert.NotEmpty(timerCmds)
+
 [<Fact>]
 let ``onGateRejectedは対応するPendingが無いRequestIdを無害に無視する`` () =
     let state', timerCmds = onGateRejected [ RequestId 999L ] initial

@@ -958,16 +958,25 @@ let onPendingDeadlineTimerFired
 /// `GatedEffect.gate`が返す拒否リストのうち、このstepでPlacementが発行したPending（`SetRect`）
 /// またはPendingPresence（`SetPresence`、v2.41）に対応するRequestIdだけが対象になる（他ドメインの
 /// RequestIdは`Map.tryFind`が`None`を返すだけで無害）。`SetPresence`側は`Desired`を取り消さない
-/// （`PendingPresence`の型直前のコメントと同じ理由）。
+/// （`PendingPresence`の型直前のコメントと同じ理由）。**v2.86**：`Pending`（`SetRect`）側も、現在の
+/// `Desired`が`HiddenByWm`なら取り消さない——`TargetHiddenByWm`で拒否される`SetRect`は、`Desired`が
+/// `HiddenByWm`な窓（`GateInput.HiddenByWm`がv2.86で実際に組み立てられるようになった）だけが対象で、
+/// 拒否の原因そのものである「隠れている」というマーカーを拒否処理が誤って消してしまうと、`onGateRejected`
+/// が`PendingPresence`拒否・`PresenceDeadline`満了（上記・型直前のコメント）で既に守っている「Desiredは
+/// 取り消さない」規則と矛盾する。それ以外（通常のTiled窓の目標矩形、`Shown _`）は従来どおり取り消す。
 let onGateRejected (rejectedRequestIds: RequestId list) (state: PlacementState) : PlacementState * TimerCommand<TimerId> list =
     rejectedRequestIds
     |> List.fold
         (fun (st: PlacementState, cmds) rid ->
             match Map.tryFind rid st.Pending with
             | Some pr ->
+                let desired' =
+                    match Map.tryFind pr.Window st.Desired with
+                    | Some HiddenByWm -> st.Desired
+                    | _ -> Map.remove pr.Window st.Desired
                 { st with
                     Pending = Map.remove rid st.Pending
-                    Desired = Map.remove pr.Window st.Desired
+                    Desired = desired'
                     RetryAttempts = Map.remove pr.Window st.RetryAttempts },
                 cmds @ [ CancelTimer (TimerId.Placement (PendingDeadline rid)) ]
             | None ->
