@@ -903,3 +903,68 @@ let ``WindowRemovedは同じstepでPlacement.Draggingも除く(v2.65)`` () =
     Assert.True(Set.contains w afterDragStart.Next.Placement.Dragging)
     let afterRemoved = step RuntimePolicy.defaults afterDragStart.Next (mkEnvelope 3L (WindowRemoved w))
     Assert.False(Set.contains w afterRemoved.Next.Placement.Dragging)
+
+// ===== MoveAttributed(w, UserDrag)（§4.4「観測されたモニターと意図されたモニターが食い違うとき」の
+// UserDrag分岐、R3-4、v2.66） =====
+
+// `mkMonitor`はどのIDでも同じWorkArea({X=0;Y=0;Width=1920;Height=1080})を返すため、2台とも素の
+// `mkMonitor`を使うと両モニターのDesired矩形が数値として一致してしまい、`dispatchPlacements`の
+// `desiredChanged`判定（§7.3重複要求の禁止）が「変化無し」としてSetRectの再発行を抑止する
+// ——Reconcileが実際に新しいモニターで計算し直したことを`Effects`で確認できなくなる
+// （このファイル冒頭の`desiredRectOf`の注釈と同じ「取り違え」の一種）。2台目のWorkAreaを明示的に
+// ずらし、矩形の値そのもので区別できるようにする。
+let private twoMonitorTopologyAndScreens () : Wm.Core.Topology.TopologyState * Screen * Screen =
+    let monitor1 = { mkMonitor 1 with Bounds = { X = 1920; Y = 0; Width = 1280; Height = 720 }; WorkArea = { X = 1920; Y = 0; Width = 1280; Height = 720 } }
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0; monitor1 ]
+    match displays topology with
+    | Displays (current, [ visibleScreen ]) -> topology, current, visibleScreen
+    | other -> failwithf "expected exactly 1 visible (non-active) screen, got %A" other
+
+[<Fact>]
+let ``MoveSizeEndedで別モニターへ落とされた窓は、そのモニターに表示中のWorkspaceへ移り、Reconcileが新しい矩形を発行する(v2.66)`` () =
+    let topology, current, visibleScreen = twoMonitorTopologyAndScreens ()
+    let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+    let w = WindowId 1L
+    let afterW = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved w))
+    Assert.Equal(Some current.Workspace, WorkspaceSet.workspaceOf w afterW.Next.Workspaces) // 新規発見はcurrentへ
+
+    let rectObs: Observation<PixelRect> = { Value = Ok { X = 2000; Y = 0; Width = 300; Height = 300 }; SampleSequence = 1L; MonotonicTime = 2L; Source = "test" }
+    let monitorObs: Observation<MonitorId> = { Value = Ok visibleScreen.Monitor.Id; SampleSequence = 1L; MonotonicTime = 2L; Source = "test" }
+    let afterDragEnd = step RuntimePolicy.defaults afterW.Next (mkEnvelope 2L (MoveSizeEnded (w, rectObs, monitorObs)))
+
+    Assert.Equal(Some visibleScreen.Workspace, WorkspaceSet.workspaceOf w afterDragEnd.Next.Workspaces)
+    let effects = afterDragEnd.Effects |> List.map GatedEffect.effect
+    Assert.Contains(effects, function SetRect (_, target, rect) -> target = w && rect = visibleScreen.Monitor.WorkArea | _ -> false)
+
+[<Fact>]
+let ``MoveSizeEndedで同じモニター内に落とされた窓はWorkspaceを変えない(v2.66)`` () =
+    let topology, current, _ = twoMonitorTopologyAndScreens ()
+    let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+    let w = WindowId 1L
+    let afterW = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved w))
+    let rectObs: Observation<PixelRect> = { Value = Ok { X = 500; Y = 0; Width = 300; Height = 300 }; SampleSequence = 1L; MonotonicTime = 2L; Source = "test" }
+    let monitorObs: Observation<MonitorId> = { Value = Ok current.Monitor.Id; SampleSequence = 1L; MonotonicTime = 2L; Source = "test" }
+    let afterDragEnd = step RuntimePolicy.defaults afterW.Next (mkEnvelope 2L (MoveSizeEnded (w, rectObs, monitorObs)))
+    Assert.Equal(afterW.Next.Workspaces, afterDragEnd.Next.Workspaces)
+
+[<Fact>]
+let ``MoveSizeEndedのモニター観測がErrorなら何もしない(v2.66)`` () =
+    let seeded = { initial RuntimePolicy.defaults with Topology = (MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0; mkMonitor 1 ] |> fst) }
+    let w = WindowId 1L
+    let afterW = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved w))
+    let rectObs: Observation<PixelRect> = { Value = Ok { X = 2000; Y = 0; Width = 300; Height = 300 }; SampleSequence = 1L; MonotonicTime = 2L; Source = "test" }
+    let failedMonitorObs: Observation<MonitorId> =
+        { Value = Error { Api = "test"; Space = Win32LastError; Code = 0; ElapsedUs = 0L }; SampleSequence = 1L; MonotonicTime = 2L; Source = "test" }
+    let afterDragEnd = step RuntimePolicy.defaults afterW.Next (mkEnvelope 2L (MoveSizeEnded (w, rectObs, failedMonitorObs)))
+    Assert.Equal(afterW.Next.Workspaces, afterDragEnd.Next.Workspaces)
+
+[<Fact>]
+let ``MoveSizeEndedで落とされたモニターが現在表示されていなければ何もしない(v2.66)`` () =
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0 ]
+    let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+    let w = WindowId 1L
+    let afterW = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved w))
+    let rectObs: Observation<PixelRect> = { Value = Ok { X = 2000; Y = 0; Width = 300; Height = 300 }; SampleSequence = 1L; MonotonicTime = 2L; Source = "test" }
+    let unknownMonitorObs: Observation<MonitorId> = { Value = Ok (MonitorId 99L); SampleSequence = 1L; MonotonicTime = 2L; Source = "test" }
+    let afterDragEnd = step RuntimePolicy.defaults afterW.Next (mkEnvelope 2L (MoveSizeEnded (w, rectObs, unknownMonitorObs)))
+    Assert.Equal(afterW.Next.Workspaces, afterDragEnd.Next.Workspaces)

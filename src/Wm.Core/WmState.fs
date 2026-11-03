@@ -440,6 +440,31 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         else
             stateAfterMovability, []
 
+    // `MoveAttributed (w, UserDrag)`（§4.4「観測されたモニターと意図されたモニターが食い違うとき」の
+    // UserDrag分岐、R3-4、v2.66）：`Topology.update`が`MoveSizeEnded`を段②で無条件に`UserDrag`と
+    // ラベルする（R5-9）。ここでは`MoveSizeEnded`自身が運ぶドロップ時点のモニター観測（段①では
+    // 使わない、Placementの`Geometry.Monitor`信念とは別経路）を読み、そのモニターに現在表示中の
+    // Workspaceへ窓を移す（architecture.md「窓が別のモニターmへ落とされたら、mに表示中のWorkspaceへ
+    // その窓を移す（i3/komorebiと同じ）」）。同じモニター内のドラッグ（WorkspaceId不変）・観測失敗
+    // （`Error`）・落とされたモニターが現在表示されていない場合は何もしない。
+    let stateAfterMovability, crossMonitorDropMoved =
+        match topologyEvents |> List.exists (function MoveAttributed (_, UserDrag) -> true | _ -> false), envelope.Input with
+        | true, MoveSizeEnded (w, _, monitorObs) ->
+            match monitorObs.Value with
+            | Error _ -> stateAfterMovability, false
+            | Ok droppedMonitor ->
+                match Topology.displays topologyState' with
+                | NoMonitors -> stateAfterMovability, false
+                | Displays (current, visible) ->
+                    match (current :: visible) |> List.tryFind (fun sc -> sc.Monitor.Id = droppedMonitor) with
+                    | None -> stateAfterMovability, false // 落とされたモニターは現在表示されていない
+                    | Some targetScreen ->
+                        match WorkspaceSet.workspaceOf w stateAfterMovability.Workspaces with
+                        | Some srcWs when srcWs <> targetScreen.Workspace ->
+                            { stateAfterMovability with Workspaces = WorkspaceSet.moveToWorkspace w targetScreen.Workspace stateAfterMovability.Workspaces }, true
+                        | _ -> stateAfterMovability, false // 同じWorkspace内のドラッグ、または管理下に無い窓
+        | _ -> stateAfterMovability, false
+
     // `WorkspaceHidden`/`WorkspaceShown`（v2.31で消費を開始。モニター接続・切断経由の`MonitorLifecycle.
     // reconcile`に加え、v2.32で`SwitchWorkspace`も同じ受け口を共有する）：該当Workspaceに属する窓を
     // `Placement.onWorkspaceHidden`/`onWorkspaceShown`へ渡し、`Desired`/`SetPresence`を更新する
@@ -649,6 +674,12 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         // 無い（hiddenになった側はもうreconcileOneScreenの対象外になるので、トリガーにしても何も
         // 起こらない）が、同じstepに両方出ることが多いため区別せず検査する。
         || (topologyEvents |> List.exists (function WorkspaceShown _ | WorkspaceHidden _ -> true | _ -> false))
+        // `MoveAttributed (_, UserDrag)`経由で窓のWorkspace所属が実際に変わった場合（v2.66、上記
+        // `crossMonitorDropMoved`）：`windowsEvents`（分類の変化）を伴わない所属変更なので、
+        // `PromoteToMaster`/`ChangeLayout`と同じ理由で明示的にここで引き金にする——元・先の両方の
+        // Workspaceが対象になる（`reconcileOneScreen`は現在表示中の全Workspaceを毎回走査するため、
+        // どちらのWorkspaceを個別に指定する必要も無い）。
+        || crossMonitorDropMoved
 
     let reconcileOneScreen (placementSt: PlacementState, effects, cmds) (screen: Screen) =
         let wsState = WorkspaceSet.stateOf screen.Workspace next.Workspaces
@@ -739,7 +770,12 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
 
     // 段①のDomainEventは、消費する後続の段（Topologyの`current`追従等）がまだ無いため捨てる
     // （Opusレビュー5-3）。段②のDomainEventのうち`TopologySettled`（v2.29）/`WorkspaceShown`/
-    // `WorkspaceHidden`/`CurrentChanged`（v2.31・v2.32）は全て上で消費するようになった。
+    // `WorkspaceHidden`/`CurrentChanged`（v2.31・v2.32）/`MoveAttributed (_, UserDrag)`（v2.66）は
+    // 全て上で消費するようになった。`MoveAttributed (_, OsInduced | Unattributed)`は、段②のTopologyが
+    // まだ`MoveSizeEnded`以外の「移動の観測」を一切受け取らないため（WindowObservedは段①⑤でWindows/
+    // Placementが処理し、Topologyには流れない）、Topology.update自体がこの2ケースを一度も生成しない
+    // ——`MoveCause`型そのものは3ケース全て存在するが、生成されるのはv2.66時点では`UserDrag`のみ
+    // （Topology.updateの`MoveSizeEnded`分岐の型直前のコメント参照）。
     ignore stage1Events
     ignore topologyEvents
 

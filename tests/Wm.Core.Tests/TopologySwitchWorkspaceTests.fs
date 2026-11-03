@@ -3,6 +3,7 @@ module Wm.Core.Tests.TopologySwitchWorkspaceTests
 
 open Xunit
 open Wm.Contracts.Identifiers
+open Wm.Contracts.Observation
 open Wm.Contracts.SharedVocabulary
 open Wm.Contracts.Timers
 open Wm.Contracts.CoreCommand
@@ -161,3 +162,32 @@ let ``抑止区間中(Reconfiguring)のFocusMonitorも、他のUserCommandと同
     | Settling _ -> ()
     | other -> failwithf "expected FocusMonitor during Reconfiguring to force Settling, got %A" other
     Assert.Contains(CancelTimer (TimerId.Topology ReconfigurationCap), response.TimerCommands)
+
+// ===== MoveSizeEnded → MoveAttributed(w, UserDrag)（§4.4「観測されたモニターと意図されたモニターが
+// 食い違うとき」のUserDrag分岐、R3-4/R5-9、v2.66） =====
+
+let private moveSizeEnded (w: WindowId) : InputEvent =
+    let rectObs: Observation<PixelRect> = { Value = Ok { X = 0; Y = 0; Width = 300; Height = 300 }; SampleSequence = 1L; MonotonicTime = 1L; Source = "test" }
+    let monitorObs: Observation<MonitorId> = { Value = Ok (MonitorId 0L); SampleSequence = 1L; MonotonicTime = 1L; Source = "test" }
+    MoveSizeEnded (w, rectObs, monitorObs)
+
+[<Fact>]
+let ``MoveSizeEndedはMoveAttributed(w, UserDrag)を出し、ScreenPhase・状態は一切変えない(v2.66)`` () =
+    let t0, state0 = settleFully 0L [ mkMonitor 0 true ] (initial Map.empty)
+    let w = WindowId 1L
+    let state1, response, events, trace = update config (t0 + 1L) (moveSizeEnded w) state0
+    Assert.Equal(state0, state1)
+    Assert.Equal({ Actions = []; TimerCommands = [] }, response)
+    Assert.Equal<DomainEvent list>([ MoveAttributed (w, UserDrag) ], events)
+    Assert.Empty(trace)
+
+[<Fact>]
+let ``MoveSizeEndedは抑止区間(Reconfiguring)中でもUserDragを優先する(R5-9、v2.66)`` () =
+    let t0, state0 = settleFully 0L [ mkMonitor 0 true ] (initial Map.empty)
+    let stateReconfiguring, _, _, _ = update config (t0 + 1L) (ScreenReconfigurationInProgress true) state0
+    match phase stateReconfiguring with
+    | Reconfiguring _ -> ()
+    | other -> failwithf "expected Reconfiguring, got %A" other
+    let w = WindowId 1L
+    let _, _, events, _ = update config (t0 + 2L) (moveSizeEnded w) stateReconfiguring
+    Assert.Equal<DomainEvent list>([ MoveAttributed (w, UserDrag) ], events)

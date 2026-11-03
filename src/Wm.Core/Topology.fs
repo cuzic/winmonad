@@ -405,4 +405,11 @@ let update (config: TopologyConfig) (now: int64) (input: InputEvent) (state: Top
         | Reconfiguring since when awaitDeadline (Some (since + config.ReconfigurationCapMs)) now ->
             enterSettling state (latestForForcedSettle ()) (now + config.HardDeadlineMs)
         | _ -> state, noResponse, [], []
+    | MoveSizeEnded (w, _, _) ->
+        // §4.4「観測されたモニターと意図されたモニターが食い違うとき」(R3-4)の原因ラベル付け（段②、
+        // v2.66）。`MoveSizeEnded`自体はユーザー操作でしか発生しないので、`ScreenPhase`に関わらず
+        // 常に`UserDrag`とラベルする（R5-9「MoveSize系の入力はユーザー操作でしか発生しないので、
+        // ScreenPhaseがSettling/Graceの間でもUserDragを優先する」）。ドロップ時点の矩形・モニター
+        // そのものはこの関数の対象外（`WmState.step`が`MoveSizeEnded`の元の入力から直接読む）。
+        state, noResponse, [ MoveAttributed (w, UserDrag) ], []
     | _ -> state, noResponse, [], []
