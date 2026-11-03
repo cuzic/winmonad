@@ -40,6 +40,12 @@
 /// `WindowObserved`ではなく`WindowRemoved`が1件届く。`IgnoreMove`/`Compose`は依然対象外
 /// （`IgnoreMove`は`DelayedByMs`の退化形（無限に遅い観測＝Timeout一本道）で新しい検証価値が薄く、
 /// `Compose`は複数挙動の確率的な組合せ規則が要るため1ラウンドでは判断点が多すぎる）。
+///
+/// **v2.85で`HungAfterMs`に`recoversAtMs`を追加**：v2.84で`Health`が`Reprobe (w, KResponsiveness)`を
+/// 実際に発行するようになったので、`VirtualWorld`側に初めてこのEffectへの応答（`PumpResponded`/
+/// `PumpTimedOut`を運ぶ`WindowObserved`）が要るようになった——それまで`HungAfterMs`には「ハングした
+/// まま回復しない」の1パターンしか無く、`Hung → Responding`の回復を実際のパイプラインで検証する
+/// 手段が無かった（v2.60の構図と同じ：消費側は既にあるが、証拠を生む側のシミュレーションが無い）。
 module Wm.Simulation.WindowBehaviors
 
 open Wm.Contracts.Identifiers
@@ -50,7 +56,11 @@ type WindowBehavior =
     /// §12.1「`startMs`以降メッセージを処理せず、`start+5000ms`以降はOSのハング判定が成立する」。
     /// 時刻は`VirtualWorld`の他の時刻と同じ`int64`ミリ秒（架空のpseudocodeの`int`注記はここでは
     /// `VirtualWorld.ClockMs`/`now`との型の一貫性を優先して`int64`にする）。
-    | HungAfterMs of startMs: int64
+    /// `recoversAtMs`（v2.85、§4.5 Responsivenessの`Reprobe (w, KResponsiveness)`応答用）：
+    /// `None`なら恒久的にハングしたまま（v2.60時点の既定）。`Some r`なら`now >= r`以降の`Reprobe`に
+    /// `PumpResponded`で応じる（それ未満は`PumpTimedOut 0L`で再確認——`Health.judgedHungThresholdUs`
+    /// 以下なので`Hung`のまま再確認されるだけで、信念は変わらない）。
+    | HungAfterMs of startMs: int64 * recoversAtMs: int64 option
     /// §12.1「`MinimumWidth(700)`」。要求された幅が`minWidthPx`未満なら、観測される幅は
     /// `minWidthPx`に丸められる（高さ・X/Yは要求どおり）。物理ピクセル（`SetRect`の矩形と同じ単位）。
     | MinimumWidth of minWidthPx: int

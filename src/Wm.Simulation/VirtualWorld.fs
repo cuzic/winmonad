@@ -145,8 +145,8 @@ let applyEffect
             // （呼び出し元には見えない、この関数内に閉じた実装都合）。
             let probe (_: WindowId) : ProbeOutcome =
                 match vw.Behavior with
-                | HungAfterMs startMs when now >= startMs + 5000L -> HungConfirmed
-                | HungAfterMs startMs when now >= startMs -> HungPending (int (now - startMs))
+                | HungAfterMs (startMs, _) when now >= startMs + 5000L -> HungConfirmed
+                | HungAfterMs (startMs, _) when now >= startMs -> HungPending (int (now - startMs))
                 | _ -> Responsive
             let mutable dispatchedWorld = world
             let mutable dispatchedEvents: InputEvent list = []
@@ -165,7 +165,7 @@ let applyEffect
                     dispatchedSeq <- Some dispatchSeq
                     Ok ()
                 | Immediate
-                | HungAfterMs _ ->
+                | HungAfterMs (_, _) ->
                     let dispatchSeq = world.NextSampleSequence
                     let sampleSeq = dispatchSeq + 1L
                     dispatchedWorld <-
@@ -269,9 +269,31 @@ let applyEffect
                     { emptySnapshot w with
                         TargetIntegrity = Some { Value = Ok vw.Integrity; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" } }
             world', [ observed ], []
+    | Reprobe (w, KResponsiveness) ->
+        // v2.85、§4.5 Responsivenessの再probeループ（v2.84で`Health`がこのEffectを発行するように
+        // なった）に対する疑似OSの応答。`HungAfterMs`の`recoversAtMs`が無い（恒久的にハング）か
+        // `now`がまだそれに達していなければ`PumpTimedOut 0L`（`Health.judgedHungThresholdUs`以下
+        // なので`Hung`が再確認されるだけ）、`recoversAtMs`に達していれば`PumpResponded`で応じる。
+        // `TargetIntegrity`と同じ部分観測（`Responsiveness`だけを運ぶ）。
+        match Map.tryFind w world.Windows with
+        | None -> world, [], []
+        | Some vw ->
+            let sampleSeq = world.NextSampleSequence
+            let world' = { world with NextSampleSequence = sampleSeq + 1L }
+            let sample =
+                match vw.Behavior with
+                | HungAfterMs (_, Some recoversAtMs) when now >= recoversAtMs -> PumpResponded
+                | HungAfterMs (_, _) -> PumpTimedOut 0L
+                | _ -> PumpResponded
+            let observed =
+                WindowObserved
+                    { emptySnapshot w with
+                        Responsiveness = Some { Value = Ok sample; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" } }
+            world', [ observed ], []
     | Reprobe (_, _) ->
-        // Coreは今のところ`KTargetIntegrity`以外のReprobeを一度も発行しない（ファイル冒頭コメント参照）。
-        // 対応する消費者が無いまま実装すると検証不能な死んだコードになるため、他のキーは対象外のまま。
+        // Coreは今のところ`KTargetIntegrity`/`KResponsiveness`以外のReprobeを一度も発行しない
+        // （ファイル冒頭コメント参照）。対応する消費者が無いまま実装すると検証不能な死んだコードに
+        // なるため、他のキーは対象外のまま。
         world, [], []
     | ObserveAll ->
         // 全窓の全体再列挙（§7.3、`ScreenPhase = Grace`突入時にTopologyが発行する）。`Reprobe`の部分観測

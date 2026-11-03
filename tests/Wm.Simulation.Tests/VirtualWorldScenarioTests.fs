@@ -326,7 +326,7 @@ let ``HungAfterMsの窓はstartMs+5000ms以降、SetRectがHungConfirmedとし�
     settleTopology reducer [ mkMonitor 0 ]
     let w = WindowId 1L
     // startMs=0なので、now>=5000なら常にHungConfirmed。
-    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } (HungAfterMs 0L)
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } (HungAfterMs (0L, None))
     let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
     let setRectEffects = discovery.Effects |> List.filter (fun g -> match GatedEffect.effect g with SetRect _ -> true | _ -> false)
     let gated = List.exactlyOne setRectEffects
@@ -358,7 +358,7 @@ let ``HungAfterMsの窓もstartMs+5000ms未満(HungPending)ならSetRectは普�
     let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
     settleTopology reducer [ mkMonitor 0 ]
     let w = WindowId 1L
-    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } (HungAfterMs 1000L)
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } (HungAfterMs (1000L, None))
     let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
     let gated = discovery.Effects |> List.filter (fun g -> match GatedEffect.effect g with SetRect _ -> true | _ -> false) |> List.exactlyOne
 
@@ -377,13 +377,94 @@ let ``HungAfterMsの窓もstartMs未満(Responsive)ならSetRectは普通に成�
     let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
     settleTopology reducer [ mkMonitor 0 ]
     let w = WindowId 1L
-    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } (HungAfterMs 5000L)
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } (HungAfterMs (5000L, None))
     let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
     let gated = discovery.Effects |> List.filter (fun g -> match GatedEffect.effect g with SetRect _ -> true | _ -> false) |> List.exactlyOne
     let finalWorld = settle 1000L reducer world discovery.Effects
     let workArea: PixelRect = (mkMonitor 0).WorkArea
     Assert.Equal(workArea, (Map.find w finalWorld.Windows).Rect)
     Assert.Empty(reducer.State.Placement.Pending)
+
+/// v2.85：v2.84で`Health`が`Reprobe (w, KResponsiveness)`を実際に発行するようになったので、
+/// `HungAfterMs`の`recoversAtMs`（新設）とこの`Reprobe`への応答を初めてここで検査する——
+/// `Hung → Responding`の回復を実際のパイプライン（Reducer+VirtualWorld）を通して確認する初めてのテスト。
+
+[<Fact>]
+let ``recoversAtMsに達した窓は、Reprobe(w, KResponsiveness)にPumpRespondedで応じ、HungからRespondingへ回復する(v2.85)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    settleTopology reducer [ mkMonitor 0 ]
+    let w = WindowId 1L
+    // startMs=0でnow>=5000は常にHungConfirmed。recoversAtMs=10000で、それ以降はPumpRespondedに応じる。
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } (HungAfterMs (0L, Some 10000L))
+    let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
+    let setRectGated = discovery.Effects |> List.filter (fun g -> match GatedEffect.effect g with SetRect _ -> true | _ -> false) |> List.exactlyOne
+
+    let _world', _events, callReturns = applyEffect 6000L world setRectGated
+    let rid, errorRecord =
+        match callReturns with
+        | [ (rid, Error record, _) ] -> rid, record
+        | other -> failwithf "unexpected callReturns: %A" other
+
+    let afterHung = reducer.Submit 6000L "virtual-world" (EffectCallReturned (rid, Error errorRecord, None))
+    match Map.tryFind w reducer.State.Health.Responsiveness with
+    | Some { Value = Hung; Confidence = Confirmed } -> ()
+    | other -> Assert.True(false, sprintf "precondition failed, unexpected: %A" other)
+
+    // Health.applyEvidence（v2.84）がHung遷移時に発行したReprobe(w, KResponsiveness)を取り出す。
+    let reprobeGated =
+        afterHung.Effects
+        |> List.filter (fun g -> match GatedEffect.effect g with Reprobe (ww, KResponsiveness) -> ww = w | _ -> false)
+        |> List.exactlyOne
+
+    // now=9000（recoversAtMs=10000未満）：まだ回復していないので、PumpTimedOut 0Lで再確認されるだけ。
+    let _world2, events2, _ = applyEffect 9000L world reprobeGated
+    let obs2 = match events2 with [ WindowObserved s ] -> s | other -> failwithf "unexpected: %A" other
+    match obs2.Responsiveness with
+    | Some { Value = Ok (PumpTimedOut 0L) } -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+    reducer.Submit 9000L "virtual-world" (WindowObserved obs2) |> ignore
+    match Map.tryFind w reducer.State.Health.Responsiveness with
+    | Some { Value = Hung; Confidence = Confirmed } -> ()
+    | other -> Assert.True(false, sprintf "unexpected after not-yet-recovered reprobe: %A" other)
+
+    // now=10000（recoversAtMsに到達）：PumpRespondedで応じ、Coreへ戻すとRespondingへ回復する。
+    let _world3, events3, _ = applyEffect 10000L world reprobeGated
+    let obs3 = match events3 with [ WindowObserved s ] -> s | other -> failwithf "unexpected: %A" other
+    match obs3.Responsiveness with
+    | Some { Value = Ok PumpResponded } -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+    reducer.Submit 10000L "virtual-world" (WindowObserved obs3) |> ignore
+    match Map.tryFind w reducer.State.Health.Responsiveness with
+    | Some { Value = Responding; Confidence = Confirmed } -> ()
+    | other -> Assert.True(false, sprintf "unexpected after recovery: %A" other)
+    Assert.False(Map.containsKey w reducer.State.Health.Reprobes)
+
+[<Fact>]
+let ``recoversAtMsが無い(None)窓は、Reprobe(w, KResponsiveness)に常にPumpTimedOutで応じ回復しない(回帰確認、v2.85)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    settleTopology reducer [ mkMonitor 0 ]
+    let w = WindowId 1L
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } (HungAfterMs (0L, None))
+    let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
+    let setRectGated = discovery.Effects |> List.filter (fun g -> match GatedEffect.effect g with SetRect _ -> true | _ -> false) |> List.exactlyOne
+    let _world', _events, callReturns = applyEffect 6000L world setRectGated
+    let rid, errorRecord =
+        match callReturns with
+        | [ (rid, Error record, _) ] -> rid, record
+        | other -> failwithf "unexpected callReturns: %A" other
+    let afterHung = reducer.Submit 6000L "virtual-world" (EffectCallReturned (rid, Error errorRecord, None))
+    let reprobeGated =
+        afterHung.Effects
+        |> List.filter (fun g -> match GatedEffect.effect g with Reprobe (ww, KResponsiveness) -> ww = w | _ -> false)
+        |> List.exactlyOne
+
+    let _world2, events2, _ = applyEffect 1_000_000L world reprobeGated
+    match events2 with
+    | [ WindowObserved s ] ->
+        match s.Responsiveness with
+        | Some { Value = Ok (PumpTimedOut 0L) } -> ()
+        | other -> Assert.True(false, sprintf "unexpected: %A" other)
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
 
 /// v2.61：`VirtualWorld.applyEffect`の`SetRect`が`MinimumWidth`挙動を実際に模すようになったので、
 /// 初めてここで検査する。`§12.1「MinimumWidth(700)」`が実際に要求幅を丸めることを直接確認する——
