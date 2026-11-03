@@ -15,6 +15,7 @@ open Wm.Core.Topology
 open Wm.Core.Workspaces
 open Wm.Core.Windows
 open Wm.Core.Placement
+open Wm.Core.DecisionTrace
 open Wm.Core.WmState
 open Wm.Layouts.LayoutRegistry
 
@@ -985,3 +986,16 @@ let ``MoveSizeEndedで落とされたモニターが現在表示されていな�
     let unknownMonitorObs: Observation<MonitorId> = { Value = Ok (MonitorId 99L); SampleSequence = 1L; MonotonicTime = 2L; Source = "test" }
     let afterDragEnd = step RuntimePolicy.defaults afterW.Next (mkEnvelope 2L (MoveSizeEnded (w, rectObs, unknownMonitorObs)))
     Assert.Equal(afterW.Next.Workspaces, afterDragEnd.Next.Workspaces)
+
+// ===== DecisionTrace（§7.1、v2.68）：WmState.step経由でWindowsが出すInconsistencySuspectedが
+// StepResult.Traceまで届くこと（Windows.fsの直接テストに加え、結線自体の確認）。 =====
+
+[<Fact>]
+let ``Windowsが出すInconsistencySuspectedは、WmState.step経由でStepResult.Traceまで届く(v2.68)`` () =
+    let w = WindowId 1L
+    let impossibleRecord = { WindowRecord.initial with Classification = Classified (EffFloating, ByUserOverride); UserOverride = None }
+    let seeded = { initial RuntimePolicy.defaults with Windows = { (initial RuntimePolicy.defaults).Windows with Records = Map.ofList [ w, impossibleRecord ] } }
+    let result = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved w))
+    match result.Trace with
+    | [ InconsistencySuspected (domain, _) ] -> Assert.Equal("Windows", domain)
+    | other -> Assert.True(false, sprintf "expected exactly one InconsistencySuspected trace, got %A" other)

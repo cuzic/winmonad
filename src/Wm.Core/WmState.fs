@@ -211,15 +211,15 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     // ClassificationDeadlineタイマー・ユーザーコマンド（ToggleFloating/SetManagement/ClearUserOverride）
     // による分類の確定を同じ入力について続けて行い、出たDomainEventをその場でWorkspaces/Focusへ反映する。
     let windowsCtx = classificationCtx runtimePolicy now state
-    let windowsRegistry', windowsEvents, windowsTimerCmds =
+    let windowsRegistry', windowsEvents, windowsTimerCmds, windowsTraces =
         match envelope.Input with
         | WindowObserved snapshot -> Windows.onWindowObserved windowsCtx snapshot state.Windows
         | VisibilityChanged (w, obs) -> Windows.onVisibilityChanged windowsCtx w obs state.Windows
         | CloakChanged (w, obs) -> Windows.onCloakChanged windowsCtx w obs state.Windows
         | TimerElapsed (TimerId.Windows (ClassificationDeadline w)) -> Windows.onClassificationDeadline windowsCtx w state.Windows
         | UserCommand cmd -> Windows.onUserCommand windowsCtx cmd state.Windows
-        | MembershipHintsLoaded hints -> Windows.onMembershipHintsLoaded hints state.Windows, [], []
-        | _ -> state.Windows, [], []
+        | MembershipHintsLoaded hints -> Windows.onMembershipHintsLoaded hints state.Windows, [], [], []
+        | _ -> state.Windows, [], [], []
 
     let stateAfterWindows =
         { state with Windows = windowsRegistry' }
@@ -349,8 +349,13 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         | _ -> stateAfterMovability, []
 
     // 段②：Topologyの原因・コマンドの受付。
-    let topologyState', topologyResponse, topologyEvents, traces =
+    let topologyState', topologyResponse, topologyEvents, topologyTraces =
         Topology.update runtimePolicy.Topology now envelope.Input stateAfterMovability.Topology
+    // `DecisionTrace`（§7.1「起こり得ない組合せに出会ったら、例外を投げずに入力を捨て、DecisionTraceに
+    // 記録する」、v2.68）：段②のTopologyが出す分（今のところ常に`[]`、Topology.updateのどの分岐も
+    // 疑わしい組合せに出会っていない）と、段①⑤のWindows（`windowsTraces`、上記）が出す分を合わせて
+    // 1つのstepのTraceとする。
+    let traces = topologyTraces @ windowsTraces
 
     // `UserCommand FocusMostRecent`（§4.4「focused = ManagedWindow _ならHistoryの2番目、Elsewhereなら
     // 先頭へ移る」、v2.38）：architecture.mdの表では行き先解決は段②のFocus、view遷移は段⑤のTopologyだが、

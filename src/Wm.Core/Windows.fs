@@ -38,6 +38,7 @@ open Wm.Contracts.SharedVocabulary
 open Wm.Contracts.Timers
 open Wm.Contracts.CoreCommand
 open Wm.Core.DomainEvents
+open Wm.Core.DecisionTrace
 open Wm.Policy.PolicyTypes
 open Wm.Policy.PolicyEvaluator
 
@@ -269,68 +270,71 @@ let private reconsider
     (inputs: ClassInputBeliefs)
     (hint: (WorkspaceId * Management option) option)
     (record: WindowRecord)
-    : WindowRecord * DomainEvent list * TimerCommand<TimerId> list =
+    : WindowRecord * DomainEvent list * TimerCommand<TimerId> list * DecisionTrace list =
     match record.UserOverride with
     | Some _ ->
         // ユーザー指定はPolicyより優先し、信念の変化を理由には上書きしない（§4.4 R4-20）。
         // `UserOverride = Some _`は常に`Classification = Classified (_, ByUserOverride)`と対になっている
         // （この対応はapplyUserOverride/ClearUserOverrideだけが変更する）。
-        record, [], []
+        record, [], [], []
     | None ->
         if not (isCandidate inputs) then
             // 一度Classifiedになった窓は、候補条件を外れたことではNotCandidateへ戻さない（§4.4 R5-2）。
-            record, [], []
+            record, [], [], []
         else
             match record.Classification with
             | Classified (_, ByUserOverride) ->
                 // 到達しないはずの組合せ（`UserOverride = None`なら`ByUserOverride`は無い、上記の対応）だが、
                 // 全域関数として安全側に倒す（§7.1「起こり得ない組合せに出会ったら例外を投げずに入力を捨てる」）。
-                record, [], []
+                // v2.68で、捨てるだけでなく実際にDecisionTraceへ記録するようにした——この関数が長らく
+                // 引用していた§7.1の規則自体が「記録する」まで含むのに、`DecisionTrace`型が作られた
+                // （ADR-019決定7）後も一度も構築されていなかった既知のギャップだった。
+                record, [], [], [ InconsistencySuspected ("Windows", sprintf "UserOverride=Noneなのに%AのWindowId %Aに遭遇した" w record.Classification) ]
             | Classified (_, ByPolicy _) ->
                 // ByPolicyで確定済みの窓の増分再分類はこのラウンドでは対象外（ファイル冒頭コメント参照）。
-                record, [], []
+                record, [], [], []
             | Classified (eff, ByTimeout) when not record.LateReclassifyUsed ->
                 match tryClassify ctx w identity inputs with
                 | Resolved (m', ruleId) ->
                     let eff' = toEffective (movabilityOf ctx w) m'
                     if eff' = eff then
-                        record, [], []
+                        record, [], [], []
                     else
                         let home = resolveHome ctx w None
                         { record with
                             Classification = Classified (eff', ByPolicy ruleId)
                             LateReclassifyUsed = true
                             ManagementChangedAt = List.truncate 8 (ctx.Now :: record.ManagementChangedAt) },
-                        [ classificationEvent w eff' home ], []
-                | ClassificationResult.AwaitingEvidence _ -> record, [], [] // まだUnknown。既定分類(Floating)のまま待つ
+                        [ classificationEvent w eff' home ], [], []
+                | ClassificationResult.AwaitingEvidence _ -> record, [], [], [] // まだUnknown。既定分類(Floating)のまま待つ
             | Classified (_, ByTimeout) ->
-                record, [], [] // 再分類は既に1回使用済み（§5.4）
+                record, [], [], [] // 再分類は既に1回使用済み（§5.4）
             | NotCandidate ->
                 match tryClassify ctx w identity inputs with
                 | Resolved (m', ruleId) ->
                     let eff, by, home, userOverride = resolveWithHint ctx w hint m' ruleId (resolveHome ctx w ctx.ActiveWorkspace)
                     { record with Classification = Classified (eff, by); UserOverride = userOverride },
-                    [ classificationEvent w eff home ], []
+                    [ classificationEvent w eff home ], [], []
                 | ClassificationResult.AwaitingEvidence _ ->
                     let deadline = ctx.Now + ctx.ClassificationTimeoutMs
                     { record with Classification = AwaitingEvidence (deadline, ctx.ActiveWorkspace) },
-                    [], [ StartTimer (TimerId.Windows (ClassificationDeadline w), ctx.ClassificationTimeoutMs) ]
+                    [], [ StartTimer (TimerId.Windows (ClassificationDeadline w), ctx.ClassificationTimeoutMs) ], []
             | AwaitingEvidence (deadline, home) ->
                 match tryClassify ctx w identity inputs with
                 | Resolved (m', ruleId) ->
                     let eff, by, home', userOverride = resolveWithHint ctx w hint m' ruleId (resolveHome ctx w home)
                     { record with Classification = Classified (eff, by); UserOverride = userOverride },
-                    [ classificationEvent w eff home' ], [ CancelTimer (TimerId.Windows (ClassificationDeadline w)) ]
-                | ClassificationResult.AwaitingEvidence _ -> record, [], [] // まだUnknown、期限はそのまま
+                    [ classificationEvent w eff home' ], [ CancelTimer (TimerId.Windows (ClassificationDeadline w)) ], []
+                | ClassificationResult.AwaitingEvidence _ -> record, [], [], [] // まだUnknown、期限はそのまま
 
 let private withRecord
     (w: WindowId)
     (registry: WindowRegistry)
-    (f: WindowRecord -> WindowRecord * DomainEvent list * TimerCommand<TimerId> list)
-    : WindowRegistry * DomainEvent list * TimerCommand<TimerId> list =
+    (f: WindowRecord -> WindowRecord * DomainEvent list * TimerCommand<TimerId> list * DecisionTrace list)
+    : WindowRegistry * DomainEvent list * TimerCommand<TimerId> list * DecisionTrace list =
     let record0 = Map.tryFind w registry.Records |> Option.defaultValue WindowRecord.initial
-    let record', events, cmds = f record0
-    { registry with Records = Map.add w record' registry.Records }, events, cmds
+    let record', events, cmds, traces = f record0
+    { registry with Records = Map.add w record' registry.Records }, events, cmds, traces
 
 // ===== 公開ハンドラ（§7.1段①⑤、WmState.stepから呼ぶ） =====
 
@@ -339,11 +343,11 @@ let private withRecord
 /// `WindowVanishedByReuse w`だけを返す——新しいProcessの値を旧`WindowId`の下で混ぜないため
 /// （次の列挙でShellが新しい`WindowId`として再発見する、R4-14）。`Records`/`Identity`/`ClassInputs`の
 /// 実際の除去と待ちタイマーの取消は`WmState.vanishWindow`（`WindowRemoved`と共通）に委ねる。
-let onWindowObserved (ctx: ClassificationCtx) (snapshot: WindowSnapshot) (registry: WindowRegistry) : WindowRegistry * DomainEvent list * TimerCommand<TimerId> list =
+let onWindowObserved (ctx: ClassificationCtx) (snapshot: WindowSnapshot) (registry: WindowRegistry) : WindowRegistry * DomainEvent list * TimerCommand<TimerId> list * DecisionTrace list =
     let w = snapshot.Id
     let identity0 = Map.tryFind w registry.Identity |> Option.defaultValue identityInitial
     if detectsProcessReuse identity0.Process snapshot.Process then
-        registry, [ WindowVanishedByReuse w ], []
+        registry, [ WindowVanishedByReuse w ], [], []
     else
         let inputs0 = Map.tryFind w registry.ClassInputs |> Option.defaultValue classInputsInitial
         let identity' = reviseIdentity ctx.Now identity0 snapshot
@@ -357,7 +361,7 @@ let private withBeliefUpdate
     (w: WindowId)
     (reviseInputs: ClassInputBeliefs -> ClassInputBeliefs)
     (registry: WindowRegistry)
-    : WindowRegistry * DomainEvent list * TimerCommand<TimerId> list =
+    : WindowRegistry * DomainEvent list * TimerCommand<TimerId> list * DecisionTrace list =
     let identity = Map.tryFind w registry.Identity |> Option.defaultValue identityInitial
     let inputs0 = Map.tryFind w registry.ClassInputs |> Option.defaultValue classInputsInitial
     let inputs' = reviseInputs inputs0
@@ -375,9 +379,9 @@ let onCloakChanged (ctx: ClassificationCtx) (w: WindowId) (obs: Observation<Cloa
 /// （§5.4「無期限に待たない」）。`awaitDeadline`で古い発火を無視する（Topology/Health/Focusと同じパターン）。
 /// 所属ヒント（v2.64）が有ればタイムアウト経路でも`reconsider`と同じ規則を適用する——期限超過も
 /// 「その窓が分類された」瞬間の一つ（§4.5 R4-3はByPolicy/ByTimeoutを区別していない）。
-let onClassificationDeadline (ctx: ClassificationCtx) (w: WindowId) (registry: WindowRegistry) : WindowRegistry * DomainEvent list * TimerCommand<TimerId> list =
+let onClassificationDeadline (ctx: ClassificationCtx) (w: WindowId) (registry: WindowRegistry) : WindowRegistry * DomainEvent list * TimerCommand<TimerId> list * DecisionTrace list =
     match Map.tryFind w registry.Records with
-    | None -> registry, [], [] // 既に消滅した窓（古い発火）
+    | None -> registry, [], [], [] // 既に消滅した窓（古い発火）
     | Some record ->
         match record.Classification with
         | AwaitingEvidence (deadline, home) when awaitDeadline (Some deadline) ctx.Now ->
@@ -387,8 +391,8 @@ let onClassificationDeadline (ctx: ClassificationCtx) (w: WindowId) (registry: W
                 | Some (hintHome, None) -> EffFloating, ByTimeout, Some hintHome, None
                 | None -> EffFloating, ByTimeout, resolveHome ctx w home, None
             let record' = { record with Classification = Classified (eff, by); UserOverride = userOverride }
-            { registry with Records = Map.add w record' registry.Records }, [ classificationEvent w eff home' ], []
-        | _ -> registry, [], [] // 古い発火、またはユーザー操作等で既に確定済み
+            { registry with Records = Map.add w record' registry.Records }, [ classificationEvent w eff home' ], [], []
+        | _ -> registry, [], [], [] // 古い発火、またはユーザー操作等で既に確定済み
 
 /// `MembershipHintsLoaded`（§4.5 R4-3、v2.64）：稼働中の再起動直後、Shellが`(HWND, ProcessKey)`から
 /// 解決した所属ヒントをCoreへ登録する。ヒント自体は信念を書き換えない——対象の窓が実際に分類される
@@ -399,7 +403,7 @@ let onMembershipHintsLoaded (hints: (WindowId * WorkspaceId * Management option)
     { registry with
         MembershipHints = hints |> List.fold (fun m (w, ws, mgmt) -> Map.add w (ws, mgmt) m) registry.MembershipHints }
 
-let private applyUserOverride (ctx: ClassificationCtx) (w: WindowId) (m: Management) (registry: WindowRegistry) : WindowRegistry * DomainEvent list * TimerCommand<TimerId> list =
+let private applyUserOverride (ctx: ClassificationCtx) (w: WindowId) (m: Management) (registry: WindowRegistry) : WindowRegistry * DomainEvent list * TimerCommand<TimerId> list * DecisionTrace list =
     withRecord w registry (fun record ->
         let eff = toEffective (movabilityOf ctx w) m
         let home = resolveHome ctx w None
@@ -411,11 +415,11 @@ let private applyUserOverride (ctx: ClassificationCtx) (w: WindowId) (m: Managem
                 Classification = Classified (eff, ByUserOverride)
                 ManagementChangedAt = if changed then List.truncate 8 (ctx.Now :: record.ManagementChangedAt) else record.ManagementChangedAt }
         let cmds = if wasAwaiting then [ CancelTimer (TimerId.Windows (ClassificationDeadline w)) ] else []
-        record', [ classificationEvent w eff home ], cmds)
+        record', [ classificationEvent w eff home ], cmds, [])
 
 /// `ToggleFloating`/`SetManagement`/`ClearUserOverride`（§4.4のCoreCommand）。管理下に無い窓
 /// （`Records`に無いWindowId）への指定は何もしない。
-let onUserCommand (ctx: ClassificationCtx) (cmd: CoreCommand) (registry: WindowRegistry) : WindowRegistry * DomainEvent list * TimerCommand<TimerId> list =
+let onUserCommand (ctx: ClassificationCtx) (cmd: CoreCommand) (registry: WindowRegistry) : WindowRegistry * DomainEvent list * TimerCommand<TimerId> list * DecisionTrace list =
     match cmd with
     | SetManagement (w, m) when Map.containsKey w registry.Records -> applyUserOverride ctx w m registry
     | ToggleFloating w when Map.containsKey w registry.Records ->
@@ -437,9 +441,9 @@ let onUserCommand (ctx: ClassificationCtx) (cmd: CoreCommand) (registry: WindowR
         // 所属ヒント（v2.64）は再適用しない（`None`を渡す）——ユーザーの明示的な`ClearUserOverride`は
         // 「Policyの分類に戻す」という意図であり、起動直後の所属ヒントを再び被せると即座に無効化される。
         let baseRecord = { record with UserOverride = None; Classification = NotCandidate }
-        let record', events, cmds = reconsider ctx w identity inputs None baseRecord
-        { registry with Records = Map.add w record' registry.Records }, events, cmds
-    | _ -> registry, [], []
+        let record', events, cmds, traces = reconsider ctx w identity inputs None baseRecord
+        { registry with Records = Map.add w record' registry.Records }, events, cmds, traces
+    | _ -> registry, [], [], []
 
 /// `Movability`の信念が`NotMovable`へ修正された直後（`Denied OtherDenial`の帰結、§4.5）に呼ぶ。
 /// すでに`Tiled`/`Floating`として確定している窓だけを`Unplaced`へ読み替える（§4.4）。`Excluded`/
