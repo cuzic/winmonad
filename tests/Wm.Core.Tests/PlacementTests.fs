@@ -285,6 +285,28 @@ let ``2段目の自己リサイズが実際に観測されたら、RescalesItsel
     | other -> Assert.True(false, sprintf "expected an Inferred RescalesItself belief, got %A" other)
 
 [<Fact>]
+let ``最小化中の観測はDpiCrossingの判定に使わない(v2.76)`` () =
+    // CIスパイクS24/S25が確認した最小化時の挙動(矩形が-32000付近へ移る)が、v2.73
+    // (onPendingDeadlineTimerFired)・v2.75(checkUnattributedDrift)と同じ誤検知経路を
+    // checkDpiCrossingにも持つ：待機中のDpiCrossingのbaselineと最小化中の矩形を比べて
+    // 「2段目の自己リサイズが実際に起きた」と誤判定してはならない。
+    let w = WindowId 1L
+    let afterFirst, _, _ = onWindowObserved 10L (snapshotWith (Some (obs 1L rect)) (Some (obs 1L (MonitorId 0L))) None None None) initial
+    let oldMonitor1 = LatestWins.value (Map.find w afterFirst.Geometry).Monitor
+    let afterSecond, _, _ = onWindowObserved 20L (snapshotWith (Some (obs 2L rect)) (Some (obs 2L (MonitorId 1L))) None None None) afterFirst
+    let afterCrossCheck = checkDpiCrossing 20L dpi96Then192 w oldMonitor1 afterSecond
+    Assert.Equal(Some rect, Map.tryFind w afterCrossCheck.DpiCrossing) // baselineを記録して待っている状態
+    // ユーザーが最小化する。観測される矩形が-32000付近へ移る(CIスパイクS24/S25)。
+    let minimizedRect = { rect with X = -32000; Y = -32000 }
+    let afterMinimized, _, _ =
+        onWindowObserved 30L (snapshotWith (Some (obs 3L minimizedRect)) None (Some (obs 3L true)) None None) afterCrossCheck
+    let oldMonitor2 = LatestWins.value (Map.find w afterMinimized.Geometry).Monitor
+    let afterFinalCheck = checkDpiCrossing 30L dpi96Then192 w oldMonitor2 afterMinimized
+    // baselineは消えず、RescalesItselfも確定しない(最小化はアプリの自己リサイズではない)。
+    Assert.Equal(Some rect, Map.tryFind w afterFinalCheck.DpiCrossing)
+    Assert.Equal(None, Map.tryFind w afterFinalCheck.DpiBehavior)
+
+[<Fact>]
 let ``同じDPIの別モニターへ移ってもDpiCrossingを記録しない(v2.45)`` () =
     let w = WindowId 1L
     let sameDpi (_: MonitorId) : int option = Some 96

@@ -517,28 +517,47 @@ let onWindowObserved (now: int64) (snapshot: WindowSnapshot) (state: PlacementSt
 /// 参照）——これにより、ここで「矩形が変わった」と見る観測は、Core自身の要求ではまだ説明できない
 /// 変化だけに限られる（同じstepで要求が`Satisfied`になった場合でも、`Pending`の有無を見るのではなく
 /// 発行時点で先に記録を消しているので、取り違えない）。
+/// 最小化中は何もしない（v2.76、`checkUnattributedDrift`のv2.75の修正と同じ理由）：CIスパイクS24/S25
+/// が確認した「最小化時に観測される矩形は`-32000`付近へ移る」という挙動は、`crossedDifferentDpi`の
+/// モニター比較だけでなく、`DpiCrossing`の記録済みbaselineとの矩形比較（直前の段）にも同じ誤検知
+/// 経路を持つ——`DpiCrossing`に記録が残っている窓を最小化すると、観測された`-32000`付近の矩形が
+/// baselineと異なるため「2段目の自己リサイズが実際に起きた」と誤って`RescalesItself`を確定させて
+/// しまう（実際にはユーザーが最小化しただけで、アプリは何もしていない）。この信念は
+/// `onPendingDeadlineTimerFired`の`isMidDpiTransition`（MinWidth証拠の2段目除外）に使われるため、
+/// 誤って確定すると後続の本物のDPI遷移でのMinWidth証拠収集を歪める。最小化→復元後に本当に
+/// DPIをまたいでいた場合は、復元後の観測で`crossedDifferentDpi`が改めて判定し直されるので、
+/// このラウンドを丸ごと止めても実害は無い（`DpiCrossing`の記録もbaselineの更新も、最小化中は
+/// 一切行わない）。CIスパイクS24/S25と同じ残課題（`EVENT_SYSTEM_MINIMIZESTART`より`-32000`付近の
+/// `EVENT_OBJECT_LOCATIONCHANGE`が先に届く場合があるため、最小化を引き起こした最初の1件の観測では
+/// `IsMinimized`信念がまだ`true`に確定していない可能性がある）はこの関数には`onPendingDeadlineTimerFired`
+/// のような猶予期間（`PendingDeadline`）が無いため解消しきれない——既知の残存ギャップとして認める
+/// （v2.73の条件5と同じ判断）。
 let checkDpiCrossing (now: int64) (dpiOf: MonitorId -> int option) (w: WindowId) (oldMonitor: MonitorId option) (state: PlacementState) : PlacementState =
-    let newMonitor = Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.Monitor)
-    let crossedDifferentDpi =
-        match oldMonitor, newMonitor with
-        | Some oldM, Some newM when oldM <> newM ->
-            match dpiOf oldM, dpiOf newM with
-            | Some dOld, Some dNew -> dOld <> dNew
+    let isMinimized = Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.IsMinimized) |> Option.defaultValue false
+    if isMinimized then
+        state
+    else
+        let newMonitor = Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.Monitor)
+        let crossedDifferentDpi =
+            match oldMonitor, newMonitor with
+            | Some oldM, Some newM when oldM <> newM ->
+                match dpiOf oldM, dpiOf newM with
+                | Some dOld, Some dNew -> dOld <> dNew
+                | _ -> false
             | _ -> false
-        | _ -> false
-    let currentRect = Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.VisibleFrameRect)
-    let state =
-        match crossedDifferentDpi, currentRect with
-        | true, Some rect -> { state with DpiCrossing = Map.add w rect state.DpiCrossing }
-        | _ -> state
-    match Map.tryFind w state.DpiCrossing, currentRect with
-    | Some baseline, Some observed when observed <> baseline ->
-        let valueSeq = Map.tryFind w state.Geometry |> Option.bind (fun g -> g.VisibleFrameRect.ValueSeq)
-        let evidence = valueSeq |> Option.map Sample |> Option.toList
-        { state with
-            DpiCrossing = Map.remove w state.DpiCrossing
-            DpiBehavior = Map.add w { Value = RescalesItself; Confidence = Inferred evidence; LastRevisedAt = now } state.DpiBehavior }
-    | _ -> state // まだ変化無し、またはこの窓は対象外
+        let currentRect = Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.VisibleFrameRect)
+        let state =
+            match crossedDifferentDpi, currentRect with
+            | true, Some rect -> { state with DpiCrossing = Map.add w rect state.DpiCrossing }
+            | _ -> state
+        match Map.tryFind w state.DpiCrossing, currentRect with
+        | Some baseline, Some observed when observed <> baseline ->
+            let valueSeq = Map.tryFind w state.Geometry |> Option.bind (fun g -> g.VisibleFrameRect.ValueSeq)
+            let evidence = valueSeq |> Option.map Sample |> Option.toList
+            { state with
+                DpiCrossing = Map.remove w state.DpiCrossing
+                DpiBehavior = Map.add w { Value = RescalesItself; Confidence = Inferred evidence; LastRevisedAt = now } state.DpiBehavior }
+        | _ -> state // まだ変化無し、またはこの窓は対象外
 
 /// `MoveCause.Unattributed`のドリフト検知（v2.70、§4.4 R3-4、Opus敵対的レビュー
 /// `opus-review-unattributed-movecause.md`で設計）。ラウンド1はクロスモニターのずれだけを対象にする
