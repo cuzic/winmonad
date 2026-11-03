@@ -123,8 +123,9 @@
 ///   `MOVESIZEEND`自体が発火しないと判明し、実デスクトップでの再検証（S11r等と同じ限定）が必要だったが、
 ///   ~~実装自体は依然専用のラウンドへ持ち越す~~：**v2.65で実装**（`PlacementState.Dragging`、
 ///   `onMoveSizeStarted`/`onMoveSizeEnded`、`onPendingDeadlineTimerFired`の各型直前のコメント参照）。
-/// - **ユーザー操作による1回だけの試し直し**：ユーザーコマンド経由でPlacementへの新しい入口が要る
-///   ——専用のラウンドへ切り出す。
+/// - ~~**ユーザー操作による1回だけの試し直し**~~：**v2.83で実装**（`onUserCommand`、型直前のコメント
+///   参照）。`WmState.step`が`UserCommand (SetManagement _ | ToggleFloating _)`をPlacementへも中継する
+///   新しい入口を追加した。
 /// - ~~**`MinWidth`（Accumulating規則）**~~：v2.43で実装（`reviseMinWidth`、型直前のコメント参照）。
 ///   `Mismatch`（`observed.Width > TargetRect.Width`）を証拠に、観測時の窓のモニターDPIでDIPへ
 ///   正規化した値を`Inferred`の最小幅とする。`DpiBehavior = RescalesItself`の2段目リサイズ待ちを
@@ -633,6 +634,19 @@ let onMoveSizeStarted (w: WindowId) (state: PlacementState) : PlacementState =
 /// 対象外のまま明示的に持ち越す（同じモニター内のドラッグ、`Unattributed`/`OsInduced`分岐も同様）。
 let onMoveSizeEnded (w: WindowId) (state: PlacementState) : PlacementState =
     { state with Dragging = Set.remove w state.Dragging }
+
+/// `SetManagement`/`ToggleFloating`（v2.83、architecture.md §4.5 Movability「ユーザーの明示操作による
+/// 1回だけの試し直し」、R4-11/R6-2）：`Movability`が`NotMovable`な窓にユーザーが明示的に管理操作を
+/// 行ったら、「ユーザーの明示操作は古い推定を捨てる根拠になる」という本文どおり、`Movable (Inferred [])`
+/// へ戻して1回だけ試し直す。自動の再試行（長いバックオフでの再挑戦）は行わないので、この入口は
+/// ユーザーコマンド経由に限る（ファイル冒頭「このラウンドで意図的に対象外にしたこと」の該当項目、
+/// v2.83で実装）。既に`Movable`、または`Movability`信念が未形成なら何もしない（冪等。自動の再試行では
+/// ないので、ユーザーが同じ窓へ何度コマンドを送っても安全に無害）。
+let onUserCommand (now: int64) (w: WindowId) (state: PlacementState) : PlacementState =
+    match Map.tryFind w state.Movability with
+    | Some { Value = NotMovable } ->
+        { state with Movability = Map.add w { Value = Movable; Confidence = Inferred []; LastRevisedAt = now } state.Movability }
+    | _ -> state
 
 /// `TimerElapsed (Placement (IntegrityReprobe w))`：`Reprobe`Effectを再発行し、次の試行を予約する
 /// （TopologyやHealthの再probeと同じ`awaitDeadline`パターンで古い発火を無視する）。

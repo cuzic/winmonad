@@ -208,6 +208,44 @@ let ``EffectCallReturnedのDenied OtherDenialは、同じstepでMovability修正
     let setRectsForW = effects |> List.choose (function SetRect (_, target, _) when target = w -> Some target | _ -> None)
     Assert.Empty(setRectsForW)
 
+/// v2.83：`Movability`が`NotMovable`になった窓(上記のDenied OtherDenialと同じ経路で用意する)に
+/// ユーザーが`ToggleFloating`/`SetManagement`を送ると、同じstepでPlacement.onUserCommandが
+/// `Movable (Inferred [])`へ1回だけ戻す(architecture.md §4.5「ユーザーの明示操作は古い推定を
+/// 捨てる根拠になる」、R4-11)。Windowsドメイン(段①)が同じ入力で分類をFloatingへ変えるのとは
+/// 独立に、Placementは自分のMovability信念だけを直す(ADR-018)。
+[<Fact>]
+let ``NotMovableになった窓にToggleFloatingを送ると、同じstepでMovabilityがMovableへ1回だけ試し直される(v2.83)`` () =
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0 ]
+    let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+    let w = WindowId 1L
+    let afterObserved = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved w))
+    let rid =
+        afterObserved.Next.Placement.Pending
+        |> Map.toSeq
+        |> Seq.filter (fun (_, (pr: PendingRequest)) -> pr.Window = w)
+        |> Seq.map fst
+        |> Seq.head
+    let deniedError: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 5; ElapsedUs = 0L }
+    let afterDenied = step RuntimePolicy.defaults afterObserved.Next (mkEnvelope 2L (EffectCallReturned (rid, Error deniedError, None)))
+    match Map.tryFind w afterDenied.Next.Placement.Movability with
+    | Some { Value = NotMovable } -> ()
+    | other -> Assert.True(false, sprintf "precondition failed, unexpected Movability: %A" other)
+
+    let afterToggle = step RuntimePolicy.defaults afterDenied.Next (mkEnvelope 3L (UserCommand (ToggleFloating w)))
+    match Map.tryFind w afterToggle.Next.Placement.Movability with
+    | Some { Value = Movable; Confidence = Inferred [] } -> ()
+    | other -> Assert.True(false, sprintf "unexpected Movability after ToggleFloating: %A" other)
+
+[<Fact>]
+let ``NotMovableと無関係な窓へのUserCommandは、その窓のMovabilityを変えない(回帰確認、v2.83)`` () =
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0 ]
+    let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+    let w = WindowId 1L
+    let afterObserved = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved w))
+    let before = Map.tryFind w afterObserved.Next.Placement.Movability
+    let afterToggle = step RuntimePolicy.defaults afterObserved.Next (mkEnvelope 2L (UserCommand (ToggleFloating w)))
+    Assert.Equal(before, Map.tryFind w afterToggle.Next.Placement.Movability)
+
 [<Fact>]
 let ``Placement.MinWidthの信念は段⑦のLayoutContext.TiledWindowsへ実際に渡る(v2.48)`` () =
     let captured = ref Option<LayoutContext>.None

@@ -103,6 +103,31 @@ let ``窓の発見時にMovabilityは楽観的既定値(Movable, Inferred[])に�
     | { Value = Movable; Confidence = Inferred [] } -> ()
     | other -> Assert.True(false, sprintf "unexpected: %A" other)
 
+// ===== Movability（ユーザー操作による1回だけの試し直し、v2.83、architecture.md §4.5 R4-11/R6-2） =====
+
+[<Fact>]
+let ``NotMovableな窓にonUserCommandを呼ぶと、Movableへ1回だけ試し直される`` () =
+    let state =
+        { initial with
+            Movability = Map.add (WindowId 1L) { Value = NotMovable; Confidence = Inferred [ Outcome (1L, RequestId 1L) ]; LastRevisedAt = 1L } initial.Movability }
+    let state' = onUserCommand 20L (WindowId 1L) state
+    match Map.find (WindowId 1L) state'.Movability with
+    | { Value = Movable; Confidence = Inferred []; LastRevisedAt = 20L } -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+
+[<Fact>]
+let ``既にMovableな窓にonUserCommandを呼んでも変化しない(冪等)`` () =
+    let state =
+        { initial with
+            Movability = Map.add (WindowId 1L) { Value = Movable; Confidence = Confirmed; LastRevisedAt = 1L } initial.Movability }
+    let state' = onUserCommand 20L (WindowId 1L) state
+    Assert.Equal<Belief<Movability>>(Map.find (WindowId 1L) state.Movability, Map.find (WindowId 1L) state'.Movability)
+
+[<Fact>]
+let ``Movability信念が未形成の窓にonUserCommandを呼んでも何も作られない`` () =
+    let state' = onUserCommand 20L (WindowId 1L) initial
+    Assert.False(Map.containsKey (WindowId 1L) state'.Movability)
+
 // ===== TargetIntegrity（ProbeOnce） =====
 
 [<Fact>]

@@ -289,6 +289,11 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         | MinimizedStateChanged (w, obs) -> Placement.onMinimizedStateChanged now w obs stateAfterWindows.Placement, [], [], None
         | MoveSizeStarted w -> Placement.onMoveSizeStarted w stateAfterWindows.Placement, [], [], None
         | MoveSizeEnded (w, _, _) -> Placement.onMoveSizeEnded w stateAfterWindows.Placement, [], [], None
+        | UserCommand (SetManagement (w, _)) | UserCommand (ToggleFloating w) ->
+            // v2.83：`Movability`が`NotMovable`な窓へのユーザーの明示操作による1回だけの試し直し
+            // （Placement.onUserCommandの型直前のコメント参照）。Windowsドメイン（段①、上記）が
+            // 同じ入力で分類を直すのとは別に、Placementは自分の信念だけを直す（ADR-018）。
+            Placement.onUserCommand now w stateAfterWindows.Placement, [], [], None
         | TimerElapsed (TimerId.Placement (IntegrityReprobe w)) ->
             let s, e, t = Placement.onIntegrityReprobeTimerFired now w stateAfterWindows.Placement
             s, e, t, None
