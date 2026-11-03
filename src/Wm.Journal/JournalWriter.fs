@@ -64,6 +64,16 @@ let private timerIdOfJson (node: JsonNode) : TimerId =
     | "health-responsiveness-reprobe" -> TimerId.Health (ResponsivenessReprobe (WindowId (refVal ())))
     | other -> failwithf "Replay: unrecognized TimerId tag '%s' — このJournalはより新しいスキーマで書かれている" other
 
+/// `System.Text.Json.Nodes.JsonValue.Create<string>(null)`は（正しく）JSONの`null`を表す`null`な
+/// `JsonNode`参照を返すが、読み出し側で`node.GetValue<string>()`をそのまま呼ぶと`NullReferenceException`
+/// になる（`GetValue`はインスタンスメソッドで、`this`がnullだと呼べない）。`string`は.NET/F#では既定で
+/// null許容なので、`Observation<'T>.Source`や`NativeCallRecord.Api`のような文字列フィールドにJSON側で
+/// nullが来ても安全に往復させる必要がある——v2.57でFsCheckの`WindowSnapshot`往復テストが
+/// `Source = null`を実際に生成して検出した（null文字列を本当に送ってくるコードは今の実装には無いが、
+/// 型がnullを許す以上、Journalの往復は「来たら安全に扱う」側であるべき、という判断）。
+let private stringOfJsonAllowNull (node: JsonNode) : string =
+    if isNull node then null else node.GetValue<string>()
+
 let private pixelRectToJson (r: PixelRect) : JsonNode =
     let o = JsonObject()
     o.["x"] <- JsonValue.Create(r.X)
@@ -119,7 +129,7 @@ let private nativeCallRecordToJson (r: NativeCallRecord) : JsonNode =
     o :> JsonNode
 
 let private nativeCallRecordOfJson (node: JsonNode) : NativeCallRecord =
-    { Api = node.["api"].GetValue<string>()
+    { Api = stringOfJsonAllowNull node.["api"]
       Space = errorSpaceOfJson (node.["space"].GetValue<string>())
       Code = node.["code"].GetValue<int>()
       ElapsedUs = node.["elapsedUs"].GetValue<int64>() }
@@ -132,32 +142,209 @@ let private windowIdOptionToJson (w: WindowId option) : JsonNode =
 let private windowIdOptionOfJson (node: JsonNode) : WindowId option =
     if isNull node then None else Some (WindowId (node.GetValue<int64>()))
 
-/// `ForegroundObserved`が運ぶ`Observation<WindowId option>`のDTO（§4.2。Observation<'T>は`'T`ごとに
-/// 個別の符号化が要る——このスライスで実際に必要なのはこの1つだけなので、汎用の符号化基盤は作らない）。
-let private observationWindowIdOptionToJson (obs: Observation<WindowId option>) : JsonNode =
+/// `Observation<'T>`の汎用DTO（§4.2）。値そのものの符号化（`valueToJson`/`valueOfJson`）だけを
+/// 型ごとに渡す——v2.42までは`ForegroundObserved`用の`Observation<WindowId option>`専用版しか無かった
+/// （「このスライスで必要なのはこの1つだけ」という理由で汎用化を避けていた）。v2.57で`WindowObserved`
+/// 等がJournal往復対象になり、`WindowSnapshot`の各フィールドごとに同じ形を繰り返す必要が出たため、
+/// ここで一般化した（`ForegroundObserved`側は`observationToJson windowIdOptionToJson`という適用に
+/// 置き換えるだけで、JSON形状自体は変えていない）。
+let private observationToJson (valueToJson: 'T -> JsonNode) (obs: Observation<'T>) : JsonNode =
     let o = JsonObject()
     o.["sampleSequence"] <- JsonValue.Create(obs.SampleSequence)
     o.["monotonicTime"] <- JsonValue.Create(obs.MonotonicTime)
     o.["source"] <- JsonValue.Create(obs.Source)
     match obs.Value with
-    | Ok w ->
+    | Ok v ->
         o.["outcome"] <- JsonValue.Create("ok")
-        o.["value"] <- windowIdOptionToJson w
+        o.["value"] <- valueToJson v
     | Error rec_ ->
         o.["outcome"] <- JsonValue.Create("failed")
         o.["failure"] <- nativeCallRecordToJson rec_
     o :> JsonNode
 
-let private observationWindowIdOptionOfJson (node: JsonNode) : Observation<WindowId option> =
+let private observationOfJson (valueOfJson: JsonNode -> 'T) (node: JsonNode) : Observation<'T> =
     let value =
         match node.["outcome"].GetValue<string>() with
-        | "ok" -> Ok (windowIdOptionOfJson node.["value"])
+        | "ok" -> Ok (valueOfJson node.["value"])
         | "failed" -> Error (nativeCallRecordOfJson node.["failure"])
         | other -> failwithf "Replay: unrecognized Observation outcome '%s'" other
     { Value = value
       SampleSequence = node.["sampleSequence"].GetValue<int64>()
       MonotonicTime = node.["monotonicTime"].GetValue<int64>()
-      Source = node.["source"].GetValue<string>() }
+      Source = stringOfJsonAllowNull node.["source"] }
+
+let private observationOptionToJson (valueToJson: 'T -> JsonNode) (obs: Observation<'T> option) : JsonNode =
+    match obs with
+    | Some o -> observationToJson valueToJson o
+    | None -> null
+
+let private observationOptionOfJson (valueOfJson: JsonNode -> 'T) (node: JsonNode) : Observation<'T> option =
+    if isNull node then None else Some (observationOfJson valueOfJson node)
+
+let private boolToJson (b: bool) : JsonNode = JsonValue.Create(b) :> JsonNode
+let private boolOfJson (node: JsonNode) : bool = node.GetValue<bool>()
+
+let private intToJson (i: int) : JsonNode = JsonValue.Create(i) :> JsonNode
+let private intOfJson (node: JsonNode) : int = node.GetValue<int>()
+
+let private stringOptionObservationToJson (obs: Observation<string> option) : JsonNode =
+    observationOptionToJson (fun (s: string) -> JsonValue.Create(s) :> JsonNode) obs
+
+let private stringOptionObservationOfJson (node: JsonNode) : Observation<string> option =
+    observationOptionOfJson stringOfJsonAllowNull node
+
+let private appIdentityToJson (a: AppIdentity) : JsonNode =
+    let o = JsonObject()
+    o.["exe"] <- stringOptionObservationToJson a.Exe
+    o.["hostExe"] <- stringOptionObservationToJson a.HostExe
+    o.["aumid"] <- stringOptionObservationToJson a.Aumid
+    o.["coreWindowExe"] <- stringOptionObservationToJson a.CoreWindowExe
+    o :> JsonNode
+
+let private appIdentityOfJson (node: JsonNode) : AppIdentity =
+    { Exe = stringOptionObservationOfJson node.["exe"]
+      HostExe = stringOptionObservationOfJson node.["hostExe"]
+      Aumid = stringOptionObservationOfJson node.["aumid"]
+      CoreWindowExe = stringOptionObservationOfJson node.["coreWindowExe"] }
+
+let private processKeyToJson (p: ProcessKey) : JsonNode =
+    let o = JsonObject()
+    o.["pid"] <- JsonValue.Create(p.Pid)
+    o.["creationTime"] <- JsonValue.Create(p.CreationTime)
+    o :> JsonNode
+
+let private processKeyOfJson (node: JsonNode) : ProcessKey =
+    { Pid = node.["pid"].GetValue<int>(); CreationTime = node.["creationTime"].GetValue<int64>() }
+
+let private cloakStateToJson (c: CloakState) : JsonNode =
+    let o = JsonObject()
+    o.["app"] <- JsonValue.Create(c.App)
+    o.["shell"] <- JsonValue.Create(c.Shell)
+    o.["inherited"] <- JsonValue.Create(c.Inherited)
+    o :> JsonNode
+
+let private cloakStateOfJson (node: JsonNode) : CloakState =
+    { App = node.["app"].GetValue<bool>(); Shell = node.["shell"].GetValue<bool>(); Inherited = node.["inherited"].GetValue<bool>() }
+
+let private monitorIdToJson (MonitorId mid: MonitorId) : JsonNode = JsonValue.Create(mid) :> JsonNode
+let private monitorIdOfJson (node: JsonNode) : MonitorId = MonitorId (node.GetValue<int64>())
+
+let private integrityRelationToJson (r: IntegrityRelation) : JsonNode =
+    JsonValue.Create(match r with NotHigher -> "not-higher" | Higher -> "higher") :> JsonNode
+
+let private integrityRelationOfJson (node: JsonNode) : IntegrityRelation =
+    match node.GetValue<string>() with
+    | "not-higher" -> NotHigher
+    | "higher" -> Higher
+    | other -> failwithf "Replay: unrecognized IntegrityRelation tag '%s'" other
+
+let private responsivenessSampleToJson (r: ResponsivenessSample) : JsonNode =
+    let o = JsonObject()
+    match r with
+    | PumpResponded -> o.["tag"] <- JsonValue.Create("pump-responded")
+    | PumpTimedOut elapsedUs ->
+        o.["tag"] <- JsonValue.Create("pump-timed-out")
+        o.["elapsedUs"] <- JsonValue.Create(elapsedUs)
+    | IsHungAppWindowTrue -> o.["tag"] <- JsonValue.Create("is-hung-app-window-true")
+    o :> JsonNode
+
+let private responsivenessSampleOfJson (node: JsonNode) : ResponsivenessSample =
+    match node.["tag"].GetValue<string>() with
+    | "pump-responded" -> PumpResponded
+    | "pump-timed-out" -> PumpTimedOut (node.["elapsedUs"].GetValue<int64>())
+    | "is-hung-app-window-true" -> IsHungAppWindowTrue
+    | other -> failwithf "Replay: unrecognized ResponsivenessSample tag '%s'" other
+
+let private observedPresenceToJson (p: ObservedPresence) : JsonNode =
+    JsonValue.Create(match p with VisibleToUser -> "visible-to-user" | HiddenByWmMethod -> "hidden-by-wm-method" | HiddenOther -> "hidden-other") :> JsonNode
+
+let private observedPresenceOfJson (node: JsonNode) : ObservedPresence =
+    match node.GetValue<string>() with
+    | "visible-to-user" -> VisibleToUser
+    | "hidden-by-wm-method" -> HiddenByWmMethod
+    | "hidden-other" -> HiddenOther
+    | other -> failwithf "Replay: unrecognized ObservedPresence tag '%s'" other
+
+let private dpiAwarenessDeclaredToJson (d: DpiAwarenessDeclared) : JsonNode =
+    JsonValue.Create(match d with Unaware -> "unaware" | SystemAware -> "system-aware" | PerMonitor -> "per-monitor" | PerMonitorV2 -> "per-monitor-v2") :> JsonNode
+
+let private dpiAwarenessDeclaredOfJson (node: JsonNode) : DpiAwarenessDeclared =
+    match node.GetValue<string>() with
+    | "unaware" -> Unaware
+    | "system-aware" -> SystemAware
+    | "per-monitor" -> PerMonitor
+    | "per-monitor-v2" -> PerMonitorV2
+    | other -> failwithf "Replay: unrecognized DpiAwarenessDeclared tag '%s'" other
+
+let private titleMatchVectorToJson (t: TitleMatchVector) : JsonNode =
+    let o = JsonObject()
+    o.["patternSetHash"] <- JsonValue.Create(t.PatternSetHash)
+    let arr = JsonArray()
+    for i in t.Matches do arr.Add(JsonValue.Create(i))
+    o.["matches"] <- arr
+    o :> JsonNode
+
+let private titleMatchVectorOfJson (node: JsonNode) : TitleMatchVector =
+    { PatternSetHash = stringOfJsonAllowNull node.["patternSetHash"]
+      Matches = node.["matches"].AsArray() |> Seq.map (fun n -> n.GetValue<int>()) |> Set.ofSeq }
+
+/// `WindowSnapshot`（§4.2「今回Shellが問い合わせた属性だけを運ぶ部分観測」）のDTO。各フィールドは
+/// `Observation<'T> option`で、問い合わせなかったフィールドは`null`として書く（v2.57追加）。
+let private windowSnapshotToJson (s: WindowSnapshot) : JsonNode =
+    let o = JsonObject()
+    let (WindowId wid) = s.Id
+    o.["id"] <- JsonValue.Create(wid)
+    o.["process"] <- observationOptionToJson processKeyToJson s.Process
+    o.["appIdentity"] <- appIdentityToJson s.AppIdentity
+    o.["owner"] <- observationOptionToJson windowIdOptionToJson s.Owner
+    o.["isDialog"] <- observationOptionToJson boolToJson s.IsDialog
+    o.["nativeRect"] <- observationOptionToJson pixelRectToJson s.NativeRect
+    o.["visibleFrameRect"] <- observationOptionToJson pixelRectToJson s.VisibleFrameRect
+    o.["isVisible"] <- observationOptionToJson boolToJson s.IsVisible
+    o.["isMinimized"] <- observationOptionToJson boolToJson s.IsMinimized
+    o.["cloak"] <- observationOptionToJson cloakStateToJson s.Cloak
+    o.["monitor"] <- observationOptionToJson monitorIdToJson s.Monitor
+    o.["minWidthHint"] <- observationOptionToJson intToJson s.MinWidthHint
+    o.["targetIntegrity"] <- observationOptionToJson integrityRelationToJson s.TargetIntegrity
+    o.["responsiveness"] <- observationOptionToJson responsivenessSampleToJson s.Responsiveness
+    o.["presence"] <- observationOptionToJson observedPresenceToJson s.Presence
+    o.["dpiAwareness"] <- observationOptionToJson dpiAwarenessDeclaredToJson s.DpiAwareness
+    o.["titleMatches"] <- observationOptionToJson titleMatchVectorToJson s.TitleMatches
+    o :> JsonNode
+
+let private windowSnapshotOfJson (node: JsonNode) : WindowSnapshot =
+    { Id = WindowId (node.["id"].GetValue<int64>())
+      Process = observationOptionOfJson processKeyOfJson node.["process"]
+      AppIdentity = appIdentityOfJson node.["appIdentity"]
+      Owner = observationOptionOfJson windowIdOptionOfJson node.["owner"]
+      IsDialog = observationOptionOfJson boolOfJson node.["isDialog"]
+      NativeRect = observationOptionOfJson pixelRectOfJson node.["nativeRect"]
+      VisibleFrameRect = observationOptionOfJson pixelRectOfJson node.["visibleFrameRect"]
+      IsVisible = observationOptionOfJson boolOfJson node.["isVisible"]
+      IsMinimized = observationOptionOfJson boolOfJson node.["isMinimized"]
+      Cloak = observationOptionOfJson cloakStateOfJson node.["cloak"]
+      Monitor = observationOptionOfJson monitorIdOfJson node.["monitor"]
+      MinWidthHint = observationOptionOfJson intOfJson node.["minWidthHint"]
+      TargetIntegrity = observationOptionOfJson integrityRelationOfJson node.["targetIntegrity"]
+      Responsiveness = observationOptionOfJson responsivenessSampleOfJson node.["responsiveness"]
+      Presence = observationOptionOfJson observedPresenceOfJson node.["presence"]
+      DpiAwareness = observationOptionOfJson dpiAwarenessDeclaredOfJson node.["dpiAwareness"]
+      TitleMatches = observationOptionOfJson titleMatchVectorOfJson node.["titleMatches"] }
+
+let private unitResultToJson (r: Result<unit, NativeCallRecord>) : JsonNode =
+    let o = JsonObject()
+    match r with
+    | Ok () -> o.["outcome"] <- JsonValue.Create("ok")
+    | Error rec_ ->
+        o.["outcome"] <- JsonValue.Create("failed")
+        o.["failure"] <- nativeCallRecordToJson rec_
+    o :> JsonNode
+
+let private unitResultOfJson (node: JsonNode) : Result<unit, NativeCallRecord> =
+    match node.["outcome"].GetValue<string>() with
+    | "ok" -> Ok ()
+    | "failed" -> Error (nativeCallRecordOfJson node.["failure"])
+    | other -> failwithf "Replay: unrecognized Result outcome '%s'" other
 
 let private managementToJson (m: Management) : string =
     match m with
@@ -262,7 +449,14 @@ let private coreCommandOfJson (node: JsonNode) : CoreCommand =
 
 /// このスライスで対応するInputEventのタグ（§9.2のDTOタグ付け規約）。`step`が分岐に使う入力
 /// （MonitorTopologyObserved/ScreenReconfigurationInProgress/TimerElapsed/ForegroundObserved/
-/// WindowRemoved/UserCommand）は全て対応する（Opusレビュー5-4）。
+/// WindowRemoved/UserCommand）は全て対応する（Opusレビュー5-4）。**v2.57で`WindowObserved`/
+/// `VisibilityChanged`/`CloakChanged`/`MinimizedStateChanged`/`EffectCallReturned`も追加**：
+/// `WmState.step`が実際に分岐対象にしている入力のうち、この5つが未対応のまま（`unsupported-
+/// input-event`へ落ちてReplayがfail-fastする）残っていた——§9.2自身が要求する「`step`の入力分岐 ⊆
+/// Journalの往復可能集合」という不変条件への違反であり、かつこの5つは現実のシナリオで最も頻繁に
+/// 届く入力（`WindowObserved`は窓の発見・全ての信念更新の起点）なので、実機ReplayがほぼどのJournalも
+/// 読めない状態だった。`EffectBatchReturned`は`ApplyBatch`自体がまだ発行されないため（VirtualWorld.fs
+/// ファイル冒頭コメント参照）、依然対象外のまま。
 let private inputEventToJson (input: InputEvent) : JsonNode =
     let o = JsonObject()
     match input with
@@ -279,15 +473,36 @@ let private inputEventToJson (input: InputEvent) : JsonNode =
         o.["timerId"] <- timerIdToJson timerId
     | ForegroundObserved obs ->
         o.["tag"] <- JsonValue.Create("foreground-observed")
-        o.["observation"] <- observationWindowIdOptionToJson obs
+        o.["observation"] <- observationToJson windowIdOptionToJson obs
     | WindowRemoved (WindowId w) ->
         o.["tag"] <- JsonValue.Create("window-removed")
         o.["windowId"] <- JsonValue.Create(w)
     | UserCommand cmd ->
         o.["tag"] <- JsonValue.Create("user-command")
         o.["command"] <- coreCommandToJson cmd
+    | WindowObserved snapshot ->
+        o.["tag"] <- JsonValue.Create("window-observed")
+        o.["snapshot"] <- windowSnapshotToJson snapshot
+    | VisibilityChanged (WindowId w, obs) ->
+        o.["tag"] <- JsonValue.Create("visibility-changed")
+        o.["windowId"] <- JsonValue.Create(w)
+        o.["observation"] <- observationToJson boolToJson obs
+    | CloakChanged (WindowId w, obs) ->
+        o.["tag"] <- JsonValue.Create("cloak-changed")
+        o.["windowId"] <- JsonValue.Create(w)
+        o.["observation"] <- observationToJson cloakStateToJson obs
+    | MinimizedStateChanged (WindowId w, obs) ->
+        o.["tag"] <- JsonValue.Create("minimized-state-changed")
+        o.["windowId"] <- JsonValue.Create(w)
+        o.["observation"] <- observationToJson boolToJson obs
+    | EffectCallReturned (RequestId rid, result, dispatchSeq) ->
+        o.["tag"] <- JsonValue.Create("effect-call-returned")
+        o.["requestId"] <- JsonValue.Create(rid)
+        o.["result"] <- unitResultToJson result
+        o.["dispatchSeq"] <- (dispatchSeq |> Option.map JsonValue.Create<int64> |> Option.defaultValue null)
     | other ->
-        // 本ビルドで未対応のInputEvent。表示専用（Replayはこのタグに出会うとfail-fastする、§9.2）。
+        // 本ビルドで未対応のInputEvent（`EffectBatchReturned`等）。表示専用（Replayはこのタグに
+        // 出会うとfail-fastする、§9.2）。
         o.["tag"] <- JsonValue.Create("unsupported-input-event")
         o.["raw"] <- JsonValue.Create(sprintf "%A" other)
     o :> JsonNode
@@ -299,9 +514,16 @@ let private inputEventOfJson (node: JsonNode) : InputEvent =
         MonitorTopologyObserved snapshots
     | "screen-reconfiguration-in-progress" -> ScreenReconfigurationInProgress (node.["value"].GetValue<bool>())
     | "timer-elapsed" -> TimerElapsed (timerIdOfJson node.["timerId"])
-    | "foreground-observed" -> ForegroundObserved (observationWindowIdOptionOfJson node.["observation"])
+    | "foreground-observed" -> ForegroundObserved (observationOfJson windowIdOptionOfJson node.["observation"])
     | "window-removed" -> WindowRemoved (WindowId (node.["windowId"].GetValue<int64>()))
     | "user-command" -> UserCommand (coreCommandOfJson node.["command"])
+    | "window-observed" -> WindowObserved (windowSnapshotOfJson node.["snapshot"])
+    | "visibility-changed" -> VisibilityChanged (WindowId (node.["windowId"].GetValue<int64>()), observationOfJson boolOfJson node.["observation"])
+    | "cloak-changed" -> CloakChanged (WindowId (node.["windowId"].GetValue<int64>()), observationOfJson cloakStateOfJson node.["observation"])
+    | "minimized-state-changed" -> MinimizedStateChanged (WindowId (node.["windowId"].GetValue<int64>()), observationOfJson boolOfJson node.["observation"])
+    | "effect-call-returned" ->
+        let dispatchSeq = if isNull node.["dispatchSeq"] then None else Some (node.["dispatchSeq"].GetValue<int64>())
+        EffectCallReturned (RequestId (node.["requestId"].GetValue<int64>()), unitResultOfJson node.["result"], dispatchSeq)
     | other -> failwithf "Replay: unrecognized InputEvent tag '%s' — このJournalはより新しいスキーマで書かれている" other
 
 let private payloadToJson (payload: JournalPayload) : JsonNode =

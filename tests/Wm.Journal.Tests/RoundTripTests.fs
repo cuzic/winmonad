@@ -154,3 +154,34 @@ let ``ChangeLayoutはLayoutArgsの全ケース・任意精度のMasterRatioで�
 let ``SetManagementはManagementの全ケースでも往復しても一致する`` (w: int) (management: Management) =
     let entry = mkEntry (InputPayload (UserCommand (SetManagement (WindowId (int64 (abs w)), management))))
     roundTrip entry = entry
+
+/// v2.57：`WmState.step`が分岐対象にしている入力のうち、ここまで`unsupported-input-event`に
+/// 落ちてReplayがfail-fastしていた5ケース（`WindowObserved`/`VisibilityChanged`/`CloakChanged`/
+/// `MinimizedStateChanged`/`EffectCallReturned`）を往復させる。`WindowObserved`は最も頻繁に届く
+/// 入力（窓の発見・全ての信念更新の起点）であり、§9.2「stepの入力分岐 ⊆ Journalの往復可能集合」を
+/// 満たすために欠けていた最大の穴だった。
+
+[<Property>]
+let ``WindowObservedは任意のWindowSnapshot(全フィールドNone/Observationを含む)でも往復しても一致する(v2.57)`` (snapshot: WindowSnapshot) =
+    let entry = mkEntry (InputPayload (WindowObserved snapshot))
+    roundTrip entry = entry
+
+[<Property>]
+let ``VisibilityChangedは往復しても一致する(v2.57)`` (w: int) (obs: Observation<bool>) =
+    let entry = mkEntry (InputPayload (VisibilityChanged (WindowId (int64 (abs w)), obs)))
+    roundTrip entry = entry
+
+[<Property>]
+let ``CloakChangedは往復しても一致する(v2.57)`` (w: int) (obs: Observation<CloakState>) =
+    let entry = mkEntry (InputPayload (CloakChanged (WindowId (int64 (abs w)), obs)))
+    roundTrip entry = entry
+
+[<Property>]
+let ``MinimizedStateChangedは往復しても一致する(v2.57)`` (w: int) (obs: Observation<bool>) =
+    let entry = mkEntry (InputPayload (MinimizedStateChanged (WindowId (int64 (abs w)), obs)))
+    roundTrip entry = entry
+
+[<Property>]
+let ``EffectCallReturnedは往復しても一致する(Ok/Error、dispatchSeqのSome/None全て)(v2.57)`` (rid: int) (result: Result<unit, NativeCallRecord>) (dispatchSeq: int64 option) =
+    let entry = mkEntry (InputPayload (EffectCallReturned (RequestId (int64 (abs rid)), result, dispatchSeq)))
+    roundTrip entry = entry
