@@ -377,3 +377,121 @@ let ``onMovabilityBecameNotMovableはユーザー指定(ByUserOverride)の窓に
 let ``onMovabilityBecameNotMovableは管理下に無い窓や既にUnplaced/Excludedの窓には何もしない`` () =
     let state0, _ = onMovabilityBecameNotMovable (WindowId 99L) initial
     Assert.Equal<WindowRegistry>(initial, state0)
+
+// ===== 所属ヒント（§4.5 R4-3、v2.64） =====
+
+[<Fact>]
+let ``onMembershipHintsLoadedはMembershipHintsへ登録するだけで、信念・分類は一切変えない`` () =
+    let w = WindowId 1L
+    let registry' = onMembershipHintsLoaded [ w, WorkspaceId 5, Some Floating ] initial
+    Assert.Equal((WorkspaceId 5, Some Floating), Map.find w registry'.MembershipHints)
+    Assert.False(Map.containsKey w registry'.Records)
+
+[<Fact>]
+let ``ヒントにManagementが有れば、Policyの判断を上書きしてByUserOverride相当で確定し、ヒントのWorkspaceへ入る`` () =
+    // Policyは素直にAnyWindow→Tiledへ分類するはずだが、ヒントがFloating/WorkspaceId 5を指定しているので
+    // そちらが優先される（§4.5「ヒントのWorkspaceへ入れ、UserOverrideを復元する」）。
+    let policy = { basePolicy with WindowRules = [ windowRule "r" 10 AnyWindow Tiled ] }
+    let ctx = ctxWith policy 0L
+    let w = WindowId 1L
+    let withHint = onMembershipHintsLoaded [ w, WorkspaceId 5, Some Floating ] initial
+    let registry', events, _ = onWindowObserved ctx (visibleSnapshot w) withHint
+    Assert.Equal<DomainEvent list>([ WindowClassified (w, EffFloating, Some (WorkspaceId 5)) ], events)
+    let record = Map.find w registry'.Records
+    Assert.Equal(Some Floating, record.UserOverride)
+    match record.Classification with
+    | Classified (EffFloating, ByUserOverride) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+    // 復元されたUserOverrideは、以後の通常のWindowObservedでも上書きされない（既存のByUserOverride規則どおり）。
+    let _, events2, _ = onWindowObserved ctx (visibleSnapshot w) registry'
+    Assert.Empty(events2)
+
+[<Fact>]
+let ``ヒントにManagementが無ければ、分類自体はPolicy任せのままhomeだけヒントのWorkspaceへ差し替わる`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "r" 10 AnyWindow Tiled ] }
+    let ctx = ctxWith policy 0L
+    let w = WindowId 1L
+    let withHint = onMembershipHintsLoaded [ w, WorkspaceId 5, None ] initial
+    let registry', events, _ = onWindowObserved ctx (visibleSnapshot w) withHint
+    Assert.Equal<DomainEvent list>([ WindowClassified (w, EffTiled, Some (WorkspaceId 5)) ], events)
+    match (Map.find w registry'.Records).Classification with
+    | Classified (EffTiled, ByPolicy (Some (PolicyRuleId "r"))) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+    Assert.True((Map.find w registry'.Records).UserOverride.IsNone)
+
+[<Fact>]
+let ``AwaitingEvidenceから解決する窓にも、解決した瞬間にヒントが反映される`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "needs-dialog" 10 (DialogIs true) Excluded ] }
+    let ctx0 = ctxWith policy 0L
+    let w = WindowId 1L
+    let withHint = onMembershipHintsLoaded [ w, WorkspaceId 5, Some Floating ] initial
+    let registry1, _, _ = onWindowObserved ctx0 (visibleSnapshot w) withHint
+    match (Map.find w registry1.Records).Classification with
+    | AwaitingEvidence _ -> ()
+    | other -> Assert.True(false, sprintf "expected AwaitingEvidence, got %A" other)
+    let dialogTrueSnapshot = { visibleSnapshot w with IsDialog = Some (obs 2L true) }
+    let registry2, events2, _ = onWindowObserved { ctx0 with Now = 10L } dialogTrueSnapshot registry1
+    // ヒントがFloatingを指定しているので、needs-dialog(Excluded)には一致せず、ヒントが優先される。
+    Assert.Equal<DomainEvent list>([ WindowClassified (w, EffFloating, Some (WorkspaceId 5)) ], events2)
+    match (Map.find w registry2.Records).Classification with
+    | Classified (EffFloating, ByUserOverride) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+
+[<Fact>]
+let ``ClassificationDeadline超過(ByTimeout)の経路でもヒントが反映される`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "needs-dialog" 10 (DialogIs true) Excluded ] }
+    let ctx0 = ctxWith policy 0L
+    let w = WindowId 1L
+    let withHint = onMembershipHintsLoaded [ w, WorkspaceId 5, Some Floating ] initial
+    let registry1, _, _ = onWindowObserved ctx0 (visibleSnapshot w) withHint
+    let registry2, events, _ = onClassificationDeadline { ctx0 with Now = 1_000L } w registry1
+    Assert.Equal<DomainEvent list>([ WindowClassified (w, EffFloating, Some (WorkspaceId 5)) ], events)
+    let record = Map.find w registry2.Records
+    Assert.Equal(Some Floating, record.UserOverride)
+    match record.Classification with
+    | Classified (EffFloating, ByUserOverride) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+
+[<Fact>]
+let ``ClassificationDeadline超過でヒントにManagementが無ければ、通常のByTimeout/FloatingのままhomeだけヒントWorkspaceへ`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "needs-dialog" 10 (DialogIs true) Excluded ] }
+    let ctx0 = ctxWith policy 0L
+    let w = WindowId 1L
+    let withHint = onMembershipHintsLoaded [ w, WorkspaceId 5, None ] initial
+    let registry1, _, _ = onWindowObserved ctx0 (visibleSnapshot w) withHint
+    let registry2, events, _ = onClassificationDeadline { ctx0 with Now = 1_000L } w registry1
+    Assert.Equal<DomainEvent list>([ WindowClassified (w, EffFloating, Some (WorkspaceId 5)) ], events)
+    match (Map.find w registry2.Records).Classification with
+    | Classified (EffFloating, ByTimeout) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+
+[<Fact>]
+let ``ヒントが無い窓は通常どおりの規則で分類される(回帰確認)`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "r" 10 AnyWindow Tiled ] }
+    let ctx = ctxWith policy 0L
+    let w = WindowId 1L
+    let registry', events, _ = onWindowObserved ctx (visibleSnapshot w) initial
+    Assert.Equal<DomainEvent list>([ WindowClassified (w, EffTiled, Some (WorkspaceId 0)) ], events)
+    match (Map.find w registry'.Records).Classification with
+    | Classified (EffTiled, ByPolicy (Some (PolicyRuleId "r"))) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+
+[<Fact>]
+let ``ClearUserOverrideはヒントを再適用しない(Policyの分類へそのまま戻る)`` () =
+    // ヒントで復元されたByUserOverrideを、ユーザーが明示的にClearUserOverrideで外した場合、
+    // 起動直後のヒントを再び被せると即座に無効化されてしまう——意図的にヒントは一度しか使わない。
+    let policy = { basePolicy with WindowRules = [ windowRule "r" 10 AnyWindow Tiled ] }
+    let ctx = ctxWith policy 0L
+    let w = WindowId 1L
+    let withHint = onMembershipHintsLoaded [ w, WorkspaceId 5, Some Floating ] initial
+    let registry1, _, _ = onWindowObserved ctx (visibleSnapshot w) withHint
+    match (Map.find w registry1.Records).Classification with
+    | Classified (EffFloating, ByUserOverride) -> ()
+    | other -> Assert.True(false, sprintf "expected hint-applied Floating first, got %A" other)
+    let registry2, events, _ = onUserCommand ctx (ClearUserOverride w) registry1
+    Assert.Equal<DomainEvent list>([ WindowClassified (w, EffTiled, Some (WorkspaceId 0)) ], events)
+    let record = Map.find w registry2.Records
+    Assert.True(record.UserOverride.IsNone)
+    match record.Classification with
+    | Classified (EffTiled, ByPolicy (Some (PolicyRuleId "r"))) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)

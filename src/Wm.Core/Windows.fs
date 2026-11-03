@@ -23,6 +23,12 @@
 ///   Movabilityの信念はPlacementドメインが持つため、Placement着手まで`EffUnplaced`は到達しない
 ///   （`classificationView`は4.5の初期既定値と同じ`Movable`を常に返す——Placementが実装されれば
 ///   実際の信念に置き換わるだけで、`WindowPredicate.MovableIs`の評価自体は変わらない）。
+/// - ~~**所属ヒント**（§4.5 R4-3「稼働中の再起動では…Hostが所属ヒントを永続化する」）~~：**v2.64で
+///   実装**。`CoreCommand.fs`に`MembershipHintsLoaded`が型だけ定義されたまま（`WmState.step`も
+///   `PolicyTypes.fs`も「配線は未実装」とコメントしていた）0%実装の既知のギャップだった。
+///   `onMembershipHintsLoaded`が`WindowRegistry.MembershipHints`へ登録し、`reconsider`/
+///   `onClassificationDeadline`が実際にその窓を分類する瞬間に`home`（Workspace）/`UserOverride`へ
+///   反映する（ヒントの無い窓は通常どおりの規則。ヒント自体はReplay可能な入力であり信念ではない）。
 module Wm.Core.Windows
 
 open Wm.Contracts.Identifiers
@@ -67,9 +73,14 @@ type WindowRegistry = {
     Records: Map<WindowId, WindowRecord>
     Identity: Map<WindowId, IdentityBeliefs>
     ClassInputs: Map<WindowId, ClassInputBeliefs>
+    /// §4.5 R4-3「所属ヒント」（v2.64で実装）。`MembershipHintsLoaded`で登録され、信念そのものは
+    /// 書き換えない——対象の窓が実際に分類される時点（`reconsider`/`onClassificationDeadline`）で
+    /// `home`/`UserOverride`へ反映される。消費後も残したままでよい（同じ`WindowId`が再度
+    /// `NotCandidate`から分類し直されることは通常ない——HWND再利用は別の`WindowId`になる、v2.47）。
+    MembershipHints: Map<WindowId, WorkspaceId * Management option>
 }
 
-let initial: WindowRegistry = { Records = Map.empty; Identity = Map.empty; ClassInputs = Map.empty }
+let initial: WindowRegistry = { Records = Map.empty; Identity = Map.empty; ClassInputs = Map.empty; MembershipHints = Map.empty }
 
 let private identityInitial: IdentityBeliefs =
     { Exe = Unformed []; HostExe = Unformed []; Aumid = Unformed []; CoreWindowExe = Unformed []; Process = Unformed [] }
@@ -227,13 +238,36 @@ let private classificationEvent (w: WindowId) (eff: EffectiveManagement) (home: 
     | EffExcluded | EffUnplaced -> WindowUnmanaged w
     | _ -> WindowClassified (w, eff, home)
 
+/// `NotCandidate`/`AwaitingEvidence`から`Classified`へ初めて遷移する箇所専用（§4.5 R4-3、v2.64）。
+/// 所属ヒントが無ければPolicyの判断（`policyM`/`ruleId`）と呼び出し側の`fallbackHome`をそのまま使う。
+/// ヒントの`Management`が`Some`なら`ByUserOverride`相当として確定し（`UserOverride`復元、v2.42以降の
+/// `UserOverride = Some _`⇔`Classified (_, ByUserOverride)`という対応をここでも保つ）、ヒントの
+/// `WorkspaceId`を`home`として使う。ヒントの`Management`が`None`なら分類自体はPolicy任せのまま、
+/// `home`だけヒントのWorkspaceへ差し替える。
+let private resolveWithHint
+    (ctx: ClassificationCtx)
+    (w: WindowId)
+    (hint: (WorkspaceId * Management option) option)
+    (policyM: Management)
+    (ruleId: PolicyRuleId option)
+    (fallbackHome: WorkspaceId option)
+    : EffectiveManagement * ClassifiedBy * WorkspaceId option * Management option =
+    match hint with
+    | Some (hintHome, Some hintM) -> toEffective (movabilityOf ctx w) hintM, ByUserOverride, Some hintHome, Some hintM
+    | Some (hintHome, None) -> toEffective (movabilityOf ctx w) policyM, ByPolicy ruleId, Some hintHome, None
+    | None -> toEffective (movabilityOf ctx w) policyM, ByPolicy ruleId, fallbackHome, None
+
 /// 現在の信念から、1つの窓の分類を再評価する（§5.4/§7.1段⑤）。`WindowObserved`等で信念が
-/// 更新された直後、またはタイマー・ユーザーコマンドの処理の一部として呼ぶ。
+/// 更新された直後、またはタイマー・ユーザーコマンドの処理の一部として呼ぶ。`hint`は
+/// `WindowRegistry.MembershipHints`からの読み取り専用の写し（§4.5 R4-3、v2.64。`Movability`/`MinWidth`
+/// と同じ「`ClassificationCtx`で渡さず呼び出し側が引く」構図——`WindowId`単位で一度しか使わない短命の
+/// 参照なので`ctx`全体に混ぜる必要がない）。
 let private reconsider
     (ctx: ClassificationCtx)
     (w: WindowId)
     (identity: IdentityBeliefs)
     (inputs: ClassInputBeliefs)
+    (hint: (WorkspaceId * Management option) option)
     (record: WindowRecord)
     : WindowRecord * DomainEvent list * TimerCommand<TimerId> list =
     match record.UserOverride with
@@ -274,9 +308,8 @@ let private reconsider
             | NotCandidate ->
                 match tryClassify ctx w identity inputs with
                 | Resolved (m', ruleId) ->
-                    let eff = toEffective (movabilityOf ctx w) m'
-                    let home = resolveHome ctx w ctx.ActiveWorkspace
-                    { record with Classification = Classified (eff, ByPolicy ruleId) },
+                    let eff, by, home, userOverride = resolveWithHint ctx w hint m' ruleId (resolveHome ctx w ctx.ActiveWorkspace)
+                    { record with Classification = Classified (eff, by); UserOverride = userOverride },
                     [ classificationEvent w eff home ], []
                 | ClassificationResult.AwaitingEvidence _ ->
                     let deadline = ctx.Now + ctx.ClassificationTimeoutMs
@@ -285,9 +318,8 @@ let private reconsider
             | AwaitingEvidence (deadline, home) ->
                 match tryClassify ctx w identity inputs with
                 | Resolved (m', ruleId) ->
-                    let eff = toEffective (movabilityOf ctx w) m'
-                    let home' = resolveHome ctx w home
-                    { record with Classification = Classified (eff, ByPolicy ruleId) },
+                    let eff, by, home', userOverride = resolveWithHint ctx w hint m' ruleId (resolveHome ctx w home)
+                    { record with Classification = Classified (eff, by); UserOverride = userOverride },
                     [ classificationEvent w eff home' ], [ CancelTimer (TimerId.Windows (ClassificationDeadline w)) ]
                 | ClassificationResult.AwaitingEvidence _ -> record, [], [] // まだUnknown、期限はそのまま
 
@@ -317,7 +349,8 @@ let onWindowObserved (ctx: ClassificationCtx) (snapshot: WindowSnapshot) (regist
         let identity' = reviseIdentity ctx.Now identity0 snapshot
         let inputs' = reviseClassInputsFromSnapshot ctx.Now inputs0 snapshot
         let registry' = { registry with Identity = Map.add w identity' registry.Identity; ClassInputs = Map.add w inputs' registry.ClassInputs }
-        withRecord w registry' (fun record -> reconsider ctx w identity' inputs' record)
+        let hint = Map.tryFind w registry'.MembershipHints
+        withRecord w registry' (fun record -> reconsider ctx w identity' inputs' hint record)
 
 let private withBeliefUpdate
     (ctx: ClassificationCtx)
@@ -329,7 +362,8 @@ let private withBeliefUpdate
     let inputs0 = Map.tryFind w registry.ClassInputs |> Option.defaultValue classInputsInitial
     let inputs' = reviseInputs inputs0
     let registry' = { registry with ClassInputs = Map.add w inputs' registry.ClassInputs }
-    withRecord w registry' (fun record -> reconsider ctx w identity inputs' record)
+    let hint = Map.tryFind w registry'.MembershipHints
+    withRecord w registry' (fun record -> reconsider ctx w identity inputs' hint record)
 
 let onVisibilityChanged (ctx: ClassificationCtx) (w: WindowId) (obs: Observation<bool>) (registry: WindowRegistry) =
     withBeliefUpdate ctx w (fun inputs -> reviseVisibility ctx.Now inputs obs) registry
@@ -339,16 +373,31 @@ let onCloakChanged (ctx: ClassificationCtx) (w: WindowId) (obs: Observation<Cloa
 
 /// `TimerElapsed (Windows (ClassificationDeadline w))`：期限超過時、安全な既定分類（Floating）へ解決する
 /// （§5.4「無期限に待たない」）。`awaitDeadline`で古い発火を無視する（Topology/Health/Focusと同じパターン）。
+/// 所属ヒント（v2.64）が有ればタイムアウト経路でも`reconsider`と同じ規則を適用する——期限超過も
+/// 「その窓が分類された」瞬間の一つ（§4.5 R4-3はByPolicy/ByTimeoutを区別していない）。
 let onClassificationDeadline (ctx: ClassificationCtx) (w: WindowId) (registry: WindowRegistry) : WindowRegistry * DomainEvent list * TimerCommand<TimerId> list =
     match Map.tryFind w registry.Records with
     | None -> registry, [], [] // 既に消滅した窓（古い発火）
     | Some record ->
         match record.Classification with
         | AwaitingEvidence (deadline, home) when awaitDeadline (Some deadline) ctx.Now ->
-            let home' = resolveHome ctx w home
-            let record' = { record with Classification = Classified (EffFloating, ByTimeout) }
-            { registry with Records = Map.add w record' registry.Records }, [ classificationEvent w EffFloating home' ], []
+            let eff, by, home', userOverride =
+                match Map.tryFind w registry.MembershipHints with
+                | Some (hintHome, Some hintM) -> toEffective (movabilityOf ctx w) hintM, ByUserOverride, Some hintHome, Some hintM
+                | Some (hintHome, None) -> EffFloating, ByTimeout, Some hintHome, None
+                | None -> EffFloating, ByTimeout, resolveHome ctx w home, None
+            let record' = { record with Classification = Classified (eff, by); UserOverride = userOverride }
+            { registry with Records = Map.add w record' registry.Records }, [ classificationEvent w eff home' ], []
         | _ -> registry, [], [] // 古い発火、またはユーザー操作等で既に確定済み
+
+/// `MembershipHintsLoaded`（§4.5 R4-3、v2.64）：稼働中の再起動直後、Shellが`(HWND, ProcessKey)`から
+/// 解決した所属ヒントをCoreへ登録する。ヒント自体は信念を書き換えない——対象の窓が実際に分類される
+/// 時点（`reconsider`/`onClassificationDeadline`）で初めて`home`/`UserOverride`へ反映される
+/// （architecture.md「到着順をShellの契約にするのは、ヒントより先に分類まで進んだ窓にヒントが適用
+/// されない穴を塞ぐため」——Shellは必ずこれをその窓の最初の`WindowObserved`より前に送る）。
+let onMembershipHintsLoaded (hints: (WindowId * WorkspaceId * Management option) list) (registry: WindowRegistry) : WindowRegistry =
+    { registry with
+        MembershipHints = hints |> List.fold (fun m (w, ws, mgmt) -> Map.add w (ws, mgmt) m) registry.MembershipHints }
 
 let private applyUserOverride (ctx: ClassificationCtx) (w: WindowId) (m: Management) (registry: WindowRegistry) : WindowRegistry * DomainEvent list * TimerCommand<TimerId> list =
     withRecord w registry (fun record ->
@@ -385,8 +434,10 @@ let onUserCommand (ctx: ClassificationCtx) (cmd: CoreCommand) (registry: WindowR
         let identity = Map.tryFind w registry.Identity |> Option.defaultValue identityInitial
         let inputs = Map.tryFind w registry.ClassInputs |> Option.defaultValue classInputsInitial
         // UserOverrideを外し、候補条件とPolicyの評価から改めて分類をやり直す（§4.4「Policyの分類に戻す」）。
+        // 所属ヒント（v2.64）は再適用しない（`None`を渡す）——ユーザーの明示的な`ClearUserOverride`は
+        // 「Policyの分類に戻す」という意図であり、起動直後の所属ヒントを再び被せると即座に無効化される。
         let baseRecord = { record with UserOverride = None; Classification = NotCandidate }
-        let record', events, cmds = reconsider ctx w identity inputs baseRecord
+        let record', events, cmds = reconsider ctx w identity inputs None baseRecord
         { registry with Records = Map.add w record' registry.Records }, events, cmds
     | _ -> registry, [], []
 

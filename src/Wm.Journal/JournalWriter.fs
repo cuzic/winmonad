@@ -359,6 +359,16 @@ let private managementOfJson (tag: string) : Management =
     | "excluded" -> Excluded
     | other -> failwithf "Replay: unrecognized Management tag '%s'" other
 
+/// `Management option`（`MembershipHintsLoaded`、v2.64）。`windowIdOptionToJson`と同じ
+/// null-as-None規約。
+let private managementOptionToJson (m: Management option) : JsonNode =
+    match m with
+    | Some mgmt -> JsonValue.Create(managementToJson mgmt) :> JsonNode
+    | None -> null
+
+let private managementOptionOfJson (node: JsonNode) : Management option =
+    if isNull node then None else Some (managementOfJson (node.GetValue<string>()))
+
 let private layoutArgsToJson (args: LayoutArgs) : JsonNode =
     let o = JsonObject()
     match args with
@@ -456,7 +466,10 @@ let private coreCommandOfJson (node: JsonNode) : CoreCommand =
 /// Journalの往復可能集合」という不変条件への違反であり、かつこの5つは現実のシナリオで最も頻繁に
 /// 届く入力（`WindowObserved`は窓の発見・全ての信念更新の起点）なので、実機ReplayがほぼどのJournalも
 /// 読めない状態だった。`EffectBatchReturned`は`ApplyBatch`自体がまだ発行されないため（VirtualWorld.fs
-/// ファイル冒頭コメント参照）、依然対象外のまま。
+/// ファイル冒頭コメント参照）、依然対象外のまま。**v2.64で`MembershipHintsLoaded`も追加**：
+/// `Windows.onMembershipHintsLoaded`の実装（§4.5 R4-3）で`WmState.step`がこの入力を初めて分岐対象に
+/// したので、同じ不変条件を保つため同じラウンドでJournal往復対応も追加した（前回のような「後から
+/// 気付く」ギャップを繰り返さないため）。
 let private inputEventToJson (input: InputEvent) : JsonNode =
     let o = JsonObject()
     match input with
@@ -500,6 +513,16 @@ let private inputEventToJson (input: InputEvent) : JsonNode =
         o.["requestId"] <- JsonValue.Create(rid)
         o.["result"] <- unitResultToJson result
         o.["dispatchSeq"] <- (dispatchSeq |> Option.map JsonValue.Create<int64> |> Option.defaultValue null)
+    | MembershipHintsLoaded hints ->
+        o.["tag"] <- JsonValue.Create("membership-hints-loaded")
+        let arr = JsonArray()
+        for (WindowId w, WorkspaceId ws, mgmt) in hints do
+            let h = JsonObject()
+            h.["windowId"] <- JsonValue.Create(w)
+            h.["workspaceId"] <- JsonValue.Create(ws)
+            h.["management"] <- managementOptionToJson mgmt
+            arr.Add(h)
+        o.["hints"] <- arr
     | other ->
         // 本ビルドで未対応のInputEvent（`EffectBatchReturned`等）。表示専用（Replayはこのタグに
         // 出会うとfail-fastする、§9.2）。
@@ -524,6 +547,12 @@ let private inputEventOfJson (node: JsonNode) : InputEvent =
     | "effect-call-returned" ->
         let dispatchSeq = if isNull node.["dispatchSeq"] then None else Some (node.["dispatchSeq"].GetValue<int64>())
         EffectCallReturned (RequestId (node.["requestId"].GetValue<int64>()), unitResultOfJson node.["result"], dispatchSeq)
+    | "membership-hints-loaded" ->
+        let hints =
+            node.["hints"].AsArray()
+            |> Seq.map (fun h -> WindowId (h.["windowId"].GetValue<int64>()), WorkspaceId (h.["workspaceId"].GetValue<int>()), managementOptionOfJson h.["management"])
+            |> List.ofSeq
+        MembershipHintsLoaded hints
     | other -> failwithf "Replay: unrecognized InputEvent tag '%s' — このJournalはより新しいスキーマで書かれている" other
 
 let private payloadToJson (payload: JournalPayload) : JsonNode =

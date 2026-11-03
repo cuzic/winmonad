@@ -217,6 +217,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         | CloakChanged (w, obs) -> Windows.onCloakChanged windowsCtx w obs state.Windows
         | TimerElapsed (TimerId.Windows (ClassificationDeadline w)) -> Windows.onClassificationDeadline windowsCtx w state.Windows
         | UserCommand cmd -> Windows.onUserCommand windowsCtx cmd state.Windows
+        | MembershipHintsLoaded hints -> Windows.onMembershipHintsLoaded hints state.Windows, [], []
         | _ -> state.Windows, [], []
 
     let stateAfterWindows =

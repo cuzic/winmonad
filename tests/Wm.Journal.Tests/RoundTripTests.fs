@@ -149,6 +149,18 @@ let ``ChangeLayoutはLayoutArgsの全ケース・任意精度のMasterRatioで�
     let entry = mkEntry (InputPayload (UserCommand (ChangeLayout layoutRef)))
     roundTrip entry = entry
 
+/// §4.5 R4-3の所属ヒント（v2.64で`Windows.onMembershipHintsLoaded`を実装し、`WmState.step`が初めて
+/// `MembershipHintsLoaded`を分岐対象にした——同じラウンドで追加したJournal往復対応をここで検査する）。
+/// `Management option`（ヒント無し/`Tiled`/`Floating`/`Excluded`復元の全ケース）と空リストを含め、
+/// 任意の件数のヒントで往復が一致することを確認する。
+[<Property>]
+let ``MembershipHintsLoadedは任意のヒント一覧(Management optionの全ケース含む)でも往復しても一致する(v2.64)``
+    (hints: (int64 * int * Management option) list)
+    =
+    let hints' = hints |> List.map (fun (w, ws, mgmt) -> WindowId w, WorkspaceId ws, mgmt)
+    let entry = mkEntry (InputPayload (MembershipHintsLoaded hints'))
+    roundTrip entry = entry
+
 /// `SetManagement`単体についても、`Management`の全ケース(Tiled/Floating/Excluded)を直接検査する。
 [<Property>]
 let ``SetManagementはManagementの全ケースでも往復しても一致する`` (w: int) (management: Management) =
