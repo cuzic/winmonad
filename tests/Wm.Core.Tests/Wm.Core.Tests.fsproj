@@ -22,6 +22,7 @@
     <Compile Include="CrossDomainInvariantTests.fs" />
     <Compile Include="HwndReuseInvariantTests.fs" />
     <Compile Include="UserOverridePersistenceTests.fs" />
+    <Compile Include="DeterministicCollectionsArchitectureTests.fs" />
     <Compile Include="GatedEffectTests.fs" />
   </ItemGroup>
 
