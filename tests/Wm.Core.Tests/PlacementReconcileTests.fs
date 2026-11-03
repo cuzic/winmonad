@@ -633,6 +633,24 @@ let ``onWindowVanishedはInFlightTargetsも消す(v2.42)`` () =
     let afterVanished, _ = onWindowVanished w afterReconcile2
     Assert.Equal(None, Map.tryFind w afterVanished.InFlightTargets)
 
+[<Fact>]
+let ``Satisfied(checkPendingSatisfied)もInFlightTargetsを消す(v2.69、Opus敵対的レビューopus-review-unattributed-movecause.md §B-4)`` () =
+    // 型直前のコメントは「該当の矩形が観測された時…消す」と書いていたが、実際に消していたのは
+    // 消滅とTopologySettledだけで、Satisfiedでは一度も消していなかった既知のギャップ。消さないと、
+    // Layoutが数種類の矩形を往復するだけの窓（MasterStackで窓数が変わるたびに同じ矩形を行き来する等）
+    // では無限に積み重なり、それらの矩形が将来Mismatchの証拠として検出されなくなる。
+    let w = WindowId 1L
+    let afterReconcile1, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
+    let afterReconcile2, _, _ = reconcileWorkspace 15L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterReconcile1
+    Assert.NotEmpty(Map.tryFind w afterReconcile2.InFlightTargets |> Option.defaultValue [])
+    // 新しい(2回目の)Targetと一致する観測が届き、Satisfiedになる。
+    let rid2 = pendingRidFor afterReconcile2 w
+    let newTarget = (Map.find rid2 afterReconcile2.Pending).TargetRect
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w newTarget 1L) afterReconcile2
+    Assert.Empty(afterObserved.Pending)
+    Assert.Equal(None, Map.tryFind w afterObserved.InFlightTargets)
+
 // ===== MinWidth（Accumulating、§4.5、v2.43。Mismatchの証拠をDIP正規化して蓄積する） =====
 
 [<Fact>]

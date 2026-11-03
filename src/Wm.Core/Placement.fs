@@ -345,7 +345,16 @@ let private checkPendingSatisfied (now: int64) (w: WindowId) (state: PlacementSt
             { state with
                 Pending = Map.remove rid state.Pending
                 Movability = Map.add w { Value = Movable; Confidence = Confirmed; LastRevisedAt = now } state.Movability
-                RetryAttempts = Map.remove w state.RetryAttempts },
+                RetryAttempts = Map.remove w state.RetryAttempts
+                // `InFlightTargets`の型直前のコメントは「該当の矩形が観測された時…消す」と書いていたが、
+                // これまで消していたのは消滅と`TopologySettled`だけで、Satisfiedでは一度も消していなかった
+                // （v2.69で発見、Opus敵対的レビュー`opus-review-unattributed-movecause.md`§B-4）。旧Epochの
+                // 目標を覚えておく理由は「まだ遅れて応答が来るかもしれない」ことだけなので、現在の意図が
+                // 実際に満たされたと確認できた時点でその理由は消える——消さないと、Layoutが数種類の矩形を
+                // 往復するだけ（例：MasterStackで窓数が変わるたびに同じ数種類の矩形を行き来する）の窓では
+                // 無限に積み重なり、それらの矩形が将来Mismatchの証拠として検出されなくなる既知のギャップ
+                // だった。
+                InFlightTargets = Map.remove w state.InFlightTargets },
             [ CancelTimer (TimerId.Placement (PendingDeadline rid)) ]
         | None -> state, []
 

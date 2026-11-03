@@ -52,6 +52,13 @@ let private visibleWindowObserved (w: WindowId) : InputEvent =
           DpiAwareness = None
           TitleMatches = None }
 
+/// `visibleWindowObserved`に、観測された矩形(`VisibleFrameRect`)を付け加えたもの。Satisfied判定
+/// （`Placement.checkPendingSatisfied`）やOS起因の移動の観測をテストで作るのに使う。
+let private visibleWindowObservedAtRect (w: WindowId) (rect: PixelRect) (sequence: int64) : InputEvent =
+    match visibleWindowObserved w with
+    | WindowObserved s -> WindowObserved { s with VisibleFrameRect = Some { Value = Ok rect; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" } }
+    | other -> other
+
 [<Fact>]
 let ``新規窓のWindowObservedは、同じstepでWindows.RecordsがAliveになるので、PlacementのReprobeがゲートを通過する`` () =
     let state = initial RuntimePolicy.defaults
@@ -999,3 +1006,42 @@ let ``Windowsが出すInconsistencySuspectedは、WmState.step経由でStepResul
     match result.Trace with
     | [ InconsistencySuspected (domain, _) ] -> Assert.Equal("Windows", domain)
     | other -> Assert.True(false, sprintf "expected exactly one InconsistencySuspected trace, got %A" other)
+
+// ===== MoveCause.OsInduced（§4.4 R3-4、既知のギャップ、v2.69で確認。Opus敵対的レビュー
+// opus-review-unattributed-movecause.md §A参照） =====
+
+[<Fact(Skip = "既知のギャップ(v2.69でOpus敵対的レビューで発見・確認。architecture.md 1279行「grace window \
+終了後に意図した配置(Desired)を再適用する」が未実装。TopologySettled後のReconcileはLayoutの計算結果と \
+前回のDesiredを比べるだけで観測を見ないため、モニター構成が元に戻った場合はdesiredChangedがfalseになり \
+SetRectが出ない。修正はMoveCause.Unattributedの実装(ラウンド1で作る「ドリフト検知」)と共通の部品になる \
+予定なので、その実装(ラウンド3)まで持ち越す。Skipを外すとこのテストはこの時点では失敗するはず。")>]
+let ``OsInduced：Reconfiguring中にOSが寄せた窓は、復帰後も元のDesiredへ戻らない(既知のギャップ、v2.69)`` () =
+    let w = WindowId 1L
+    let afterDiscovered = settleOneMonitorThenDiscoverWindow w
+    let workArea = (mkMonitor 0).WorkArea
+    // Satisfiedにする(観測がTargetと一致)。
+    let afterSatisfied = step RuntimePolicy.defaults afterDiscovered.Next (mkEnvelope 101L (visibleWindowObservedAtRect w workArea 2L))
+    Assert.Empty(afterSatisfied.Next.Placement.Pending)
+
+    // スリープ/ロック等でReconfiguringへ入る(§7.3)。
+    let afterReconfiguring = step RuntimePolicy.defaults afterSatisfied.Next (mkEnvelope 200L (ScreenReconfigurationInProgress true))
+    match phase afterReconfiguring.Next.Topology with
+    | Reconfiguring _ -> ()
+    | other -> failwithf "expected Reconfiguring, got %A" other
+
+    // 抑止区間中、OSが窓を別の位置へ寄せる(段①は無条件に信念へ反映する、ScreenPhaseを問わない)。
+    let movedRect = { workArea with X = workArea.X + 500 }
+    let afterMoved = step RuntimePolicy.defaults afterReconfiguring.Next (mkEnvelope 210L (visibleWindowObservedAtRect w movedRect 3L))
+    Assert.Equal(Some movedRect, LatestWins.value (Map.find w afterMoved.Next.Placement.Geometry).VisibleFrameRect)
+
+    // 復帰(モニター構成自体は変わらない)。Settling→(ScreenSettle満了)→Grace→(ScreenGrace満了)→Stable。
+    let afterReconfiguringEnds = step RuntimePolicy.defaults afterMoved.Next (mkEnvelope 300L (ScreenReconfigurationInProgress false))
+    let settleMs = TopologyConfig.defaults.SettleMs
+    let graceMs = TopologyConfig.defaults.GraceMs
+    let afterSettle = step RuntimePolicy.defaults afterReconfiguringEnds.Next (mkEnvelope (300L + settleMs) (TimerElapsed (TimerId.Topology ScreenSettle)))
+    let afterGrace = step RuntimePolicy.defaults afterSettle.Next (mkEnvelope (300L + settleMs + graceMs) (TimerElapsed (TimerId.Topology ScreenGrace)))
+
+    // 期待する正しい挙動：grace満了までに、元のWorkAreaへ戻すSetRectが出ている
+    // （architecture.md「grace window終了後に意図した配置(Desired)を再適用する」）。
+    let effects = afterSettle.Effects @ afterGrace.Effects |> List.map GatedEffect.effect
+    Assert.Contains(effects, function SetRect (_, target, rect) -> target = w && rect = workArea | _ -> false)
