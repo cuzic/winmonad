@@ -176,25 +176,29 @@ Phase 0は「要素技術の確認」ではなく、**捨てる前提の素朴�
 - **記録する内容**: 測り直したシャドウ値、各ターゲットでの要求矩形・観測されたDWM可視枠・一致したかどうか。
 - **判定**: 全ターゲットで一致すれば、`Mismatch → Reevaluate`段階1導入の前提（M3）が満たされる。一致しない（固定オフセットがあるか、位置依存でシャドウが変わる）場合は、Shell側の換算ロジックに追加の補正が必要であり、段階1の導入前にその補正方法を設計し直す必要がある。
 
-### S22. SetWindowPos(ASYNC)発行からLOCATIONCHANGE観測までの遅延分布（M1、Placement `Mismatch → Reevaluate`設計の前提）【未検証：CIで実行予定】
+### S22. SetWindowPos(ASYNC)発行からLOCATIONCHANGE観測までの遅延分布（M1、Placement `Mismatch → Reevaluate`設計の前提）【CI実機検証済み：全て0〜1ms】
+**結果**：5つの異なる位置・サイズへの発行、全てで最初の`EVENT_OBJECT_LOCATIONCHANGE`が0〜1ms以内に届いた（初回の実行では窓の初期位置がtargetの1つと偶然一致し「no-op」を「500ms届かない」と誤記録する実装ミスがあり、修正して再検証済み）。`pendingDeadlineMs = 2000`に対して数千倍の余裕があり、段階1の判定時刻として問題ないことがCI実機で確認できた。
 - **検証する前提**: `Mismatch → Reevaluate`の設計相談（Opus敵対的レビュー）のM1：`pendingDeadlineMs = 2000`が、段階1（`PendingDeadline`満了時点でのMismatch分類）の判定時刻として十分な余裕を持つか。`SetWindowPos`は`SWP_ASYNCWINDOWPOS`で非同期に発行されるため、OSが要求を受け付けてから実際に矩形が変わり`EVENT_OBJECT_LOCATIONCHANGE`が届くまでの遅延を実測する必要がある。
 - **方法**: `Phase0CiSpikes`の`spikeS22_SetRectDispatchDelay`で、自作WinForms窓へ5つの異なる位置・サイズを`SetWindowPos(..., SWP_ASYNCWINDOWPOS)`で順に発行し、各発行から自分自身の`EVENT_OBJECT_LOCATIONCHANGE`（`idObject = OBJID_WINDOW`）が最初に届くまでの遅延を`SetWinEventHook(WINEVENT_OUTOFCONTEXT)`で記録する。
 - **記録する内容**: 発行ごとの最初のLOCATIONCHANGEまでの遅延（ms）、LOCATIONCHANGEが一度も届かなかったケースの有無。
 - **判定**: 遅延が`pendingDeadlineMs`（2000ms）に対して十分小さければ、段階1の判定時刻として問題ない根拠になる。極端に遅い・届かないケースがあれば、`pendingDeadlineMs`自体の見直しが必要。
 
-### S23. 最小幅での丸めに未丸め矩形の中間観測が出るか（M2、Placement `Mismatch → Reevaluate`設計の前提）【未検証：CIで実行予定】
+### S23. 最小幅での丸めに未丸め矩形の中間観測が出るか（M2、Placement `Mismatch → Reevaluate`設計の前提）【CI実機検証済み：中間観測は無し】
+**結果**：`MinTrackSize.X = 400px`を強制した窓へ幅200pxを要求したところ、`EVENT_OBJECT_LOCATIONCHANGE`は1件だけ（0ms後）発火し、その時点で既に幅400px（丸め後の最終値）だった。未丸めの200px（または他の中間値）は一度も観測されなかった（初回の実行では窓の初期幅がたまたま`MinTrackSize`と同じ400pxだったため実際には何も変化せず無意味な結果になっており、初期幅を600pxに変えて再検証済み）。少なくともこの単発の`SetWindowPos`（実際のドラッグではない）では、Windowsは丸め後の最終矩形だけを見せる——`checkPendingSatisfied`等の既存実装は、このケースについて追加の対策が要らないという一次データ。
 - **検証する前提**: M2：`WM_GETMINMAXINFO`の`MinTrackSize`で丸められる窓へ、それより狭い幅を`SetWindowPos`で要求したとき、Windowsは要求どおりの（未丸めの）矩形を一度`EVENT_OBJECT_LOCATIONCHANGE`で見せてから丸め後の矩形へ訂正するのか、最初から丸め後の矩形だけを見せるのか。前者なら、既存の`checkPendingSatisfied`（および将来のMismatch段階2早期判定）が、この中間状態を実際には起きていない「一致」や「不一致」と誤認する危険がある。
 - **方法**: `Phase0CiSpikes`の`spikeS23_MinWidthRoundingObservation`で、`WM_GETMINMAXINFO`をオーバーライドして`MinTrackSize.X = 400px`を強制する`MinWidthForm`を作り、幅200pxへ`SetWindowPos`を発行、以降に届く全ての`EVENT_OBJECT_LOCATIONCHANGE`それぞれで`GetWindowRect`の幅を記録する。
 - **記録する内容**: LOCATIONCHANGEのシーケンス（各発火時点の幅）、最終的な幅、400px以外の（未丸めの）幅が一度でも観測されたか。
 - **判定**: 未丸めの中間幅が観測されなければ、`checkPendingSatisfied`等の既存実装はこの点について追加の対策が要らない。観測される場合は、どのタイミングで最終値に収束するかを見て、早期判定（段階2）やMinWidth証拠収集に「最後の安定した観測を使う」等の対策を検討する。
 
-### S24. MOVESIZESTART/LOCATIONCHANGE/MOVESIZEENDの到着順（M6、Placement `Mismatch → Reevaluate`設計の前提）【未検証：CIで実行予定】
+### S24. MOVESIZESTART/LOCATIONCHANGE/MOVESIZEENDの到着順（M6、Placement `Mismatch → Reevaluate`設計の前提）【CI実機検証済み：投稿メッセージ技法ではMOVESIZESTART/ENDが発火しない】
+**結果**：`WM_ENTERSIZEMOVE`→`SetWindowPos`×2→`WM_EXITSIZEMOVE`という投稿メッセージ技法（S18と同じ、実際のOSモーダルドラッグには入らない安全な技法）では、`EVENT_SYSTEM_MOVESIZESTART`/`MOVESIZEEND`は一度も発火せず、`EVENT_OBJECT_LOCATIONCHANGE`だけが2回届いた（66ms, 119ms）。**これらのWinEventはUSER32自身の内部モーダルドラッグ追跡から発火するものであり、単に`WM_ENTERSIZEMOVE`/`WM_EXITSIZEMOVE`メッセージを窓が受け取るだけでは発火しないと判明した**——M6（条件6のユーザードラッグ除外の実装根拠）は、この安全な技法では答えられず、実際のマウス入力を使う実デスクトップでの再検証（S11r等と同じ限定）が必要であることが明確になった。
 - **検証する前提**: M6：Mismatch判定の条件6（ユーザーのドラッグ中の観測を不一致と誤認しない）を実装する際、`EVENT_SYSTEM_MOVESIZEEND`（ドラッグ終了、段②の`MoveAttributed`の契機）が、ドラッグ中の`EVENT_OBJECT_LOCATIONCHANGE`群より後に届くか。また、S18と同じ理由（実際のOSモーダルドラッグループに入るとハングの危険がある、S4のAltキー合成入力での既往症参照）で、`WM_ENTERSIZEMOVE`/`WM_EXITSIZEMOVE`を直接postする安全な技法のままで、そもそも`EVENT_SYSTEM_MOVESIZESTART`/`MOVESIZEEND`自体が発火するのかも未確認。
 - **方法**: `Phase0CiSpikes`の`spikeS24_MoveSizeEventOrder`で、S18と同じ投稿メッセージ技法（`WM_ENTERSIZEMOVE`→`SetWindowPos`×2→`WM_EXITSIZEMOVE`）を使い、`EVENT_SYSTEM_MOVESIZESTART`/`EVENT_SYSTEM_MOVESIZEEND`/`EVENT_OBJECT_LOCATIONCHANGE`の到着順を記録する。
 - **記録する内容**: 3種のイベントの到着順・タイムスタンプ、`MOVESIZESTART`/`MOVESIZEEND`が一度も発火しなかったかどうか。
 - **判定**: `MOVESIZESTART`/`MOVESIZEEND`が発火しないなら、この投稿メッセージ技法ではM6に答えられないと判明したことになり、実際のマウス入力を使う実デスクトップでの再検証（S11r等と同様の限定）へ持ち越す。発火する場合は、到着順が条件6の実装（`MoveAttributed`をMismatch判定より先に読めるか）の根拠になる。
 
-### S25. 最小化時のMINIMIZESTART/LOCATIONCHANGEの到着順（M7、Placement `Mismatch → Reevaluate`設計の前提）【未検証：CIで実行予定】
+### S25. 最小化時のMINIMIZESTART/LOCATIONCHANGEの到着順（M7、Placement `Mismatch → Reevaluate`設計の前提）【CI実機検証済み：LOCATIONCHANGEがMINIMIZESTARTと同時か、先】
+**結果**：`ShowWindow(SW_MINIMIZE)`を呼んだところ、`EVENT_OBJECT_LOCATIONCHANGE`（矩形=(-32000,-32000,-31840,-31972)）と`EVENT_SYSTEM_MINIMIZESTART`が同じ6msに届いたが、コールバックへの到着順としては**LOCATIONCHANGEが先**だった（`MINIMIZESTART`が先に届く保証は無い）。これはMismatch判定の条件5（最小化中の窓を不一致と誤認しない）が、「`IsMinimized`信念が矩形観測より先に確定している」ことを前提にできないことを意味する——同じstep内の処理順序だけでは安全に区別できない可能性があり、条件5を実装する際は追加の猶予（デバウンス）や、矩形の値自体（画面外の`-32000`付近）で判定する等の対策を検討する必要がある。
 - **検証する前提**: M7：Mismatch判定の条件5（最小化中の窓の観測を不一致と誤認しない）の実装は、`IsMinimized`信念が最小化後の`-32000`付近の矩形観測より先に（または同じstepで）確定していることを前提にする。`EVENT_SYSTEM_MINIMIZESTART`と、最小化による`EVENT_OBJECT_LOCATIONCHANGE`のどちらが先に届くかを確認する。
 - **方法**: `Phase0CiSpikes`の`spikeS25_MinimizeEventOrder`で、自作WinForms窓を`ShowWindow(SW_MINIMIZE)`し、`EVENT_SYSTEM_MINIMIZESTART`と`EVENT_OBJECT_LOCATIONCHANGE`の到着順・各時点の`GetWindowRect`を記録する。
 - **記録する内容**: 2種のイベントの到着順・タイムスタンプ・各時点の矩形。
