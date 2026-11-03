@@ -796,3 +796,49 @@ let ``Coreが新しいSetRectを発行すると、未決着のDpiCrossingは帰�
     // 説明できてしまうので、まだ決着していないDpiCrossingの記録は帰属不能として諦める。
     let afterReconcile, _, _ = reconcileWorkspace 30L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterCrossCheck
     Assert.Equal(None, Map.tryFind w afterReconcile.DpiCrossing)
+
+// ===== MoveSizeStarted/MoveSizeEnded（§4.4 Suspended、§7.2「ユーザーのドラッグ」除外、v2.65） =====
+
+[<Fact>]
+let ``onMoveSizeStartedはDraggingへ加え、onMoveSizeEndedは外す`` () =
+    let w = WindowId 1L
+    let afterStart = onMoveSizeStarted w initial
+    Assert.True(Set.contains w afterStart.Dragging)
+    let afterEnd = onMoveSizeEnded w afterStart
+    Assert.False(Set.contains w afterEnd.Dragging)
+
+[<Fact>]
+let ``Dragging中の窓はPendingDeadline発火時にMismatch判定もRetryもせず、戦わずに終端する(v2.65、Opusレビューの条件5)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    // ユーザーがドラッグ中に、要求とは異なる矩形が観測される(ユーザー自身の操作の結果)。
+    let draggedRect = { workArea with X = workArea.X + 300; Width = 2000 } // 幅も要求より広い(MinWidthの証拠候補)
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w draggedRect m 10L) afterDispatched
+    let afterDragStart = onMoveSizeStarted w afterObserved
+    let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
+    let afterDeadline, effects, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterDragStart
+    Assert.Empty(afterDeadline.Pending) // 終端はする(Reevaluateと同じ、戦わない)
+    Assert.Empty(effects) // Retryしない
+    Assert.Equal(None, Map.tryFind w afterDeadline.RetryAttempts)
+    // ドラッグ中の観測はMinWidthの証拠にもしない(幅が広くても、ユーザー操作の結果であって
+    // アプリの最小幅制約の証拠ではない——条件5の除外そのもの)。
+    Assert.Equal(None, Map.tryFind w afterDeadline.MinWidth)
+
+[<Fact>]
+let ``ドラッグ終了後は通常どおりMismatch判定に戻る(回帰確認、v2.65)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterDragEnded = onMoveSizeEnded w afterDispatched // Draggingに入っていなくても安全にno-op
+    let widerRect = { workArea with Width = 2000 }
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w widerRect m 10L) afterDragEnded
+    let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
+    let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    match Map.tryFind w afterDeadline.MinWidth with
+    | Some { Confidence = Inferred _ } -> ()
+    | other -> Assert.True(false, sprintf "expected an Inferred MinWidth belief (normal Mismatch evidence capture), got %A" other)

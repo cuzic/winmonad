@@ -143,6 +143,21 @@
 ///   このラウンドの実装では、確定（`Believed`）した窓を再probeする経路自体が無い（`WindowObserved`が
 ///   `TargetIntegrity = None`で届いても、既に`TargetIntegrity`マップにエントリがあれば何もしない）ため、
 ///   この規則は構造的に自動で満たされる。Windows.Identity.Processを読む明示的な相互ドメイン参照は不要。
+/// - ~~**`MoveSizeStarted`/`MoveSizeEnded`の配線**~~：**v2.65で実装（§4.4「Suspended」の一因、
+///   976行目「`MoveSizeStarted`〜`MoveSizeEnded`の間（ユーザー操作中）」、CoreCommand.fsの
+///   `MoveSizeStarted`型直前のコメント「自動整列を抑止する」）**。`CoreCommand.fs`に型だけ定義された
+///   まま`WmState.step`が一度も分岐対象にしていなかった0%実装の既知のギャップだった。新設の
+///   `PlacementState.Dragging: Set<WindowId>`に、`onMoveSizeStarted`/`onMoveSizeEnded`で加除する。
+///   `WmState.step`の`reconcileOneScreen`がこの集合をAliveから除くので、ドラッグ中は新しい`SetRect`を
+///   発行しない。`onPendingDeadlineTimerFired`も、発火時点で対象窓が`Dragging`中なら
+///   `tryMismatchObservation`を呼ばずにReevaluateと同じ終端を行う（「ユーザーのドラッグ」除外、
+///   Opusレビューの条件5——`tryMismatchObservation`の型直前のコメントが長らく「専用のラウンドへ
+///   持ち越す」としていた項目のうち、MinWidth Accumulatingの消費側がv2.48で既に配線済みになっていた
+///   ため前提は満たされていた）。`MoveSizeEnded`のペイロード（ドロップ時点の矩形・モニター）を使う
+///   「別モニターへ落とされた場合のWorkspace再割当」（§4.4の`MoveCause`分岐、`UserDrag`/`OsInduced`/
+///   `Unattributed`）と、条件6「最小化・非表示中」の除外は、Topologyドメインの設計変更やPresence系の
+///   別の信号が要るため依然対象外のまま（`onMoveSizeEnded`/`tryMismatchObservation`の型直前のコメント
+///   参照）。
 module Wm.Core.Placement
 
 open Wm.Contracts.Identifiers
@@ -259,7 +274,13 @@ type PlacementState =
       /// §4.5「DPIの振る舞い」（Accumulating、S11）。`reviseDpiBehaviorDeclaration`の型直前のコメント参照。
       DpiBehavior: Map<WindowId, Belief<DpiBehavior>>
       /// `DpiBehavior`の2段目自己リサイズ検出（v2.45）。`checkDpiCrossing`の型直前のコメント参照。
-      DpiCrossing: Map<WindowId, PixelRect> }
+      DpiCrossing: Map<WindowId, PixelRect>
+      /// `MoveSizeStarted`〜`MoveSizeEnded`の間（ユーザーがドラッグ/リサイズ中、v2.65）。CoreCommand.fsの
+      /// `MoveSizeStarted`自身のコメント「自動整列を抑止する」をここで実際に実現する——`WmState.step`の
+      /// `reconcileOneScreen`がこの集合に含まれる窓をこのstepの対象（Alive）から外す。§4.4の
+      /// Suspended（単一の状態ではなく各ドメインが自分の理由で持つ「配置対象から一時的に外す」条件の
+      /// 和、architecture.md 976行目）のうち、このドメインが持つ理由。`onWindowVanished`で除く。
+      Dragging: Set<WindowId> }
 
 let initial: PlacementState =
     { Geometry = Map.empty
@@ -275,7 +296,8 @@ let initial: PlacementState =
       InFlightTargets = Map.empty
       MinWidth = Map.empty
       DpiBehavior = Map.empty
-      DpiCrossing = Map.empty }
+      DpiCrossing = Map.empty
+      Dragging = Set.empty }
 
 /// `WmState.step`が、Placement自身のReconcile以外の理由（Focus.SwitchSettleの再要求、
 /// `MoveFocusedToWorkspace`のRequestForeground等、v2.27）で新しいRequestIdが要るときに呼ぶ最小の窓口。
@@ -480,6 +502,23 @@ let checkDpiCrossing (now: int64) (dpiOf: MonitorId -> int option) (w: WindowId)
 let onMinimizedStateChanged (now: int64) (w: WindowId) (obs: Observation<bool>) (state: PlacementState) : PlacementState =
     { state with Geometry = Map.add w (reviseMinimized now (Map.tryFind w state.Geometry |> Option.defaultValue geometryInitial) obs) state.Geometry }
 
+/// `MoveSizeStarted`（v2.65）：ユーザーがドラッグ/リサイズを開始した窓を`Dragging`へ加える。
+/// `WmState.step`の`reconcileOneScreen`がこの集合を読んでAliveから外すので、ドラッグ中に新しい
+/// `SetRect`を発行しない（CoreCommand.fsの型直前のコメント「自動整列を抑止する」）。
+let onMoveSizeStarted (w: WindowId) (state: PlacementState) : PlacementState =
+    { state with Dragging = Set.add w state.Dragging }
+
+/// `MoveSizeEnded`（v2.65）：`Dragging`から外すだけ——ドラッグ開始前に発行済みのPendingはあえて
+/// そのまま残す（`onPendingDeadlineTimerFired`が発火時点で`Dragging`を見て判定するので、ここで
+/// 先回りして終端する必要が無い。ドラッグ終了後に届く観測は、もはやドラッグに起因しないので通常の
+/// Mismatch判定に戻ってよい）。ペイロードの`Observation<PixelRect>`/`Observation<MonitorId>`
+/// （ドロップ時点の矩形・モニター）は、別モニターへ落とされた場合のWorkspace再割当（§4.4「観測された
+/// モニターと意図されたモニターが食い違うとき」のUserDrag分岐）に使う——Topologyドメインの
+/// `MoveCause`型と合わせた設計が必要な、Placement単体では閉じないより大きな機能のため、このラウンドは
+/// 対象外のまま明示的に持ち越す（同じモニター内のドラッグ、`Unattributed`/`OsInduced`分岐も同様）。
+let onMoveSizeEnded (w: WindowId) (state: PlacementState) : PlacementState =
+    { state with Dragging = Set.remove w state.Dragging }
+
 /// `TimerElapsed (Placement (IntegrityReprobe w))`：`Reprobe`Effectを再発行し、次の試行を予約する
 /// （TopologyやHealthの再probeと同じ`awaitDeadline`パターンで古い発火を無視する）。
 let onIntegrityReprobeTimerFired (now: int64) (w: WindowId) (state: PlacementState) : PlacementState * Effect list * TimerCommand<TimerId> list =
@@ -625,9 +664,11 @@ let private retryOrGiveUp (now: int64) (rid: RequestId) (pr: PendingRequest) (st
 /// 3. 観測が`TargetRect`と異なる
 /// 4. 観測が`Baseline`と異なる（「何も変わっていない」＝要求が無反応の可能性を、不一致と呼ばない）
 /// 5. 観測が`InFlightTargets`のどの旧目標とも異なる（旧Epochの遅延適用を新Epochの不一致と取り違えない）
-/// 「ユーザーのドラッグ」「最小化・非表示中」の除外（Opusレビューの条件5・6）は、MinWidth Accumulating
-/// （§4.5、未実装）が実際にこのMismatch証拠を消費するようになってから、その消費側と合わせて設計する
-/// 専用のラウンドへ持ち越す——今は証拠として使う消費者が無いので、取り違えても実害はまだ無い。
+/// 「ユーザーのドラッグ」の除外（Opusレビューの条件5）はv2.65で実装した——`onPendingDeadlineTimerFired`
+/// 側で、発火時点で`pr.Window`が`state.Dragging`に含まれていればこの関数を呼ばず、Mismatch証拠に
+/// しない（下記`onPendingDeadlineTimerFired`参照）。「最小化・非表示中」の除外（条件6）は、
+/// 判定に使う信号（`IsVisible`/Presence等、ドラッグの`Dragging`集合のように単純な開始/終了の対で
+/// 表せない）が条件5と異なる形を要るため、依然専用のラウンドへ持ち越す。
 let private tryMismatchObservation (pr: PendingRequest) (state: PlacementState) : (PixelRect * int64) option =
     match pr.DispatchSeq with
     | None -> None
@@ -668,7 +709,9 @@ let private reviseMinWidth (now: int64) (evidence: EvidenceRef) (observedWidthDi
 
 /// `TimerElapsed (Placement (PendingDeadline rid))`：§7.2「Timeout → Retry/Backoff、上限後は配置対象外」
 /// （v2.28）に加え、v2.42で`tryMismatchObservation`がSomeを返す場合の`Mismatch → Reevaluate`を分岐させる（v2.43で
-/// 併せてMinWidthの証拠収集も配線した）。
+/// 併せてMinWidthの証拠収集も配線した）。v2.65で、発火時点で`pr.Window`が`Dragging`中なら
+/// `tryMismatchObservation`自体を呼ばずにReevaluateと同じ終端だけを行う分岐を先頭に追加した
+/// （「ユーザーのドラッグ」の除外、Opusレビューの条件5）。
 /// Reevaluate＝「アプリと戦わない」（オーナー確認済み）：Pendingを終端し`Desired`は目標のまま残す
 /// （`dispatchPlacements`の`desiredChanged`判定が同じ目標の再発行を止める、v2.41のPendingPresence版
 /// Reevaluateと同じ考え方）、Retryしない。`RetryAttempts`は次に本当に新しい意図が来たときのために
@@ -687,6 +730,14 @@ let onPendingDeadlineTimerFired
     (state: PlacementState)
     : PlacementState * Effect list * TimerCommand<TimerId> list =
     match Map.tryFind rid state.Pending with
+    | Some pr when awaitDeadline (Some pr.Deadline) now && Set.contains pr.Window state.Dragging ->
+        // 「ユーザーのドラッグ」の除外（v2.65、Opusレビューの条件5、ファイル冒頭`tryMismatchObservation`の
+        // コメント参照）：ドラッグ中はいかなる観測もユーザー操作そのものの結果でしかないので、
+        // Mismatch証拠にもTimeoutのRetry対象にもしない——Reevaluateと同じ「戦わない」終端だけを行う。
+        { state with
+            Pending = Map.remove rid state.Pending
+            RetryAttempts = Map.remove pr.Window state.RetryAttempts },
+        [], []
     | Some pr when awaitDeadline (Some pr.Deadline) now ->
         match tryMismatchObservation pr state with
         | Some (observed, valueSeq) ->
@@ -896,5 +947,6 @@ let onWindowVanished (w: WindowId) (state: PlacementState) : PlacementState * Ti
         InFlightTargets = Map.remove w state.InFlightTargets
         MinWidth = Map.remove w state.MinWidth
         DpiBehavior = Map.remove w state.DpiBehavior
-        DpiCrossing = Map.remove w state.DpiCrossing },
+        DpiCrossing = Map.remove w state.DpiCrossing
+        Dragging = Set.remove w state.Dragging },
     integrityCancel @ pendingCancel @ pendingPresenceCancel

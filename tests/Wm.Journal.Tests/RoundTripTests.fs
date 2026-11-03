@@ -197,3 +197,21 @@ let ``MinimizedStateChangedは往復しても一致する(v2.57)`` (w: int) (obs
 let ``EffectCallReturnedは往復しても一致する(Ok/Error、dispatchSeqのSome/None全て)(v2.57)`` (rid: int) (result: Result<unit, NativeCallRecord>) (dispatchSeq: int64 option) =
     let entry = mkEntry (InputPayload (EffectCallReturned (RequestId (int64 (abs rid)), result, dispatchSeq)))
     roundTrip entry = entry
+
+/// v2.65：`Placement.onMoveSizeStarted`/`onMoveSizeEnded`の実装で`WmState.step`が初めて
+/// `MoveSizeStarted`/`MoveSizeEnded`を分岐対象にした——同じラウンドで追加したJournal往復対応を
+/// ここで検査する。
+
+[<Property>]
+let ``MoveSizeStartedは往復しても一致する(v2.65)`` (w: int) =
+    let entry = mkEntry (InputPayload (MoveSizeStarted (WindowId (int64 (abs w)))))
+    roundTrip entry = entry
+
+[<Property>]
+let ``MoveSizeEndedは任意のrect/monitor観測(Ok/Error含む)でも往復しても一致する(v2.65)``
+    (w: int)
+    (rectObs: Observation<PixelRect>)
+    (monitorObs: Observation<MonitorId>)
+    =
+    let entry = mkEntry (InputPayload (MoveSizeEnded (WindowId (int64 (abs w)), rectObs, monitorObs)))
+    roundTrip entry = entry

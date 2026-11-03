@@ -469,7 +469,9 @@ let private coreCommandOfJson (node: JsonNode) : CoreCommand =
 /// ファイル冒頭コメント参照）、依然対象外のまま。**v2.64で`MembershipHintsLoaded`も追加**：
 /// `Windows.onMembershipHintsLoaded`の実装（§4.5 R4-3）で`WmState.step`がこの入力を初めて分岐対象に
 /// したので、同じ不変条件を保つため同じラウンドでJournal往復対応も追加した（前回のような「後から
-/// 気付く」ギャップを繰り返さないため）。
+/// 気付く」ギャップを繰り返さないため）。**v2.65で`MoveSizeStarted`/`MoveSizeEnded`も追加**：
+/// `Placement.onMoveSizeStarted`/`onMoveSizeEnded`の実装で`WmState.step`がこの2つを初めて分岐対象に
+/// したので、同じ理由で同じラウンドに含めた。
 let private inputEventToJson (input: InputEvent) : JsonNode =
     let o = JsonObject()
     match input with
@@ -513,6 +515,14 @@ let private inputEventToJson (input: InputEvent) : JsonNode =
         o.["requestId"] <- JsonValue.Create(rid)
         o.["result"] <- unitResultToJson result
         o.["dispatchSeq"] <- (dispatchSeq |> Option.map JsonValue.Create<int64> |> Option.defaultValue null)
+    | MoveSizeStarted (WindowId w) ->
+        o.["tag"] <- JsonValue.Create("move-size-started")
+        o.["windowId"] <- JsonValue.Create(w)
+    | MoveSizeEnded (WindowId w, rectObs, monitorObs) ->
+        o.["tag"] <- JsonValue.Create("move-size-ended")
+        o.["windowId"] <- JsonValue.Create(w)
+        o.["rect"] <- observationToJson pixelRectToJson rectObs
+        o.["monitor"] <- observationToJson monitorIdToJson monitorObs
     | MembershipHintsLoaded hints ->
         o.["tag"] <- JsonValue.Create("membership-hints-loaded")
         let arr = JsonArray()
@@ -544,6 +554,9 @@ let private inputEventOfJson (node: JsonNode) : InputEvent =
     | "visibility-changed" -> VisibilityChanged (WindowId (node.["windowId"].GetValue<int64>()), observationOfJson boolOfJson node.["observation"])
     | "cloak-changed" -> CloakChanged (WindowId (node.["windowId"].GetValue<int64>()), observationOfJson cloakStateOfJson node.["observation"])
     | "minimized-state-changed" -> MinimizedStateChanged (WindowId (node.["windowId"].GetValue<int64>()), observationOfJson boolOfJson node.["observation"])
+    | "move-size-started" -> MoveSizeStarted (WindowId (node.["windowId"].GetValue<int64>()))
+    | "move-size-ended" ->
+        MoveSizeEnded (WindowId (node.["windowId"].GetValue<int64>()), observationOfJson pixelRectOfJson node.["rect"], observationOfJson monitorIdOfJson node.["monitor"])
     | "effect-call-returned" ->
         let dispatchSeq = if isNull node.["dispatchSeq"] then None else Some (node.["dispatchSeq"].GetValue<int64>())
         EffectCallReturned (RequestId (node.["requestId"].GetValue<int64>()), unitResultOfJson node.["result"], dispatchSeq)

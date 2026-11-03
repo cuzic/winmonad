@@ -848,3 +848,58 @@ let ``ForegroundChangedは、step開始時点でどのWorkspaceにも属さな�
     let w = WindowId 1L
     let afterForegroundFirst = step RuntimePolicy.defaults seeded (mkEnvelope 1L (mkForegroundObserved 1L w))
     Assert.Equal(seeded.Topology, afterForegroundFirst.Next.Topology)
+
+// ===== MoveSizeStarted/MoveSizeEnded（§4.4 Suspended、reconcileOneScreenのAlive/TiledWindows除外、v2.65） =====
+
+[<Fact>]
+let ``Dragging中の窓は、他の窓の出現でレイアウトが変わる局面でも除外されSetRectを受け取らない(v2.65)`` () =
+    let w1, w2 = WindowId 1L, WindowId 2L
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0 ]
+    let seeded = { initial masterStackPolicy with Topology = topology }
+    let afterW1 = step masterStackPolicy seeded (mkEnvelope 1L (visibleWindowObserved w1))
+    let workArea = (mkMonitor 0).WorkArea
+    Assert.Equal(Some workArea, desiredRectOf afterW1.Next.Placement w1) // 唯一の窓なのでmaster=全画面
+
+    let afterDragStart = step masterStackPolicy afterW1.Next (mkEnvelope 2L (MoveSizeStarted w1))
+    Assert.True(Set.contains w1 afterDragStart.Next.Placement.Dragging)
+
+    // ドラッグ中にw2が加わる。通常ならMasterStackが2窓構成に切り替わりw1もstackへ動くはずだが、
+    // w1はDragging中なのでこのstepのTiledWindows/Aliveから除かれる——w2だけが「唯一の対象窓」として
+    // 全画面を与えられ、w1のDesired/Pendingは一切変化しない。
+    let afterW2 = step masterStackPolicy afterDragStart.Next (mkEnvelope 3L (visibleWindowObserved w2))
+    Assert.Equal(Some workArea, desiredRectOf afterW2.Next.Placement w1) // 変化無し(新しいSetRectが無い証拠)
+    Assert.Equal(Some workArea, desiredRectOf afterW2.Next.Placement w2) // w1を除いた「唯一の窓」として全画面
+    let w2Effects = afterW2.Effects |> List.map GatedEffect.effect
+    Assert.DoesNotContain(w2Effects, function SetRect (_, w, _) -> w = w1 | _ -> false)
+
+[<Fact>]
+let ``MoveSizeEndedはDraggingから外し、以後は通常どおりReconcileの対象に戻る(v2.65)`` () =
+    let w1, w2 = WindowId 1L, WindowId 2L
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0 ]
+    let seeded = { initial masterStackPolicy with Topology = topology }
+    let afterW1 = step masterStackPolicy seeded (mkEnvelope 1L (visibleWindowObserved w1))
+    let afterDragStart = step masterStackPolicy afterW1.Next (mkEnvelope 2L (MoveSizeStarted w1))
+    let rectObs: Observation<PixelRect> = { Value = Ok (mkMonitor 0).WorkArea; SampleSequence = 1L; MonotonicTime = 3L; Source = "test" }
+    let monitorObs: Observation<MonitorId> = { Value = Ok (MonitorId 0L); SampleSequence = 1L; MonotonicTime = 3L; Source = "test" }
+    let afterDragEnd = step masterStackPolicy afterDragStart.Next (mkEnvelope 3L (MoveSizeEnded (w1, rectObs, monitorObs)))
+    Assert.False(Set.contains w1 afterDragEnd.Next.Placement.Dragging)
+
+    // ドラッグが終わっているので、w2が加わると通常どおりmaster(w1)/stack(w2、1窓なのでstackArea全体)へ
+    // 分割される（`ChangeLayoutはアクティブなWorkspaceの...`テストと同じ計算）。
+    let workArea = (mkMonitor 0).WorkArea
+    let masterRect = { workArea with Width = workArea.Width / 2 }
+    let stackArea = { workArea with X = masterRect.Width; Width = workArea.Width - masterRect.Width }
+    let afterW2 = step masterStackPolicy afterDragEnd.Next (mkEnvelope 4L (visibleWindowObserved w2))
+    Assert.Equal(Some masterRect, desiredRectOf afterW2.Next.Placement w1)
+    Assert.Equal(Some stackArea, desiredRectOf afterW2.Next.Placement w2)
+
+[<Fact>]
+let ``WindowRemovedは同じstepでPlacement.Draggingも除く(v2.65)`` () =
+    let w = WindowId 1L
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0 ]
+    let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+    let afterW = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved w))
+    let afterDragStart = step RuntimePolicy.defaults afterW.Next (mkEnvelope 2L (MoveSizeStarted w))
+    Assert.True(Set.contains w afterDragStart.Next.Placement.Dragging)
+    let afterRemoved = step RuntimePolicy.defaults afterDragStart.Next (mkEnvelope 3L (WindowRemoved w))
+    Assert.False(Set.contains w afterRemoved.Next.Placement.Dragging)

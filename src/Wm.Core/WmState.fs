@@ -278,6 +278,8 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             let s = Placement.checkDpiCrossing now dpiOf snapshot.Id oldMonitor s
             s, e, t, None
         | MinimizedStateChanged (w, obs) -> Placement.onMinimizedStateChanged now w obs stateAfterWindows.Placement, [], [], None
+        | MoveSizeStarted w -> Placement.onMoveSizeStarted w stateAfterWindows.Placement, [], [], None
+        | MoveSizeEnded (w, _, _) -> Placement.onMoveSizeEnded w stateAfterWindows.Placement, [], [], None
         | TimerElapsed (TimerId.Placement (IntegrityReprobe w)) ->
             let s, e, t = Placement.onIntegrityReprobeTimerFired now w stateAfterWindows.Placement
             s, e, t, None
@@ -682,7 +684,14 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         // Workspaceに属していたため表面化していなかった誤り）。
         let windowsInThisWorkspace = Set.ofList stackList
         let managementForScreen = managementByWindow |> Map.filter (fun w _ -> Set.contains w windowsInThisWorkspace)
-        let aliveForScreen = Set.intersect aliveWindows windowsInThisWorkspace
+        // `Dragging`中の窓（§4.4 Suspended、v2.65）も、生死とは別の理由でこのstepのLayout対象から外す
+        // ——新しいSetRectを発行しない（CoreCommand.fsの`MoveSizeStarted`型直前のコメント「自動整列を
+        // 抑止する」）。`ctx.TiledWindows`自体はそのまま渡してよい——除いた窓を`Alive`から外せば、
+        // `PlanValidator.checkManagedAndAlive`が`UnmanagedOrDeadWindow`として検出し、
+        // `decide`の`RelayoutWithout`（既存の「検証時点で死亡/Excluded化していた窓を除いて1回だけ
+        // 再計算する」経路）がこの窓を除いて自動的に計算し直す——生死以外の理由で除外する窓も、
+        // 既存の「このstepでは対象から外す」機構に相乗りできる（新しい特別扱いの分岐は不要）。
+        let aliveForScreen = Set.intersect aliveWindows windowsInThisWorkspace |> fun s -> Set.difference s placementSt.Dragging
         let st', e', t' = Placement.reconcileWorkspace now runtimePolicy.LayoutRegistry layoutRef ctx managementForScreen aliveForScreen placementSt
         st', effects @ e', cmds @ t'
 
