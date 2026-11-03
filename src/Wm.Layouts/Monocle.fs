@@ -11,6 +11,10 @@ open Wm.Contracts.Identifiers
 open Wm.Contracts.SharedVocabulary
 open Wm.Layouts.LayoutRegistry
 
+/// §6.2のMinWidth対応（v2.78）：MasterStackとは違い、Monocleは全窓へ常に`ctx.WorkArea`全体を
+/// そのまま渡すため、`LayoutWindow.MinWidthDip`を実際に読んで判定する必要が無い——モニター自体が
+/// 窓のMinWidthより狭いという実機ではまず起きない極端な場合を除き、WorkArea全体の幅は常にどの
+/// MinWidthも満たす。意図的に`MinWidthDip`を読まない。
 let calculate: LayoutFunction =
     fun args ctx ->
         match args with

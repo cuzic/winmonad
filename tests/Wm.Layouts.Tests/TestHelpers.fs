@@ -10,7 +10,9 @@ let mkWorkArea (x: int) (y: int) (w: FsCheck.PositiveInt) (h: FsCheck.PositiveIn
     let (FsCheck.PositiveInt hRaw) = h
     { X = x; Y = y; Width = 50 + (wRaw % 3950); Height = 50 + (hRaw % 3950) }
 
-/// 0〜count個の、重複しないWindowIdを持つTiledWindowsを作る(MinWidthDipはどちらのLayoutも読まないのでNone)。
+/// 0〜count個の、重複しないWindowIdを持つTiledWindowsを作る(MinWidthDipはv2.78以降MasterStackが読むが、
+/// 既存のFsCheck性質テストは制約の無い窓だけを対象にするためNoneのままにする——MinWidth対応自体の
+/// テストはMasterStackTests.fsが別途、明示的にMinWidthDipを設定して検査する)。
 let mkTiledWindows (count: int) : LayoutWindow list =
     [ for i in 0 .. (abs count % 9) - 1 -> { Id = WindowId (int64 i); MinWidthDip = None } ]
 

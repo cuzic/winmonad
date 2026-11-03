@@ -20,6 +20,12 @@ let private ratioOf (args: LayoutArgs) : Result<decimal, LayoutError> =
     | MasterRatio r -> Error (InvalidInput (sprintf "MasterRatioは(0,1)の範囲でなければならない: %M" r))
     | ColumnCount _ -> Error (InvalidInput "MasterStackはColumnCountを受け付けない")
 
+/// §6.2「ソフト制約・劣化」のMinWidth対応（v2.78）：`LayoutWindow.MinWidthDip`をこの画面のDPIで
+/// 物理ピクセルへ戻す（`Placement.reviseMinWidth`が記録する際の正規化`toDip = px * 96 / dpi`の逆、
+/// `px = dip * dpi / 96`）。信念が無い窓は制約無し（0）として扱う。
+let private minWidthPxOf (dpi: int) (w: LayoutWindow) : int =
+    w.MinWidthDip |> Option.map (fun b -> b.Value * dpi / 96) |> Option.defaultValue 0
+
 /// stack側の`n`窓をWorkAreaの右側`stackArea`に縦に等分する。余りのピクセルは隙間を残さないため
 /// 最後の窓へ割り当てる（ギャップの厳密さはソフト制約、§6.1）。
 let private splitVertically (stackArea: PixelRect) (n: int) : PixelRect list =
@@ -45,7 +51,25 @@ let calculate: LayoutFunction =
             | [ only ] -> Ok [ { Window = only.Id; Target = ctx.WorkArea } ]
             | master :: stack ->
                 let area = ctx.WorkArea
-                let masterWidth = int (decimal area.Width * ratio)
+                let naturalMasterWidth = int (decimal area.Width * ratio)
+                // §6.2のMinWidth対応（v2.78、プロジェクトオーナー確認済み：「兄弟窓を縮めて調整する」）：
+                // masterとstack列はこの2者だけで幅を取り合う（stack内の各窓は同じstackArea.Widthを
+                // 共有するので、stack列が必要とする最小幅は構成窓のうち最大のMinWidth）。どちらかの
+                // 比率どおりの幅が自分のMinWidthを下回るなら、もう一方から幅を削って充てる——
+                // 両方のMinWidthの合計がWorkArea全体を超える場合は満たしきれないので、それ以上は
+                // 強制せず元の比率のまま（ソフト制約、打ち止め。削る側を決める根拠が無い状態で
+                // 無理に押し込むと、むしろ任意の判断を混入させてしまう）。
+                let masterMinPx = minWidthPxOf ctx.Dpi master
+                let stackMinPx = stack |> List.map (minWidthPxOf ctx.Dpi) |> List.fold max 0
+                let masterWidth =
+                    if masterMinPx + stackMinPx > area.Width then
+                        naturalMasterWidth
+                    elif naturalMasterWidth < masterMinPx then
+                        masterMinPx
+                    elif area.Width - naturalMasterWidth < stackMinPx then
+                        area.Width - stackMinPx
+                    else
+                        naturalMasterWidth
                 let masterRect = { X = area.X; Y = area.Y; Width = masterWidth; Height = area.Height }
                 let stackArea =
                     { X = area.X + masterWidth

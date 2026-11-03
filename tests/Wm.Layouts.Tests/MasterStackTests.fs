@@ -1,12 +1,17 @@
 /// architecture.md §5.6/§6.1：MasterStackレイアウトの幾何的な正しさを検査する。
 module Wm.Layouts.Tests.MasterStackTests
 
+open Xunit
 open FsCheck
 open FsCheck.Xunit
+open Wm.Contracts.Identifiers
+open Wm.Contracts.Beliefs
 open Wm.Contracts.SharedVocabulary
 open Wm.Layouts
 open Wm.Layouts.LayoutRegistry
 open Wm.Layouts.Tests.TestHelpers
+
+let private mkMinWidthDip (dip: int) : Belief<int> option = Some { Value = dip; Confidence = Inferred []; LastRevisedAt = 0L }
 
 [<Property>]
 let ``TiledWindowsが0件なら空のPlacementを返す`` (x: int) (y: int) (w: PositiveInt) (h: PositiveInt) =
@@ -80,3 +85,91 @@ let ``ColumnCountは常にInvalidInputで拒否する`` (x: int) (y: int) (w: Po
     match MasterStack.calculate (ColumnCount cols) ctx with
     | Error (InvalidInput _) -> true
     | _ -> false
+
+// ===== §6.2 MinWidth対応（v2.78、プロジェクトオーナー確認済み：「兄弟窓を縮めて調整する」） =====
+
+[<Fact>]
+let ``masterのMinWidthが比率どおりの幅を上回る場合、stack側を削ってmasterへ充てる`` () =
+    let area: PixelRect = { X = 0; Y = 0; Width = 1000; Height = 600 }
+    let master: LayoutWindow = { Id = WindowId 1L; MinWidthDip = mkMinWidthDip 700 }
+    let stackWin: LayoutWindow = { Id = WindowId 2L; MinWidthDip = None }
+    let ctx = mkContext area [ master; stackWin ]
+    match MasterStack.calculate (MasterRatio 0.3m) ctx with
+    | Ok placements ->
+        let masterRect = (placements |> List.find (fun p -> p.Window = master.Id)).Target
+        let stackRect = (placements |> List.find (fun p -> p.Window = stackWin.Id)).Target
+        Assert.Equal(700, masterRect.Width) // 比率どおりなら300だが、MinWidthの700へ広げる
+        Assert.Equal(300, stackRect.Width) // 残りをstackへ(1000-700)
+    | Error e -> Assert.True(false, sprintf "unexpected: %A" e)
+
+[<Fact>]
+let ``stack側のMinWidthが比率どおりの幅を上回る場合、master側を削ってstackへ充てる`` () =
+    let area: PixelRect = { X = 0; Y = 0; Width = 1000; Height = 600 }
+    let master: LayoutWindow = { Id = WindowId 1L; MinWidthDip = None }
+    let stackWin: LayoutWindow = { Id = WindowId 2L; MinWidthDip = mkMinWidthDip 800 }
+    let ctx = mkContext area [ master; stackWin ]
+    match MasterStack.calculate (MasterRatio 0.7m) ctx with
+    | Ok placements ->
+        let masterRect = (placements |> List.find (fun p -> p.Window = master.Id)).Target
+        let stackRect = (placements |> List.find (fun p -> p.Window = stackWin.Id)).Target
+        Assert.Equal(200, masterRect.Width) // 比率どおりなら700だが、stackのMinWidth 800を確保するため削られる
+        Assert.Equal(800, stackRect.Width)
+    | Error e -> Assert.True(false, sprintf "unexpected: %A" e)
+
+[<Fact>]
+let ``stack側のMinWidthは構成窓のうち最大値を使う(全員が同じstackArea.Widthを共有するため)`` () =
+    let area: PixelRect = { X = 0; Y = 0; Width = 1000; Height = 600 }
+    let master: LayoutWindow = { Id = WindowId 1L; MinWidthDip = None }
+    let stackA: LayoutWindow = { Id = WindowId 2L; MinWidthDip = mkMinWidthDip 300 }
+    let stackB: LayoutWindow = { Id = WindowId 3L; MinWidthDip = mkMinWidthDip 800 }
+    let ctx = mkContext area [ master; stackA; stackB ]
+    match MasterStack.calculate (MasterRatio 0.7m) ctx with
+    | Ok placements ->
+        let stackWidths = placements |> List.filter (fun p -> p.Window <> master.Id) |> List.map (fun p -> p.Target.Width)
+        Assert.All<int>(stackWidths, fun ww -> Assert.Equal(800, ww)) // stackBの800が両方のstack窓の幅になる
+    | Error e -> Assert.True(false, sprintf "unexpected: %A" e)
+
+[<Fact>]
+let ``両者のMinWidthの合計がWorkArea幅を超える場合は、これ以上は強制せず元の比率のまま(打ち止め)`` () =
+    let area: PixelRect = { X = 0; Y = 0; Width = 1000; Height = 600 }
+    let master: LayoutWindow = { Id = WindowId 1L; MinWidthDip = mkMinWidthDip 700 }
+    let stackWin: LayoutWindow = { Id = WindowId 2L; MinWidthDip = mkMinWidthDip 700 }
+    let ctx = mkContext area [ master; stackWin ]
+    match MasterStack.calculate (MasterRatio 0.5m) ctx with
+    | Ok placements ->
+        let masterRect = (placements |> List.find (fun p -> p.Window = master.Id)).Target
+        Assert.Equal(500, masterRect.Width) // 700+700 > 1000なので満たせない。比率どおりの500のまま
+    | Error e -> Assert.True(false, sprintf "unexpected: %A" e)
+
+[<Fact>]
+let ``MinWidthDipは画面のDPIで物理ピクセルへ変換される(toDipの逆、px = dip * dpi / 96)`` () =
+    let area: PixelRect = { X = 0; Y = 0; Width = 1000; Height = 600 }
+    let master: LayoutWindow = { Id = WindowId 1L; MinWidthDip = mkMinWidthDip 400 } // 192DPIでは800px相当
+    let stackWin: LayoutWindow = { Id = WindowId 2L; MinWidthDip = None }
+    let ctx = { mkContext area [ master; stackWin ] with Dpi = 192 }
+    match MasterStack.calculate (MasterRatio 0.3m) ctx with
+    | Ok placements ->
+        let masterRect = (placements |> List.find (fun p -> p.Window = master.Id)).Target
+        Assert.Equal(800, masterRect.Width)
+    | Error e -> Assert.True(false, sprintf "unexpected: %A" e)
+
+/// MinWidthの値に関わらず、master幅+stack幅は常にWorkArea幅をちょうど分割する
+/// （PlanValidatorの前提・既存の性質テストと同じ不変条件が、MinWidth調整後も崩れないことの確認）。
+[<Property>]
+let ``MinWidthで調整しても、masterとstackの幅の合計はWorkArea幅のまま変わらない``
+    (x: int)
+    (y: int)
+    (w: PositiveInt)
+    (h: PositiveInt)
+    (masterMinRaw: int)
+    (stackMinRaw: int)
+    =
+    let area = mkWorkArea x y w h
+    let master: LayoutWindow = { Id = WindowId 1L; MinWidthDip = mkMinWidthDip (abs masterMinRaw % 5000) }
+    let stackWin: LayoutWindow = { Id = WindowId 2L; MinWidthDip = mkMinWidthDip (abs stackMinRaw % 5000) }
+    let ctx = mkContext area [ master; stackWin ]
+    match MasterStack.calculate NoArgs ctx with
+    | Ok placements ->
+        let totalWidth = placements |> List.sumBy (fun p -> p.Target.Width)
+        totalWidth = area.Width
+    | Error _ -> false
