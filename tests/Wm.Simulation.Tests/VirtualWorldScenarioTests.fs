@@ -14,6 +14,7 @@ module Wm.Simulation.Tests.VirtualWorldScenarioTests
 open Xunit
 open Wm.Contracts.Identifiers
 open Wm.Contracts.Observation
+open Wm.Contracts.SharedVocabulary
 open Wm.Contracts.CoreCommand
 open Wm.Contracts.GatedEffect
 open Wm.Core.Topology
@@ -92,6 +93,79 @@ let ``VirtualWorldに存在しない窓へのSetRectはERROR_INVALID_WINDOW_HAND
     // classify → TargetGone → Cancelled」）。
     Assert.Empty(reducer.State.Placement.Pending)
     Assert.Equal(None, Map.tryFind w reducer.State.Placement.Desired)
+
+[<Fact>]
+let ``SwitchWorkspaceでhidden化された窓はSetPresence(shown=false)がVirtualWorldへ届き、PendingPresenceがSatisfiedになる(v2.50)`` () =
+    // v2.17時点のファイル冒頭コメントは「ReconcileがまだSetRect以外を発行しないため`SetPresence`等は
+    // 対象外」としていたが、v2.31でReconcileは実際にSetPresenceを発行するようになっていた——
+    // VirtualWorld側がそれを黒洞のように無視していた（`applyEffect`の決め打ち`[]`）既知のギャップ。
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    settleTopology reducer [ mkMonitor 0 ]
+    let w = WindowId 1L
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } Immediate
+    let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
+    let worldAfterDiscovery = settle 1000L reducer world discovery.Effects
+    Assert.Empty(reducer.State.Placement.Pending)
+    Assert.True((Map.find w worldAfterDiscovery.Windows).Shown)
+
+    // 別のWorkspaceへ切り替えると、wのいるWorkspace(0)がhiddenになり、SetPresence(shown=false)が出る。
+    let switchAway = reducer.Submit 2000L "virtual-world" (UserCommand (SwitchWorkspace (WorkspaceId 1)))
+    let setPresenceEffects = switchAway.Effects |> List.filter (fun g -> match GatedEffect.effect g with SetPresence _ -> true | _ -> false)
+    Assert.NotEmpty(setPresenceEffects)
+    let finalWorld = settle 2000L reducer worldAfterDiscovery switchAway.Effects
+
+    Assert.False((Map.find w finalWorld.Windows).Shown)
+    Assert.Empty(reducer.State.Placement.PendingPresence) // 観測が戻ってSatisfiedになっている
+
+[<Fact>]
+let ``SwitchWorkspaceで表示に戻った窓はSetPresence(shown=true)とRequestForegroundの両方がVirtualWorldで観測を生む(v2.50)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    settleTopology reducer [ mkMonitor 0 ]
+    let w = WindowId 1L
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } Immediate
+    let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
+    let worldAfterDiscovery = settle 1000L reducer world discovery.Effects
+    let switchAway = reducer.Submit 2000L "virtual-world" (UserCommand (SwitchWorkspace (WorkspaceId 1)))
+    let worldHidden = settle 2000L reducer worldAfterDiscovery switchAway.Effects
+    Assert.False((Map.find w worldHidden.Windows).Shown)
+
+    // ws0へ戻る(UserView)：SetPresence(shown=true)に加え、zipperのFocus(=w)へRequestForegroundが出る。
+    let switchBack = reducer.Submit 3000L "virtual-world" (UserCommand (SwitchWorkspace (WorkspaceId 0)))
+    let effects = switchBack.Effects |> List.map GatedEffect.effect
+    Assert.Contains(effects, (function SetPresence (_, w', true) -> w' = w | _ -> false))
+    Assert.Contains(effects, (function RequestForeground (_, w') -> w' = w | _ -> false))
+    let finalWorld = settle 3000L reducer worldHidden switchBack.Effects
+
+    Assert.True((Map.find w finalWorld.Windows).Shown)
+    Assert.Equal(Some (Some w), Wm.Contracts.Beliefs.LatestWins.value reducer.State.Focus.Foreground)
+
+[<Fact>]
+let ``ForgetWindowはVirtualWorldから窓を取り除くだけで、観測もEffectCallReturnedも生まない(v2.50)`` () =
+    let w = WindowId 1L
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } Immediate
+    // ForgetWindowはRequestIdを持たないfire-and-forgetなEffectなので、本物のGatedEffectを得るために
+    // 実際のHWND再利用シナリオ(v2.47)を駆動する必要はない——ここでは直接WindowsテストやWmStateテストが
+    // 使っているのと同じ構成でEffectを手に入れる手段が無いため、直接Core.Windowsの性質で保証されている
+    // Effectの意味（窓を対応表から外す、7.1）だけを単体で検査する。
+    let gated =
+        // GatedEffectのコンストラクタはinternalなので、Wm.Core側の実経路（HWND再利用）を駆動して得る。
+        let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+        let withProcess (sequence: int64) (pid: int) : InputEvent =
+            WindowObserved
+                { Id = w
+                  Process = Some { Value = Ok { Pid = pid; CreationTime = 1L }; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" }
+                  AppIdentity = emptyAppIdentity
+                  Owner = None; IsDialog = None; NativeRect = None; VisibleFrameRect = None
+                  IsVisible = Some { Value = Ok true; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" }
+                  IsMinimized = None; Cloak = None; Monitor = None; MinWidthHint = None
+                  TargetIntegrity = None; Responsiveness = None; Presence = None; DpiAwareness = None; TitleMatches = None }
+        reducer.Submit 1L "virtual-world" (withProcess 1L 100) |> ignore
+        let result = reducer.Submit 2L "virtual-world" (withProcess 2L 200)
+        result.Effects |> List.filter (fun g -> match GatedEffect.effect g with ForgetWindow w' -> w' = w | _ -> false) |> List.exactlyOne
+    let world', events, callReturns = applyEffect 3L world gated
+    Assert.Empty(events)
+    Assert.Empty(callReturns)
+    Assert.False(Map.containsKey w world'.Windows)
 
 [<Fact>]
 let ``2つ目の窓が現れても、両方がMonocleで全画面に配置され両方Satisfiedになる`` () =
