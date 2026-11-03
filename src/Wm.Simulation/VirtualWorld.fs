@@ -18,6 +18,22 @@
 /// `WindowSnapshot`のどのフィールドを返すべきかの対応がBeliefKeyごとに違うため設計が要る、
 /// `ApplyBatch`は子Effectの集約の順序・部分失敗の扱いが要る、`ObserveAll`は全窓への再帰が要る——
 /// どれも1ラウンドで一括実装するには判断点が多すぎるため、個別のラウンドへ切り出す）。
+///
+/// **v2.51で`Reprobe`/`ObserveAll`/`RequestClose`の3つを実装**：v2.50の直後に`src/Wm.Core/*.fs`を
+/// 再調査したところ、この3つも実際にはCoreが発行していた（`Reprobe (w, KTargetIntegrity)`は
+/// `Placement.fs`のTargetIntegrity ProbeOnce規則が発行し続けている、`ObserveAll`は`Topology.fs`が
+/// Grace期間突入時に発行する、`RequestClose`は`CloseFocused`コマンドが発行する）——「各Effectの対応が
+/// BeliefKeyごとに違うので設計が要る」という上記の懸念は、実際には`Reprobe`が今日まで`KTargetIntegrity`
+/// 以外で一度も呼ばれていないため当てはまらなかった（他のキーはまだ呼び出し元が存在しない、R4-24と
+/// 同じ「まだ無い消費者向けに作り込まない」判断でそのまま`[]`のまま残す）。`VirtualWindow`に
+/// `Integrity: IntegrityRelation`（既定`NotHigher`）を追加し、`Reprobe (w, KTargetIntegrity)`は
+/// `TargetIntegrity`だけを運ぶ部分観測（§4.2「今回問い合わせた属性だけを運ぶ」に忠実：`VisibleFrameRect`
+/// 等は含めない）を返す。`ObserveAll`は全窓についてRect/Presence/TargetIntegrityを運ぶ完全な
+/// `WindowObserved`を返す（全体再列挙を模すため、こちらは部分観測ではない）。`RequestClose`は
+/// 常に成功する（窓を取り除き`WindowRemoved`を返す）という最も単純な形だけを実装する——アプリが
+/// 拒否する側（S17で実機確認済みの挙動）を模す`WindowBehavior`はまだ無いため、この既定だけを置く。
+/// `ApplyBatch`/`ObserveWindow`は依然`[]`のまま（前者は子Effectの集約規則が要る、後者はCoreがまだ
+/// 一度も発行していないため消費者が無い）。
 /// - `advanceClock`は`Scheduled`の発火だけを行い、`Reducer`のTimerキュー（`PendingDeadline`等）には
 ///   関与しない——両者を同じ呼び出しで進める結合は`ScenarioRunner.fs`冒頭コメントが明示的にシナリオ側の
 ///   責務としているため、ここでは2つの独立した時計（疑似OSの`Scheduled`とCoreのTimerキュー）を別々に
@@ -34,13 +50,17 @@ module Wm.Simulation.VirtualWorld
 open Wm.Contracts.Identifiers
 open Wm.Contracts.ErrorTypes
 open Wm.Contracts.Observation
+open Wm.Contracts.Beliefs
 open Wm.Contracts.CoreCommand
 open Wm.Contracts.GatedEffect
 open Wm.Simulation.WindowBehaviors
 
 /// `Shown`はWMが`SetPresence`で最後に要求した表示状態（v2.50追加）。発見時は常に`true`
-/// （`addWindow`が疑似OS上に置く時点で既に見えている窓を模しているため）。
-type VirtualWindow = { Id: WindowId; Rect: PixelRect; Behavior: WindowBehavior; Shown: bool }
+/// （`addWindow`が疑似OS上に置く時点で既に見えている窓を模しているため）。`Integrity`はWMと対象
+/// プロセスの整合性レベルの関係（§4.5 TargetIntegrityのProbeOnce規則、v2.51追加）。発見時は常に
+/// `NotHigher`（通常の非昇格テスト窓を模す既定——昇格窓を模すシナリオは`addWindow`呼び出し後に
+/// `{ world with Windows = Map.add w { vw with Integrity = Higher } world.Windows }`で上書きする）。
+type VirtualWindow = { Id: WindowId; Rect: PixelRect; Behavior: WindowBehavior; Shown: bool; Integrity: IntegrityRelation }
 
 /// §12.1「`ScheduledSimEvent`」の最小形：`DelayedByMs`な`SetRect`が、`FireAtMs`に達するまで積まれる
 /// 未発火の観測。`Seed`はまだ`WindowBehaviors`のどの挙動も使わないため持たない。
@@ -55,7 +75,7 @@ type VirtualWorld =
 let empty: VirtualWorld = { Windows = Map.empty; ClockMs = 0L; NextSampleSequence = 0L; Scheduled = [] }
 
 let addWindow (w: WindowId) (rect: PixelRect) (behavior: WindowBehavior) (world: VirtualWorld) : VirtualWorld =
-    { world with Windows = Map.add w { Id = w; Rect = rect; Behavior = behavior; Shown = true } world.Windows }
+    { world with Windows = Map.add w { Id = w; Rect = rect; Behavior = behavior; Shown = true; Integrity = NotHigher } world.Windows }
 
 let private emptySnapshot (w: WindowId) : WindowSnapshot =
     { Id = w
@@ -148,6 +168,49 @@ let applyEffect
         // 疑似OS側にはHWND対応表という概念そのものが無いので、単にその窓を取り除くだけでよい
         // （Coreは`ForgetWindow`を発行した後、このWindowIdへは二度と観測を期待しない、R4-14）。
         { world with Windows = Map.remove w world.Windows }, [], []
+    | Reprobe (w, KTargetIntegrity) ->
+        match Map.tryFind w world.Windows with
+        | None -> world, [], [] // Reprobeも`[]`返却に結果の通知先が無い（元の発行元はタイマーで再試行する）
+        | Some vw ->
+            let sampleSeq = world.NextSampleSequence
+            let world' = { world with NextSampleSequence = sampleSeq + 1L }
+            // §4.2「今回問い合わせた属性だけを運ぶ部分観測」に忠実に、`TargetIntegrity`だけを運ぶ
+            // （`VisibleFrameRect`等は含めない——`ObserveAll`の全体再列挙とはここが違う）。
+            let observed =
+                WindowObserved
+                    { emptySnapshot w with
+                        TargetIntegrity = Some { Value = Ok vw.Integrity; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" } }
+            world', [ observed ], []
+    | Reprobe (_, _) ->
+        // Coreは今のところ`KTargetIntegrity`以外のReprobeを一度も発行しない（ファイル冒頭コメント参照）。
+        // 対応する消費者が無いまま実装すると検証不能な死んだコードになるため、他のキーは対象外のまま。
+        world, [], []
+    | ObserveAll ->
+        // 全窓の全体再列挙（§7.3、`ScreenPhase = Grace`突入時にTopologyが発行する）。`Reprobe`の部分観測
+        // とは異なり、ここでは疑似OSが持つ属性を全て運ぶ完全な`WindowObserved`を返す。
+        let observed, nextSeq =
+            world.Windows
+            |> Map.toList
+            |> List.fold
+                (fun (acc, sampleSeq) (w, vw) ->
+                    let presence = if vw.Shown then VisibleToUser else HiddenByWmMethod
+                    let ev =
+                        WindowObserved
+                            { emptySnapshot w with
+                                VisibleFrameRect = Some { Value = Ok vw.Rect; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" }
+                                Presence = Some { Value = Ok presence; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" }
+                                TargetIntegrity = Some { Value = Ok vw.Integrity; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" } }
+                    acc @ [ ev ], sampleSeq + 1L)
+                ([], world.NextSampleSequence)
+        { world with NextSampleSequence = nextSeq }, observed, []
+    | RequestClose (rid, w) ->
+        match Map.tryFind w world.Windows with
+        | None -> world, [], [ rid, Error { Api = "PostMessage"; Space = Win32LastError; Code = 1400; ElapsedUs = 0L }, None ]
+        | Some _ ->
+            // 既定は常に成功する（窓が閉じる）という最も単純な形だけを実装する。アプリが`WM_CLOSE`を
+            // 拒否する側（S17で実機確認済みの非blocking拒否）を模す`WindowBehavior`はまだ無いため、
+            // 拒否のシナリオは専用のラウンドへ持ち越す（ファイル冒頭コメント参照）。
+            { world with Windows = Map.remove w world.Windows }, [ WindowRemoved w ], [ rid, Ok (), None ]
     | _ -> world, [], [] // このラウンドで対象外のEffect種別（ファイル冒頭参照）
 
 /// 疑似OSの仮想時計を`toMs`まで進め、`FireAtMs <= toMs`の予定観測を発火時刻の昇順で発火させる

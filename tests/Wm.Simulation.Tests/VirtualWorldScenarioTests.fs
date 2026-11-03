@@ -14,6 +14,7 @@ module Wm.Simulation.Tests.VirtualWorldScenarioTests
 open Xunit
 open Wm.Contracts.Identifiers
 open Wm.Contracts.Observation
+open Wm.Contracts.Beliefs
 open Wm.Contracts.SharedVocabulary
 open Wm.Contracts.CoreCommand
 open Wm.Contracts.GatedEffect
@@ -166,6 +167,86 @@ let ``ForgetWindowはVirtualWorldから窓を取り除くだけで、観測もEf
     Assert.Empty(events)
     Assert.Empty(callReturns)
     Assert.False(Map.containsKey w world'.Windows)
+
+[<Fact>]
+let ``窓の発見時にPlacementが出すReprobe(KTargetIntegrity)は、TargetIntegrityだけを運ぶ部分観測を返す(v2.51)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    settleTopology reducer [ mkMonitor 0 ]
+    let w = WindowId 1L
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } Immediate
+    // 発見時の観測にTargetIntegrityが含まれていないので、Placementが能動的にReprobeを発行する(§21)。
+    let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
+    let reprobeEffects = discovery.Effects |> List.filter (fun g -> match GatedEffect.effect g with Reprobe (w', KTargetIntegrity) -> w' = w | _ -> false)
+    Assert.Equal(1, List.length reprobeEffects)
+    let world', events, callReturns = applyEffect 1000L world (List.exactlyOne reprobeEffects)
+    Assert.Empty(callReturns) // ReprobeはRequestIdを持たないEffectなので結果は無い
+    match events with
+    | [ WindowObserved snapshot ] ->
+        Assert.Equal(w, snapshot.Id)
+        Assert.Equal(Some (Ok NotHigher), snapshot.TargetIntegrity |> Option.map (fun o -> o.Value))
+        // 部分観測であることの確認：TargetIntegrity以外のフィールドは一切運ばない。
+        Assert.Equal(None, snapshot.VisibleFrameRect)
+        Assert.Equal(None, snapshot.Presence)
+    | other -> Assert.True(false, sprintf "unexpected events: %A" other)
+    // この観測をCoreへ戻すと、Placement.TargetIntegrityの信念が実際にBelieved NotHigherへ確定する。
+    let afterObserved = events |> List.fold (fun (r: Reducer) ev -> r.Submit 1001L "virtual-world" ev |> ignore; r) reducer
+    match Map.tryFind w afterObserved.State.Placement.TargetIntegrity with
+    | Some (Believed { Value = NotHigher; Confidence = Confirmed }) -> ()
+    | other -> Assert.True(false, sprintf "unexpected: %A" other)
+
+    // 昇格窓(Integrity = Higher)を模した場合は、Reprobeの観測もHigherを運ぶ——決め打ちのNotHigherで
+    // なく実際にVirtualWindow.Integrityを読んでいることを確認する。
+    let elevatedWindow = { Map.find w world.Windows with Integrity = Higher }
+    let elevatedWorld = { world with Windows = Map.add w elevatedWindow world.Windows }
+    let _, elevatedEvents, _ = applyEffect 1000L elevatedWorld (List.exactlyOne reprobeEffects)
+    match elevatedEvents with
+    | [ WindowObserved snapshot ] -> Assert.Equal(Some (Ok Higher), snapshot.TargetIntegrity |> Option.map (fun o -> o.Value))
+    | other -> Assert.True(false, sprintf "unexpected events: %A" other)
+
+[<Fact>]
+let ``ScreenSettle確定でTopologyが発行するObserveAllは、VirtualWorld上の全窓を完全なWindowObservedとして運ぶ(v2.51)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    let w1, w2 = WindowId 1L, WindowId 2L
+    let world =
+        empty
+        |> addWindow w1 { X = 0; Y = 0; Width = 10; Height = 10 } Immediate
+        |> addWindow w2 { X = 5; Y = 5; Width = 20; Height = 20 } Immediate
+    reducer.Submit 0L "virtual-world" (MonitorTopologyObserved [ mkMonitor 0 ]) |> ignore
+    let settleResult = (reducer.AdvanceToNextTimer ()).Value // ScreenSettle満了：ObserveAllを発行してGraceへ
+    let observeAllEffects = settleResult.Effects |> List.filter (fun g -> match GatedEffect.effect g with ObserveAll -> true | _ -> false)
+    Assert.Equal(1, List.length observeAllEffects)
+    let _, events, callReturns = applyEffect 100L world (List.exactlyOne observeAllEffects)
+    Assert.Empty(callReturns)
+    let observedIds = events |> List.choose (function WindowObserved s -> Some s.Id | _ -> None) |> Set.ofList
+    Assert.Equal<Set<WindowId>>(Set.ofList [ w1; w2 ], observedIds)
+    // 部分観測ではなく全体再列挙なので、Rect/Presence/TargetIntegrityを全て運ぶ。
+    for ev in events do
+        match ev with
+        | WindowObserved s ->
+            Assert.True(s.VisibleFrameRect.IsSome)
+            Assert.True(s.Presence.IsSome)
+            Assert.True(s.TargetIntegrity.IsSome)
+        | _ -> ()
+
+[<Fact>]
+let ``CloseFocusedが出すRequestCloseはVirtualWorldから窓を取り除きWindowRemovedを生む(v2.51)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    settleTopology reducer [ mkMonitor 0 ]
+    let w = WindowId 1L
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } Immediate
+    let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
+    let world' = settle 1000L reducer world discovery.Effects
+    let fg: Observation<WindowId option> = { Value = Ok (Some w); SampleSequence = 100L; MonotonicTime = 1500L; Source = "test" }
+    reducer.Submit 1500L "virtual-world" (ForegroundObserved fg) |> ignore
+
+    let closeResult = reducer.Submit 1600L "virtual-world" (UserCommand CloseFocused)
+    let requestCloseEffects = closeResult.Effects |> List.filter (fun g -> match GatedEffect.effect g with RequestClose (_, w') -> w' = w | _ -> false)
+    Assert.Equal(1, List.length requestCloseEffects)
+
+    let finalWorld = settle 1600L reducer world' closeResult.Effects
+    Assert.False(Map.containsKey w finalWorld.Windows)
+    // VirtualWorldが返したWindowRemovedが実際にCoreへ戻り、消滅のクリーンアップが走っている。
+    Assert.False(Map.containsKey w reducer.State.Windows.Records)
 
 [<Fact>]
 let ``2つ目の窓が現れても、両方がMonocleで全画面に配置され両方Satisfiedになる`` () =
