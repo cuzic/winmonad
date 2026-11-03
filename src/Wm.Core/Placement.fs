@@ -555,6 +555,12 @@ let checkDpiCrossing (now: int64) (dpiOf: MonitorId -> int option) (w: WindowId)
 /// 5. `Accepted`に値がある（＝この窓についてこれまでに一度も「受け入れられた」という証拠が無ければ、
 ///    比べる基準が無いので検知しない）。
 /// 6. 観測されたモニター（`Geometry.Monitor`）と`desiredMonitorOf w`が異なる。
+/// 7. `Geometry.IsMinimized`信念が`true`でない（v2.75で追加）：CIスパイクS24/S25が確認した
+///    最小化時の`-32000`付近への移動は、`onPendingDeadlineTimerFired`のMismatch判定だけでなく
+///    （条件5、v2.73）、このクロスモニター比較にも同じ誤検知経路を持つ——Shellが最小化中の窓の
+///    モニターをどう報告するか次第で、観測されたモニターが`desiredMonitorOf`と食い違って見える
+///    可能性がある。v2.73と同じ理由（最小化はユーザー操作そのものの結果であり、OS/アプリの
+///    ドリフトではない）で除外する。
 ///
 /// 検知した場合でも、直近`unattributedWindowMs`以内の補正回数が`unattributedCorrectionLimit`に
 /// 達していれば打ち止めにする（レビュー§Q2「意図をまたいでリセットしない」）——補正もカウントも
@@ -570,7 +576,8 @@ let checkUnattributedDrift
     (w: WindowId)
     (state: PlacementState)
     : PlacementState * bool * bool =
-    if not screenPhaseIsStable || not (isTiled w) || (state.Pending |> Map.exists (fun _ pr -> pr.Window = w)) || Set.contains w state.Dragging then
+    let isMinimized = Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.IsMinimized) |> Option.defaultValue false
+    if not screenPhaseIsStable || not (isTiled w) || (state.Pending |> Map.exists (fun _ pr -> pr.Window = w)) || Set.contains w state.Dragging || isMinimized then
         state, false, false
     else
         match Map.tryFind w state.Accepted, Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.Monitor), desiredMonitorOf w with

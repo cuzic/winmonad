@@ -1012,6 +1012,25 @@ let ``checkUnattributedDriftは、Pendingが無くAcceptedが有りモニター�
     Assert.Equal<int64 list>([ 30L ], Map.tryFind w afterDrift.DriftCorrections |> Option.defaultValue [])
 
 [<Fact>]
+let ``checkUnattributedDriftは最小化中の窓には作用しない(v2.75)`` () =
+    // CIスパイクS24/S25が確認した最小化時の挙動（矩形が-32000付近へ移る）は、v2.73で
+    // onPendingDeadlineTimerFiredのMismatch判定を誤検知させることが分かっている。
+    // checkUnattributedDriftは同じGeometry.Monitor信念を見るクロスモニター比較なので、
+    // 最小化中にモニターの観測が食い違って見えても補正・カウントしてはならない。
+    let w = WindowId 1L
+    let m0, m1 = MonitorId 0L, MonitorId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
+    Assert.Equal(Some workArea, Map.tryFind w afterObserved.Accepted)
+    // ユーザーが最小化し、観測されたモニターが(最小化中の報告の揺れ等で)食い違って見える。
+    let afterMinimized, _, _ = onWindowObserved 30L (observedSnapshotMinimized w workArea m1 2L) afterObserved
+    let afterDrift, corrected, shouldDegrade = checkUnattributedDrift 30L isTiledTrue (fun _ -> Some m0) alwaysStable w afterMinimized
+    Assert.False(corrected)
+    Assert.False(shouldDegrade)
+    Assert.Equal(Some (Shown (Some workArea)), Map.tryFind w afterDrift.Desired)
+    Assert.Empty(Map.tryFind w afterDrift.DriftCorrections |> Option.defaultValue [])
+
+[<Fact>]
 let ``checkUnattributedDriftは抑止区間中(ScreenPhase非Stable)は検知もカウントもしない(v2.70、Opusレビュー§Q4-1「必須」)`` () =
     let w = WindowId 1L
     let m0, m1 = MonitorId 0L, MonitorId 1L
