@@ -735,6 +735,49 @@ let ``onWindowVanishedはMinWidthも消す(v2.43)`` () =
     let afterVanished, _ = onWindowVanished w afterDeadline
     Assert.Equal(None, Map.tryFind w afterVanished.MinWidth)
 
+[<Fact>]
+let ``DpiBehavior=RescalesItselfで2段目リサイズ待ち中(DpiCrossing未決着)のMismatchはMinWidthの証拠にしない(v2.45)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    // DPIクロッシング待ち中（checkDpiCrossingの記録を直接構成する——`PlacementState`は公開レコード）、
+    // かつこの窓はRescalesItselfだと分かっていることにする。
+    let afterMarked =
+        { afterDispatched with
+            DpiBehavior = Map.add w { Value = RescalesItself; Confidence = Inferred []; LastRevisedAt = 12L } afterDispatched.DpiBehavior
+            DpiCrossing = Map.add w workArea afterDispatched.DpiCrossing }
+    let widerRect = { workArea with Width = workArea.Width + 100 } // Targetより広い、かつDpiCrossingのbaseline(workArea)とも異なる
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w widerRect m 10L) afterMarked
+    let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
+    let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    Assert.Empty(afterDeadline.Pending) // Mismatchとしての終端・Pending解消は変わらない
+    Assert.Equal(None, Map.tryFind w afterDeadline.MinWidth) // だがMinWidthの証拠にはしない(2段目待ち中)
+
+[<Fact>]
+let ``DpiBehavior=OsBitmapScaledならDpiCrossing未決着中でもMismatchをMinWidthの証拠にする(v2.45)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    // 除外はRescalesItselfの窓だけが対象(§4.5)——OsBitmapScaledなら2段目自己リサイズという概念自体が
+    // 無いので、DpiCrossingが(何らかの理由で)残っていても除外しない。
+    let afterMarked =
+        { afterDispatched with
+            DpiBehavior = Map.add w { Value = OsBitmapScaled; Confidence = Inferred []; LastRevisedAt = 12L } afterDispatched.DpiBehavior
+            DpiCrossing = Map.add w workArea afterDispatched.DpiCrossing }
+    let widerRect = { workArea with Width = workArea.Width + 100 }
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w widerRect m 10L) afterMarked
+    let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
+    let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    match Map.tryFind w afterDeadline.MinWidth with
+    | Some { Confidence = Inferred _ } -> ()
+    | other -> Assert.True(false, sprintf "expected an Inferred MinWidth belief, got %A" other)
+
 // ===== DpiBehaviorの2段目自己リサイズ検出（checkDpiCrossing、v2.45） =====
 
 [<Fact>]

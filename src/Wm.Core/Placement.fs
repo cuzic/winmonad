@@ -125,18 +125,17 @@
 /// - ~~**`MinWidth`（Accumulating規則）**~~：v2.43で実装（`reviseMinWidth`、型直前のコメント参照）。
 ///   `Mismatch`（`observed.Width > TargetRect.Width`）を証拠に、観測時の窓のモニターDPIでDIPへ
 ///   正規化した値を`Inferred`の最小幅とする。`DpiBehavior = RescalesItself`の2段目リサイズ待ちを
-///   除外する規則（§4.5）は、v2.45で`DpiBehavior`信念自体の2段目検出（下記）が実装された後も、
-///   `checkPendingSatisfied`/`isMismatch`側にこの信念を読んで除外する分岐をまだ追加していないため
-///   対象外のまま（今は証拠としてそのまま採用する、既知のギャップ）。信念自体は`MinWidth`を読む
-///   `Policy`述語（`MinWidthAtLeast`、§5.4）やLayoutの`LayoutWindow.MinWidthDip`へまだ結線していない
-///   ——値を蓄積するところまでがこのラウンドの範囲で、実際に配置・分類へ反映する消費側は専用の
-///   ラウンドへ持ち越す（信念が無いと配置を変えようにも読む側が無いため、まずここから）。
+///   除外する規則（§4.5）はv2.45で`onPendingDeadlineTimerFired`に結線済み（`isMidDpiTransition`、
+///   `reviseMinWidth`の型直前のコメント参照）。信念自体は`MinWidth`を読む`Policy`述語
+///   （`MinWidthAtLeast`、§5.4）やLayoutの`LayoutWindow.MinWidthDip`へまだ結線していない——値を
+///   蓄積するところまでがこのラウンドの範囲で、実際に配置・分類へ反映する消費側は専用のラウンドへ
+///   持ち越す（信念が無いと配置を変えようにも読む側が無いため、まずここから）。
 /// - ~~**`DpiBehavior`（Accumulating規則）**~~：v2.44で発見時の申告による初期値、v2.45で2段目の
-///   自己リサイズ検出（`checkDpiCrossing`、型直前のコメント参照）を実装した。CIスパイクS22
-///   （docs/spikes.md）で`SetWindowPos`から`LOCATIONCHANGE`までの遅延が0〜1msと確認済みなので、
-///   架空のタイムアウトは設けず次の観測だけで判定する最小実装にした。残るのは`MinWidth`側の
-///   2段目待ち除外の消費（上記）と、`Movable`への確定（v2.24と同様の仕組み。今は`Inferred`のまま）
-///   ——専用のラウンドへ持ち越す。
+///   自己リサイズ検出（`checkDpiCrossing`、型直前のコメント参照）、同じラウンドで`MinWidth`側の
+///   2段目待ち除外（上記）も結線した。CIスパイクS22（docs/spikes.md）で`SetWindowPos`から
+///   `LOCATIONCHANGE`までの遅延が0〜1msと確認済みなので、架空のタイムアウトは設けず次の観測だけで
+///   判定する最小実装にした。残るのは`Movable`への確定に相当する仕組み（v2.24と同様。今は
+///   `Inferred`のまま、2段目を実際に見ても`Confirmed`へは進めない）——専用のラウンドへ持ち越す。
 /// - **`TargetIntegrity`のProbeOnce規則が述べる「同じProcessKeyの間は再probeしない」の明示的な検査**：
 ///   このラウンドの実装では、確定（`Believed`）した窓を再probeする経路自体が無い（`WindowObserved`が
 ///   `TargetIntegrity = None`で届いても、既に`TargetIntegrity`マップにエントリがあれば何もしない）ため、
@@ -646,9 +645,9 @@ let private tryMismatchObservation (pr: PendingRequest) (state: PlacementState) 
 /// （`MinWidth`の型直前のコメント参照）。より小さい幅が観測されたら値を下げる——最新の証拠をそのまま
 /// 採用する単純な規則とし、具体的な閾値（何回観測されたら配置に反映するか）は実機Journalでの
 /// チューニングを待つ専用のラウンドへ持ち越す（§21）。`DpiBehavior = RescalesItself`の窓がモニター間を
-/// 移った直後の2段目リサイズ待ちを除外する規則（§4.5）は、`DpiBehavior`信念自体はv2.45で実装された
-/// ものの、この関数側にそれを読んで除外する分岐をまだ追加していないため対象外のまま
-/// （ファイル冒頭「対象外」参照）——今は証拠としてそのまま採用する、既知のギャップ。
+/// 移った直後の2段目リサイズ待ちを除外する規則（§4.5）はv2.45で`onPendingDeadlineTimerFired`側に
+/// 結線した（`isMidDpiTransition`、呼び出し側のコメント参照）——`DpiCrossing`に未決着の記録が残る
+/// `RescalesItself`の窓だけ、観測した`Mismatch`をこの関数の証拠対象から外す。
 let private toDip (dpi: int) (physicalPx: int) : int = physicalPx * 96 / dpi
 
 let private reviseMinWidth (now: int64) (evidence: EvidenceRef) (observedWidthDip: int) (current: Belief<int> option) : Belief<int> =
@@ -688,8 +687,17 @@ let onPendingDeadlineTimerFired
     | Some pr when awaitDeadline (Some pr.Deadline) now ->
         match tryMismatchObservation pr state with
         | Some (observed, valueSeq) ->
+            // §4.5「`DpiBehavior = RescalesItself`の窓が異なるDPIのモニターへ移った直後、2段目の
+            // 自己リサイズを待っている間に観測した`Mismatch`は証拠にしない（1段目のOSの拡大と2段目の
+            // 間の値を誤って正規化しないため、R5-11）」（v2.45で結線。`reviseMinWidth`の型直前の
+            // コメント参照）：`DpiCrossing`に未決着の記録が残っている（＝`checkDpiCrossing`がまだ
+            // 2段目を見ていない）窓で、信念が`RescalesItself`なら、このMismatchをMinWidthの証拠にしない
+            // （Mismatch自体の終端・Pending解消は変えない——証拠として採用しないだけ）。
+            let isMidDpiTransition =
+                Map.containsKey pr.Window state.DpiCrossing
+                && (Map.tryFind pr.Window state.DpiBehavior |> Option.map (fun b -> b.Value)) = Some RescalesItself
             let minWidth' =
-                if observed.Width > pr.TargetRect.Width then
+                if observed.Width > pr.TargetRect.Width && not isMidDpiTransition then
                     match Map.tryFind pr.Window state.Geometry |> Option.bind (fun g -> LatestWins.value g.Monitor) |> Option.bind dpiOf with
                     | Some dpi ->
                         let observedWidthDip = toDip dpi observed.Width
