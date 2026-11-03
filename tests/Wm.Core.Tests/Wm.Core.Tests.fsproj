@@ -25,6 +25,7 @@
     <Compile Include="DeterministicCollectionsArchitectureTests.fs" />
     <Compile Include="TruthCombinatorLawTests.fs" />
     <Compile Include="ClassifyTests.fs" />
+    <Compile Include="ExecuteEffectProtocolTests.fs" />
     <Compile Include="GatedEffectTests.fs" />
   </ItemGroup>
 
