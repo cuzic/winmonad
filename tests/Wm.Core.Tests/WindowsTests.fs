@@ -122,6 +122,39 @@ let ``reviseIdentity: Error観測は何もしない`` () =
     let identity' = reviseIdentity 10L identityInit snapshot
     Assert.True(match identity'.Process with Unformed [] -> true | _ -> false)
 
+// ===== onWindowObserved：HWND再利用の検知(§4.5 Sticky規則、v2.47) =====
+
+let private withProcess (w: WindowId) (sequence: int64) (pid: int) : WindowSnapshot =
+    { visibleSnapshot w with Process = Some (obs sequence { Pid = pid; CreationTime = 1L }) }
+
+[<Fact>]
+let ``Processが異なる値で観測されたらWindowVanishedByReuseを出し、信念は書き換えない`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "r" 10 AnyWindow Tiled ] }
+    let ctx = ctxWith policy 0L
+    let registry1, _, _ = onWindowObserved ctx (withProcess (WindowId 1L) 1L 100) initial
+    let registry', events, cmds = onWindowObserved { ctx with Now = 10L } (withProcess (WindowId 1L) 2L 200) registry1
+    Assert.Equal<DomainEvent list>([ WindowVanishedByReuse (WindowId 1L) ], events)
+    Assert.Empty(cmds)
+    // 信念は一切書き換えない(旧Processの値のまま)。実際の除去はWmState.vanishWindowに委ねる。
+    match (Map.find (WindowId 1L) registry'.Identity).Process with
+    | Believed b -> Assert.Equal({ Pid = 100; CreationTime = 1L }, b.Value)
+    | Unformed _ -> Assert.True(false, "expected Believed")
+
+[<Fact>]
+let ``同じProcessの繰り返しはWindowVanishedByReuseを出さない`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "r" 10 AnyWindow Tiled ] }
+    let ctx = ctxWith policy 0L
+    let registry1, _, _ = onWindowObserved ctx (withProcess (WindowId 1L) 1L 100) initial
+    let _, events, _ = onWindowObserved { ctx with Now = 10L } (withProcess (WindowId 1L) 2L 100) registry1
+    Assert.DoesNotContain(WindowVanishedByReuse (WindowId 1L), events)
+
+[<Fact>]
+let ``Processが初めて観測される(Unformedから)場合はHWND再利用と判定しない`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "r" 10 AnyWindow Tiled ] }
+    let ctx = ctxWith policy 0L
+    let _, events, _ = onWindowObserved ctx (withProcess (WindowId 1L) 1L 100) initial
+    Assert.DoesNotContain(WindowVanishedByReuse (WindowId 1L), events)
+
 // ===== onWindowObserved / 分類 =====
 
 [<Fact>]

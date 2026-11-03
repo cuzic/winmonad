@@ -122,8 +122,9 @@ let private removeFromWorkspacesAndFocus (w: WindowId) (state: WmState) : WmStat
 /// 除去する」）。Workspaces・Focus.History・SwitchSettleに加え、Health（Responsiveness/Reprobes）と
 /// Windows（Records/Identity/ClassInputs）の信念も、同じstepの中で原子的に除去する。
 ///
-/// Opusレビュー4-2：これは「消滅そのもの」（`WindowRemoved`、将来はSticky規則のProcess不一致によるHWND
-/// 再利用検知も含む——後者はまだ未配線、Windows.fsのファイル冒頭コメント参照）専用であり、「管理外化」
+/// Opusレビュー4-2：これは「消滅そのもの」（`WindowRemoved`、Sticky規則のProcess不一致によるHWND
+/// 再利用検知も同じ経路を使う——`WindowVanishedByReuse`、v2.47で配線済み。Windows.fsのファイル冒頭
+/// コメント参照）専用であり、「管理外化」
 /// （Excluded化・Unplaced化。消滅はしていないがWorkspaces/Focus.History/SwitchSettleからだけ外れる）とは
 /// 意図的に分けている（`unmanageWindow`、下記）。後者はHealth等の信念を消さない（Excludedの窓も信念を
 /// 持ち続け再分類に備える、§4.4）。この2つを同じ関数に融合すると、片方を書き換えたときにもう片方が壊れる
@@ -188,15 +189,17 @@ let private applyWindowsEvent (state: WmState) (ev: DomainEvent) : WmState =
 /// （ADR-018：各ドメインは自分の状態だけを返し、他ドメインの状態を書かない）。
 ///
 /// Opusレビュー5-3：§7.1の段の順そのままではなく、今実装済みのドメインが処理できる入力の分だけ
-/// 素直に並べている。段⑦（Reconcile）はアクティブなWorkspace1つだけを対象に配線した（`StyleChanged`は
-/// 依然未配線、Windows.fs/Placement.fsのファイル冒頭コメント参照）。表どおりの8段パイプラインへの
-/// 完全な組み直し（複数の可視Workspace、`WorkspaceShown`/`Hidden`経由のReconcileトリガー等）は
-/// 今後のラウンドへ持ち越す。
+/// 素直に並べている。段⑦（Reconcile）は現在表示中の全Workspace（アクティブなものに限らない）を対象に
+/// 配線している（v2.26で拡張済み。このコメントが長らくv2.11時点の「アクティブな1つだけ」のまま
+/// 更新されていなかった誤りをv2.47で訂正した。`StyleChanged`は依然未配線、Windows.fs/Placement.fsの
+/// ファイル冒頭コメント参照）。表どおりの8段パイプラインへの完全な組み直しは今後のラウンドへ持ち越す。
 let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelope<InputEvent>) : StepResult =
     let now = envelope.MonotonicTime
     let focusedBefore = focused state
 
-    // 窓の消滅（vanished）のクリーンアップ。今はWindowRemovedだけが引き金になる。
+    // 窓の消滅（vanished）のクリーンアップ。`WindowRemoved`はここで即座に引き金になる。HWND再利用
+    // （`WindowVanishedByReuse`、v2.47）はWindowsが`WindowObserved`を処理した後にしか分からないので、
+    // 同じ`vanishWindow`を下（`stateAfterWindows`の直後）でも別途呼ぶ。
     let state, vanishTimerCmds =
         match envelope.Input with
         | WindowRemoved w -> vanishWindow w state
@@ -218,6 +221,25 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     let stateAfterWindows =
         { state with Windows = windowsRegistry' }
         |> fun s -> windowsEvents |> List.fold applyWindowsEvent s
+
+    // HWND再利用の検知（§4.5 Sticky規則のProcess不一致、v2.47）：`WindowVanishedByReuse`は
+    // `applyWindowsEvent`が処理しない特別なケースで、`WindowRemoved`と同じ`vanishWindow`（全ドメインの
+    // 信念・Workspaces/Focus/SwitchSettle・待ちタイマーの除去）を適用する。`windowsRegistry'`はこの時点
+    // でまだ旧Processの値のまま（`Windows.onWindowObserved`が検知時は信念を書き換えずに返す、Windows.fs
+    // 参照）なので、`vanishWindow`内の`Windows.onWindowVanished`が初めてRecords/Identity/ClassInputsを
+    // 除去する。`ForgetWindow`EffectはShellの対応表から外させるためのもの（7.1）。
+    let stateAfterWindows, reuseVanishTimerCmds =
+        windowsEvents
+        |> List.fold
+            (fun (s, cmds) ev ->
+                match ev with
+                | WindowVanishedByReuse w ->
+                    let s', c = vanishWindow w s
+                    s', cmds @ c
+                | _ -> s, cmds)
+            (stateAfterWindows, [])
+
+    let reuseForgetEffects = windowsEvents |> List.choose (function WindowVanishedByReuse w -> Some (ForgetWindow w) | _ -> None)
 
     // 段①相当（Placement）：WindowObservedはWindowsと同じ入力から自分の信念（Geometry/Movability/
     // TargetIntegrity）だけを修正する（§7.1「Windows→Placement→Health→Focus」の順）。TargetIntegrityの
@@ -684,7 +706,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
           HiddenByWm = Set.empty
           NeedsRestore = Set.empty }
 
-    let gated, rejected = GatedEffect.gate gateInput (topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects @ switchForegroundEffects @ focusRotateEffects @ closeFocusedEffects @ focusMostRecentEffects @ switchSettleReRequestEffects)
+    let gated, rejected = GatedEffect.gate gateInput (reuseForgetEffects @ topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects @ switchForegroundEffects @ focusRotateEffects @ closeFocusedEffects @ focusMostRecentEffects @ switchSettleReRequestEffects)
 
     // §7.2「GateRejected → Cancelled（Deadlineまで待たず同じstep内で即時に遷移する）」。
     let rejectedRequestIds = rejected |> List.choose fst
@@ -706,6 +728,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         @ switchSettleStartCmds
         @ windowsTimerCmds
         @ vanishTimerCmds
+        @ reuseVanishTimerCmds
         @ placementTimerCmds
         @ presenceTimerCmds
         @ topologySettledTimerCmds

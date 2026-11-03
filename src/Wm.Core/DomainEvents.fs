@@ -38,6 +38,12 @@ type PendingOutcome =
 type DomainEvent =
     | ForegroundChanged of WindowId option
     | WindowUnmanaged of WindowId
+    /// HWND再利用の検知（§4.5 Sticky規則「Processが異なる値で観測されたら…」、v2.47）。`WindowUnmanaged`
+    /// （管理外化。Workspaces/Focus.History/SwitchSettleからだけ除き信念は保持する）とは別のケースにする：
+    /// こちらは「消滅」と同じ全除去（`WmState.vanishWindow`、全ドメインの信念も含む）を引き金にする必要が
+    /// あり、両者を同じDomainEventで表すと下流が区別できずどちらかの挙動を壊す（Windows.fsファイル冒頭
+    /// コメント参照）。
+    | WindowVanishedByReuse of WindowId
     | MoveAttributed of WindowId * MoveCause
     | TopologySettled of Wm.Contracts.Identifiers.MonitorSnapshot list
     | FocusTargetRequested of WindowId

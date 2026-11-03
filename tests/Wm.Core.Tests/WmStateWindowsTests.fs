@@ -8,6 +8,7 @@ open Wm.Contracts.Observation
 open Wm.Contracts.SharedVocabulary
 open Wm.Contracts.Timers
 open Wm.Contracts.CoreCommand
+open Wm.Contracts.GatedEffect
 open Wm.Core.Windows
 open Wm.Core.Workspaces
 open Wm.Core.Topology
@@ -76,6 +77,33 @@ let ``WindowRemovedは同じstepでWorkspaces・Windows.Recordsの双方から�
     let afterRemoved = (step runtimePolicy afterObserved (mkEnvelope 2L (WindowRemoved (WindowId 1L)))).Next
     Assert.False(Map.containsKey (WindowId 1L) afterRemoved.Windows.Records)
     Assert.Equal(None, WorkspaceSet.workspaceOf (WindowId 1L) afterRemoved.Workspaces)
+
+let private visibleWindowObservedWithProcess (w: WindowId) (sequence: int64) (pid: int) : InputEvent =
+    WindowObserved
+        { (match visibleWindowObserved w with WindowObserved s -> s | _ -> failwith "unreachable") with
+            Process = Some { Value = Ok { Pid = pid; CreationTime = 1L }; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" } }
+
+[<Fact>]
+let ``HWND再利用(Processの不一致)は旧WindowIdをWindowRemovedと同じく全除去し、ForgetWindowを出す(v2.47)`` () =
+    let state = seedState ()
+    let afterFirst = (step runtimePolicy state (mkEnvelope 1L (visibleWindowObservedWithProcess (WindowId 1L) 1L 100))).Next
+    Assert.True(Map.containsKey (WindowId 1L) afterFirst.Windows.Records)
+    Assert.Equal(Some (WorkspaceId 0), WorkspaceSet.workspaceOf (WindowId 1L) afterFirst.Workspaces)
+    let result = step runtimePolicy afterFirst (mkEnvelope 2L (visibleWindowObservedWithProcess (WindowId 1L) 2L 200))
+    // 消滅と同じ全除去：Windows.Records、Workspacesの所属の双方から除かれる（WindowRemovedと同じ経路）。
+    Assert.False(Map.containsKey (WindowId 1L) result.Next.Windows.Records)
+    Assert.Equal(None, WorkspaceSet.workspaceOf (WindowId 1L) result.Next.Workspaces)
+    // ShellのHWND→WindowId対応表から外させるForgetWindowが出る。
+    Assert.Contains(ForgetWindow (WindowId 1L), result.Effects |> List.map GatedEffect.effect)
+
+[<Fact>]
+let ``同じProcessが繰り返し観測されてもHWND再利用とは判定されない`` () =
+    let state = seedState ()
+    let afterFirst = (step runtimePolicy state (mkEnvelope 1L (visibleWindowObservedWithProcess (WindowId 1L) 1L 100))).Next
+    let result = step runtimePolicy afterFirst (mkEnvelope 2L (visibleWindowObservedWithProcess (WindowId 1L) 2L 100))
+    Assert.True(Map.containsKey (WindowId 1L) result.Next.Windows.Records)
+    Assert.Equal(Some (WorkspaceId 0), WorkspaceSet.workspaceOf (WindowId 1L) result.Next.Workspaces)
+    Assert.DoesNotContain(ForgetWindow (WindowId 1L), result.Effects |> List.map GatedEffect.effect)
 
 [<Fact>]
 let ``SetManagement Excludedは同じstepでWorkspacesから除くが、Windows.Recordsの信念は保持する(管理外化)`` () =

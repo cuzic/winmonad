@@ -3,14 +3,16 @@
 /// 分類述語が読む属性）。
 ///
 /// このラウンドで意図的に対象外にしたこと（いずれも既知のギャップとして明示する）：
-/// - **HWND再利用の検知**（§4.5「Processが異なる値で観測されたら…」）：`reviseIdentity`はSticky規則の
-///   「値は変えず確度を下げる」だけを行い、`Process`の不一致を`WindowUnmanaged`＋`ForgetWindow`へ
-///   変換する分岐は実装しない。これは「消滅と同じに扱う」特殊な経路であり、DomainEventの意味論を
-///   どう割り振るか（既存の`WindowUnmanaged`を再利用するか、新しいケースを追加するか）が非自明なため、
-///   独立したラウンドで扱う。
-/// - **`StyleChanged`/`MinimizedStateChanged`の配線**：前者は信念を運ばない通知だけのイベントであり、
-///   どの段でどう使うか（`ObserveWindow`を発行するか）が7.1の表に明記されていない。後者はPlacement
-///   ドメイン（`GeometryBeliefs.IsMinimized`、§4.5）の所轄であり、Placement着手まで配線先が無い。
+/// - ~~**HWND再利用の検知**（§4.5「Processが異なる値で観測されたら…」）~~：**v2.47で実装**。
+///   `onWindowObserved`が`detectsProcessReuse`で`Process`の不一致を検知したら、信念を書き換えずに
+///   `WindowVanishedByReuse w`だけを返す（`WindowUnmanaged`とは別のDomainEventケース。既存の
+///   `WindowUnmanaged`は「管理外化」専用で信念を保持するため、再利用には使えない——下記DomainEvents.fs
+///   参照）。`WmState.step`がこれを`vanishWindow`（`WindowRemoved`と共通の全除去経路）へ回し、
+///   `ForgetWindow`Effectも合わせて出す。
+/// - **`StyleChanged`の配線**：信念を運ばない通知だけのイベントであり、どの段でどう使うか
+///   （`ObserveWindow`を発行するか）が7.1の表に明記されていない。~~`MinimizedStateChanged`~~は
+///   v2.41で`Placement.onMinimizedStateChanged`として既に配線済み（このコメントはv2.15時点の記述が
+///   古いまま残っていたもので、v2.47で訂正した）。
 /// - **`ByPolicy`で確定済みの窓の増分再分類**：§5.4「分類確定後に再分類（タイトル変化等）で結果が変わる
 ///   場合は、7.3の振動防止の対象に含める」は一般の再分類を想定しているが、具体的な振動の閾値
 ///   （何回・どの時間窓で「振動」とみなすか）は本書に数値が無い。`ByTimeout`からの一度だけの
@@ -114,6 +116,14 @@ let private reviseSticky (now: int64) (isValid: 'T -> bool) (current: BeliefSlot
 
 let private alwaysValid (_: 'T) = true
 let private notApplicationFrameHost (v: string) = v <> "ApplicationFrameHost.exe"
+
+/// HWND再利用の検知（§4.5 Sticky規則「Processが異なる値で観測されたら、それはHWNDの再利用を見逃した
+/// 証拠である」、v2.47）。`reviseSticky`は値を変えず確度を下げるだけなので、検知はこの専用の関数が
+/// 別に行う（`Process`はSticky規則の対象で`alwaysValid`、不定値の例外は無い）。
+let private detectsProcessReuse (current: BeliefSlot<ProcessKey>) (observed: Observation<ProcessKey> option) : bool =
+    match current, observed with
+    | Believed b, Some { Value = Ok v } -> v <> b.Value
+    | _ -> false
 
 /// `WindowSnapshot`から`IdentityBeliefs`をSticky規則で修正する（§4.5）。
 let reviseIdentity (now: int64) (current: IdentityBeliefs) (snapshot: WindowSnapshot) : IdentityBeliefs =
@@ -279,14 +289,21 @@ let private withRecord
 // ===== 公開ハンドラ（§7.1段①⑤、WmState.stepから呼ぶ） =====
 
 /// `WindowObserved`：Identity/ClassInputsを修正し、同じstepで分類を再評価する。
+/// HWND再利用（`Process`の不一致、v2.47）を検知したら、信念をこのstepでは一切書き換えずに
+/// `WindowVanishedByReuse w`だけを返す——新しいProcessの値を旧`WindowId`の下で混ぜないため
+/// （次の列挙でShellが新しい`WindowId`として再発見する、R4-14）。`Records`/`Identity`/`ClassInputs`の
+/// 実際の除去と待ちタイマーの取消は`WmState.vanishWindow`（`WindowRemoved`と共通）に委ねる。
 let onWindowObserved (ctx: ClassificationCtx) (snapshot: WindowSnapshot) (registry: WindowRegistry) : WindowRegistry * DomainEvent list * TimerCommand<TimerId> list =
     let w = snapshot.Id
     let identity0 = Map.tryFind w registry.Identity |> Option.defaultValue identityInitial
-    let inputs0 = Map.tryFind w registry.ClassInputs |> Option.defaultValue classInputsInitial
-    let identity' = reviseIdentity ctx.Now identity0 snapshot
-    let inputs' = reviseClassInputsFromSnapshot ctx.Now inputs0 snapshot
-    let registry' = { registry with Identity = Map.add w identity' registry.Identity; ClassInputs = Map.add w inputs' registry.ClassInputs }
-    withRecord w registry' (fun record -> reconsider ctx w identity' inputs' record)
+    if detectsProcessReuse identity0.Process snapshot.Process then
+        registry, [ WindowVanishedByReuse w ], []
+    else
+        let inputs0 = Map.tryFind w registry.ClassInputs |> Option.defaultValue classInputsInitial
+        let identity' = reviseIdentity ctx.Now identity0 snapshot
+        let inputs' = reviseClassInputsFromSnapshot ctx.Now inputs0 snapshot
+        let registry' = { registry with Identity = Map.add w identity' registry.Identity; ClassInputs = Map.add w inputs' registry.ClassInputs }
+        withRecord w registry' (fun record -> reconsider ctx w identity' inputs' record)
 
 let private withBeliefUpdate
     (ctx: ClassificationCtx)
