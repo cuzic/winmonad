@@ -1,12 +1,14 @@
 /// architecture.md §4.5「応答性（ハング）」のAccumulating規則と、§4.5の再probeバックオフ上限を検査する。
 module Wm.Core.Tests.HealthInvariantTests
 
+open Xunit
 open FsCheck.Xunit
 open Wm.Contracts.Identifiers
 open Wm.Contracts.ErrorTypes
 open Wm.Contracts.Observation
 open Wm.Contracts.Beliefs
 open Wm.Contracts.Timers
+open Wm.Contracts.CoreCommand
 open Wm.Core.Health
 
 let private mkCurrent (value: Responsiveness) (confidence: Confidence) : Belief<Responsiveness> option =
@@ -82,7 +84,7 @@ let ``applyEvidenceを任意の証拠列でfoldした結果、HungならReprobes
         evidences
         |> List.fold
             (fun (state, now) ev ->
-                let state', _cmds = applyEvidence now window (toEvidence ev) state
+                let state', _effects, _cmds = applyEvidence now window (toEvidence ev) state
                 state', now + 1L)
             (initial, 0L)
         |> fst
@@ -95,3 +97,45 @@ let ``applyEvidenceを任意の証拠列でfoldした結果、HungならReprobes
     let hasReprobe = Map.containsKey window finalState.Reprobes
 
     isHung = hasReprobe
+
+// ===== Reprobe Effectの発行（v2.84、architecture.md §4.5「Reprobeで再確認を要求する」） =====
+
+[<Fact>]
+let ``Hungへ新たに遷移するとReprobe(w, KResponsiveness)が発行される`` () =
+    let window = WindowId 1L
+    let state', effects, _cmds = applyEvidence 0L window (FromEffectFailure TargetHung) initial
+    Assert.Equal<Effect list>([ Reprobe (window, KResponsiveness) ], effects)
+    Assert.True(Map.containsKey window state'.Reprobes)
+
+[<Fact>]
+let ``既にHungな窓へさらにHungの証拠が来てもReprobeは再発行しない(遷移の瞬間だけ)`` () =
+    let window = WindowId 1L
+    let state1, _, _ = applyEvidence 0L window (FromEffectFailure TargetHung) initial
+    let _state2, effects2, _cmds2 = applyEvidence 100L window (FromObservation (PumpTimedOut 0L)) state1
+    Assert.Empty(effects2)
+
+[<Fact>]
+let ``Respondingへ回復してもReprobeは発行しない(CancelTimerだけ)`` () =
+    let window = WindowId 1L
+    let state1, _, _ = applyEvidence 0L window (FromEffectFailure TargetHung) initial
+    let _state2, effects2, cmds2 = applyEvidence 100L window (FromObservation PumpResponded) state1
+    Assert.Empty(effects2)
+    Assert.Equal<TimerCommand<TimerId> list>([ CancelTimer (TimerId.Health (ResponsivenessReprobe window)) ], cmds2)
+
+[<Fact>]
+let ``onReprobeTimerFiredが実際に次の再試行を予約するとReprobe(w, KResponsiveness)を再発行する`` () =
+    let window = WindowId 1L
+    let state1, _, cmds1 = applyEvidence 0L window (FromEffectFailure TargetHung) initial
+    let deadline = match Map.find window state1.Reprobes with _, d -> d
+    let _state2, effects2, cmds2 = onReprobeTimerFired deadline window state1
+    Assert.Equal<Effect list>([ Reprobe (window, KResponsiveness) ], effects2)
+    Assert.NotEmpty(cmds1)
+    Assert.NotEmpty(cmds2)
+
+[<Fact>]
+let ``onReprobeTimerFiredは既に回復済み(Hungでない)なら何もしない`` () =
+    let window = WindowId 1L
+    let state', effects, cmds = onReprobeTimerFired 0L window initial
+    Assert.Empty(effects)
+    Assert.Empty(cmds)
+    Assert.Equal<HealthState>(initial, state')

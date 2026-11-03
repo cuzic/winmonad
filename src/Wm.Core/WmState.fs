@@ -601,15 +601,27 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     // Health：ResponsivenessReprobeタイマーの発火と、PlacementのEffectCallReturned処理が`TargetHung`と
     // 判定した場合のResponsiveness修正（§7.2「EffectCallReturned(Error) → classify → TargetHung →
     // Cancelled ＋ Responsiveness:=Hung」。この信念修正自体はHealthの管轄なのでPlacement.fsではなく
-    // ここで行う、ADR-018）を配線する。
-    let healthState', healthTimerCmds =
+    // ここで行う、ADR-018）を配線する。**v2.84で`WindowObserved`も配線**：`snapshot.Responsiveness`
+    // （`PumpResponded`/`PumpTimedOut`/`IsHungAppWindowTrue`、§4.5）をHealthへ渡す経路がそれまで
+    // 一度も無く、`Hung`から`Responding`へ回復する唯一の経路（本文「`Reprobe`で再確認を要求する」）が
+    // 0%実装だった既知のギャップ（`applyEvidence`/`onReprobeTimerFired`のFromObservation分岐は
+    // 個別にテスト済みだったが、WmStateから呼ばれたことが一度も無かった）。HWND再利用検知時
+    // （`stateAfterWindows`と同じ`windowsEvents`ガード）はPlacementと同じ理由で素通りさせる——
+    // 消滅が決まった旧WindowIdの下にHealthの信念を新しく作らない。
+    let healthState', healthEffects, healthTimerCmds =
         match envelope.Input with
         | TimerElapsed (TimerId.Health (ResponsivenessReprobe w)) -> Health.onReprobeTimerFired now w stateAfterMovability.Health
+        | WindowObserved snapshot when windowsEvents |> List.exists (function WindowVanishedByReuse w -> w = snapshot.Id | _ -> false) ->
+            stateAfterMovability.Health, [], []
+        | WindowObserved snapshot ->
+            match snapshot.Responsiveness with
+            | Some { Value = Ok sample } -> Health.applyEvidence now snapshot.Id (FromObservation sample) stateAfterMovability.Health
+            | _ -> stateAfterMovability.Health, [], []
         | EffectCallReturned _ ->
             match effectCallFailure with
             | Some (w, TargetHung) -> Health.applyEvidence now w (FromEffectFailure TargetHung) stateAfterMovability.Health
-            | _ -> stateAfterMovability.Health, []
-        | _ -> stateAfterMovability.Health, []
+            | _ -> stateAfterMovability.Health, [], []
+        | _ -> stateAfterMovability.Health, [], []
 
     // Focus：SwitchSettleタイマーの発火（R4-5、v2.40で再要求を配線。以前は採番元が無いとして捨てていたが、
     // 他のUserCommand同様`stateAfterMovability.Placement`から採番できる）。期限到達時点でまだ`focused`が
@@ -868,7 +880,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             |> Seq.map fst
             |> Set.ofSeq }
 
-    let gated, rejected = GatedEffect.gate gateInput (reuseForgetEffects @ topologyResponse.Actions @ placementEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects @ switchForegroundEffects @ focusRotateEffects @ closeFocusedEffects @ focusMostRecentEffects @ switchSettleReRequestEffects)
+    let gated, rejected = GatedEffect.gate gateInput (reuseForgetEffects @ topologyResponse.Actions @ placementEffects @ healthEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects @ switchForegroundEffects @ focusRotateEffects @ closeFocusedEffects @ focusMostRecentEffects @ switchSettleReRequestEffects)
 
     // §7.2「GateRejected → Cancelled（Deadlineまで待たず同じstep内で即時に遷移する）」。
     let rejectedRequestIds = rejected |> List.choose fst

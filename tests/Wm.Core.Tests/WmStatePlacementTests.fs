@@ -77,6 +77,13 @@ let private visibleWindowObservedMaximized (w: WindowId) : InputEvent =
     | WindowObserved s -> WindowObserved { s with IsMaximized = Some { Value = Ok true; SampleSequence = 1L; MonotonicTime = 1L; Source = "test" } }
     | other -> other
 
+/// `visibleWindowObserved`に、`Responsiveness`の観測(`PumpResponded`/`PumpTimedOut`等)を付け加えたもの。
+/// Health.applyEvidenceへの中継(v2.84)をstep経由で検証するのに使う。
+let private visibleWindowObservedWithResponsiveness (w: WindowId) (sample: ResponsivenessSample) (sequence: int64) : InputEvent =
+    match visibleWindowObserved w with
+    | WindowObserved s -> WindowObserved { s with Responsiveness = Some { Value = Ok sample; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" } }
+    | other -> other
+
 [<Fact>]
 let ``新規窓のWindowObservedは、同じstepでWindows.RecordsがAliveになるので、PlacementのReprobeがゲートを通過する`` () =
     let state = initial RuntimePolicy.defaults
@@ -169,6 +176,38 @@ let ``EffectCallReturnedのTargetHungは同じstepでHealth.Responsivenessも修
     | Some { Value = Hung; Confidence = Confirmed } -> ()
     | other -> Assert.True(false, sprintf "unexpected: %A" other)
     Assert.Empty(afterHung.Next.Placement.Pending)
+
+/// v2.84：`WindowObserved`の`Responsiveness`観測が`Health.applyEvidence`へ中継され、`Hung`から
+/// `Responding`へ回復できることを`step`越しに確認する。それまで`WindowObserved`からHealthへの経路が
+/// 一度も無かったため、`TargetHung`で`Hung`になった窓は原理的に二度と`Responding`へ戻れなかった
+/// （Health.fsの型直前のコメント参照）。
+[<Fact>]
+let ``TargetHungでHungになった窓は、WindowObservedのPumpRespondedでRespondingへ回復する(v2.84)`` () =
+    let topology, _ = MonitorLifecycle.reconcile (Wm.Core.Topology.initial Map.empty) [ mkMonitor 0 ]
+    let seeded = { initial RuntimePolicy.defaults with Topology = topology }
+    let w = WindowId 1L
+    let afterObserved = step RuntimePolicy.defaults seeded (mkEnvelope 1L (visibleWindowObserved w))
+    let rid =
+        afterObserved.Next.Placement.Pending
+        |> Map.toSeq
+        |> Seq.filter (fun (_, (pr: PendingRequest)) -> pr.Window = w)
+        |> Seq.map fst
+        |> Seq.head
+    let hungError: NativeCallRecord = { Api = "SendMessageTimeout"; Space = Win32LastError; Code = 1460; ElapsedUs = 0L }
+    let afterHung = step RuntimePolicy.defaults afterObserved.Next (mkEnvelope 2L (EffectCallReturned (rid, Error hungError, None)))
+    match Map.tryFind w afterHung.Next.Health.Responsiveness with
+    | Some { Value = Hung } -> ()
+    | other -> Assert.True(false, sprintf "precondition failed, unexpected: %A" other)
+    // Reprobe(w, KResponsiveness)が実際にゲートを通過して発行されている(ReprobeはRBelievedHungでも
+    // 適用されないEffect種別、GatedEffect.fsの表参照)。
+    let reprobeEffects = afterHung.Effects |> List.map GatedEffect.effect |> List.filter (function Reprobe (ww, KResponsiveness) -> ww = w | _ -> false)
+    Assert.NotEmpty(reprobeEffects)
+
+    let afterRecovered = step RuntimePolicy.defaults afterHung.Next (mkEnvelope 3L (visibleWindowObservedWithResponsiveness w PumpResponded 10L))
+    match Map.tryFind w afterRecovered.Next.Health.Responsiveness with
+    | Some { Value = Responding; Confidence = Confirmed } -> ()
+    | other -> Assert.True(false, sprintf "unexpected after recovery: %A" other)
+    Assert.False(Map.containsKey w afterRecovered.Next.Health.Reprobes)
 
 [<Fact>]
 let ``EffectCallReturnedのDenied OtherDenialは、同じstepでMovability修正・Unplacedへの降格・Workspaceからの除去までつながる`` () =

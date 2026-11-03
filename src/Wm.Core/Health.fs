@@ -6,6 +6,7 @@ open Wm.Contracts.ErrorTypes
 open Wm.Contracts.Observation
 open Wm.Contracts.Beliefs
 open Wm.Contracts.Timers
+open Wm.Contracts.CoreCommand
 
 /// Responsivenessの信念を修正する証拠（§4.5）。通常の観測（Reprobe/事前確認の結果）と、
 /// Effect呼出が`TargetHung`に分類された場合の両方から来る。
@@ -73,15 +74,20 @@ let initial: HealthState = { Responsiveness = Map.empty; Reprobes = Map.empty }
 
 /// 1件の証拠を適用する。新たにHungになったら再probeを開始し、HungからRespondingへ回復したら
 /// 再probeを打ち切る（CancelTimer + Reprobesから除去）。それ以外は信念だけを更新する。
+/// **v2.84で`Effect list`を追加**：Hungになった直後に`Reprobe (w, KResponsiveness)`を発行する
+/// （本文「`Reprobe`（7.1）で`SendMessageTimeout(WM_NULL)`の再確認を要求する」）。それまで0%実装
+/// だった既知のギャップ（型とタイマーのスケジューリングはあったが、実際にOSへ再確認を要求する
+/// Effectを一度も発行していなかった）——`Placement.onIntegrityReprobeTimerFired`の`Reprobe (w,
+/// KTargetIntegrity)`と同じ形。
 let applyEvidence
     (now: int64)
     (window: WindowId)
     (evidence: ResponsivenessEvidence)
     (state: HealthState)
-    : HealthState * TimerCommand<TimerId> list =
+    : HealthState * Effect list * TimerCommand<TimerId> list =
     let before = Map.tryFind window state.Responsiveness
     match reviseResponsiveness now before evidence with
-    | None -> state, [] // 決定的な証拠が無く、既存の信念も無い:Mapに何も書かない（5-5）
+    | None -> state, [], [] // 決定的な証拠が無く、既存の信念も無い:Mapに何も書かない（5-5）
     | Some revised ->
         let responsiveness' = Map.add window revised state.Responsiveness
         let prevValue = before |> Option.map (fun b -> b.Value)
@@ -94,27 +100,31 @@ let applyEvidence
                 { state with
                     Responsiveness = responsiveness'
                     Reprobes = Map.add window (retry', deadline) state.Reprobes },
+                [ Reprobe (window, KResponsiveness) ],
                 cmds
             | None ->
                 // AttemptCount=0から始めるため理論上到達しないが、全域関数として定義する（§7.1「例外を制御フローに使わない」）。
-                { state with Responsiveness = responsiveness' }, []
+                { state with Responsiveness = responsiveness' }, [], []
         elif recoveredFromHung then
             { state with
                 Responsiveness = responsiveness'
                 Reprobes = Map.remove window state.Reprobes },
+            [],
             [ CancelTimer (TimerId.Health (ResponsivenessReprobe window)) ]
         else
-            { state with Responsiveness = responsiveness' }, []
+            { state with Responsiveness = responsiveness' }, [], []
 
 /// ResponsivenessReprobeタイマーの発火を処理する。Topology.updateと同じくawaitDeadlineで古い発火を無視する。
-let onReprobeTimerFired (now: int64) (window: WindowId) (state: HealthState) : HealthState * TimerCommand<TimerId> list =
+/// **v2.84で`Effect list`を追加**：`applyEvidence`と同じ理由で、バックオフの各再試行ごとに
+/// `Reprobe (w, KResponsiveness)`を発行する。
+let onReprobeTimerFired (now: int64) (window: WindowId) (state: HealthState) : HealthState * Effect list * TimerCommand<TimerId> list =
     match Map.tryFind window state.Responsiveness with
     | Some b when b.Value = Hung ->
         match Map.tryFind window state.Reprobes with
         | Some (retry, deadline) when awaitDeadline (Some deadline) now ->
             match scheduleReprobe now window (Some retry) with
             | Some (retry', deadline', cmds) ->
-                { state with Reprobes = Map.add window (retry', deadline') state.Reprobes }, cmds
-            | None -> { state with Reprobes = Map.remove window state.Reprobes }, [] // 上限到達、打ち切り
-        | _ -> state, [] // 古い発火、またはもう追跡していない
-    | _ -> state, [] // 既にHungではない（回復済み）。無害
+                { state with Reprobes = Map.add window (retry', deadline') state.Reprobes }, [ Reprobe (window, KResponsiveness) ], cmds
+            | None -> { state with Reprobes = Map.remove window state.Reprobes }, [], [] // 上限到達、打ち切り
+        | _ -> state, [], [] // 古い発火、またはもう追跡していない
+    | _ -> state, [], [] // 既にHungではない（回復済み）。無害
