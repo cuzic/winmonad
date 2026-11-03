@@ -570,10 +570,51 @@ let private inputEventOfJson (node: JsonNode) : InputEvent =
         MembershipHintsLoaded hints
     | other -> failwithf "Replay: unrecognized InputEvent tag '%s' — このJournalはより新しいスキーマで書かれている" other
 
+/// v2.81で`InputPayload`以外の往復対応を追加した：`JournalKind`の11種は全てPhase A範囲内として
+/// 型に存在する（`ReplIntervention`等Phase C/D向けは最初から型自体に無い、ファイル冒頭コメント参照）
+/// にもかかわらず、`Payload`の実際の符号化・復号化は`InputPayload`だけしか実装されておらず、他の
+/// 8ケースは書込み時に構造を持たない文字列へ落ち（`sprintf "%A"`）、読込み時には`failwithf`で
+/// 必ず例外になっていた——`Wm.Runtime.Reducer`がまだ`InputReceived`以外のKindを一度も書いていない
+/// ため実害が無いまま残っていたが、型・タグ（`kindTag`/`kindOfTag`）は既に11種全てに対応していたのに
+/// Payload側だけが取りこぼされているという非対称だった。既存の`unitResultToJson`/`unitResultOfJson`
+/// （`EffectCallReturned`InputEvent自身の符号化が既に使っている部品）を再利用できる6ケース
+/// （`EffectCallReturnedPayload`/`InternalFaultPayload`/`JournalDegradedPayload`/
+/// `JournalRecoveredPayload`/`SafetyRecoveryActionPayload`/`PendingOutcomePayload`）をこのラウンドで
+/// 実装した。`EffectDispatchPayload`/`EffectBatchReturnedPayload`は`Effect`自体のJSON符号化が
+/// どこにも存在しないため（`EffectBatchReturned`の生産元`ApplyBatch`自体がVirtualWorld側でも
+/// 未実装、既知のギャップ）、依然このラウンドの対象外とし、書込み時のフォールバック表示
+/// （`sprintf "%A"`）・読込み時の`failwithf`のまま残す。
 let private payloadToJson (payload: JournalPayload) : JsonNode =
     match payload with
     | InputPayload input -> inputEventToJson input
-    | other -> JsonValue.Create(sprintf "%A" other) :> JsonNode
+    | EffectCallReturnedPayload (RequestId rid, result) ->
+        let o = JsonObject()
+        o.["requestId"] <- JsonValue.Create(rid)
+        o.["result"] <- unitResultToJson result
+        o :> JsonNode
+    | InternalFaultPayload componentName ->
+        let o = JsonObject()
+        o.["componentName"] <- JsonValue.Create(componentName)
+        o :> JsonNode
+    | JournalDegradedPayload since ->
+        let o = JsonObject()
+        o.["since"] <- JsonValue.Create(since)
+        o :> JsonNode
+    | JournalRecoveredPayload (gapStart, gapEnd) ->
+        let o = JsonObject()
+        o.["gapStart"] <- JsonValue.Create(gapStart)
+        o.["gapEnd"] <- JsonValue.Create(gapEnd)
+        o :> JsonNode
+    | SafetyRecoveryActionPayload description ->
+        let o = JsonObject()
+        o.["description"] <- JsonValue.Create(description)
+        o :> JsonNode
+    | PendingOutcomePayload (RequestId rid, satisfied) ->
+        let o = JsonObject()
+        o.["requestId"] <- JsonValue.Create(rid)
+        o.["satisfied"] <- JsonValue.Create(satisfied)
+        o :> JsonNode
+    | other -> JsonValue.Create(sprintf "%A" other) :> JsonNode // EffectDispatchPayload/EffectBatchReturnedPayload：Effect自体の符号化が無いため依然未対応
 
 let private kindTag (kind: JournalKind) : string =
     match kind with
@@ -623,8 +664,30 @@ let private entryOfJson (node: JsonNode) : JournalEntry =
     let kind = kindOfTag (node.["kind"].GetValue<string>())
     let payload =
         match kind with
-        | InputReceived -> InputPayload (inputEventOfJson node.["payload"])
-        | _ -> failwithf "Replay: このビルドはJournalKind '%A' のPayload復元に未対応" kind
+        | InputReceived
+        | ObservationReceived ->
+            // `ObservationReceived`専用のPayloadケースは無い（`WindowObserved`等は元から`InputEvent`の
+            // 1ケースなので、`InputPayload`をそのまま再利用する——Kindタグだけが「これは観測だった」
+            // という分類を運ぶ）。
+            InputPayload (inputEventOfJson node.["payload"])
+        | EffectCallReturnedKind ->
+            EffectCallReturnedPayload (
+                RequestId (node.["payload"].["requestId"].GetValue<int64>()),
+                unitResultOfJson node.["payload"].["result"]
+            )
+        | InternalFaultKind -> InternalFaultPayload (stringOfJsonAllowNull node.["payload"].["componentName"])
+        | JournalDegradedKind -> JournalDegradedPayload (node.["payload"].["since"].GetValue<int64>())
+        | JournalRecoveredKind ->
+            JournalRecoveredPayload (node.["payload"].["gapStart"].GetValue<int64>(), node.["payload"].["gapEnd"].GetValue<int64>())
+        | SafetyRecoveryAction -> SafetyRecoveryActionPayload (stringOfJsonAllowNull node.["payload"].["description"])
+        | PendingSatisfied
+        | PendingTimedOut ->
+            PendingOutcomePayload (
+                RequestId (node.["payload"].["requestId"].GetValue<int64>()),
+                node.["payload"].["satisfied"].GetValue<bool>()
+            )
+        | EffectDispatchStarted
+        | EffectBatchReturnedKind -> failwithf "Replay: このビルドはJournalKind '%A' のPayload復元に未対応" kind
     { SchemaVersion = node.["schemaVersion"].GetValue<int>()
       SessionId = node.["sessionId"].GetValue<string>()
       Sequence = node.["sequence"].GetValue<int64>()

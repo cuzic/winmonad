@@ -215,3 +215,54 @@ let ``MoveSizeEndedは任意のrect/monitor観測(Ok/Error含む)でも往復し
     =
     let entry = mkEntry (InputPayload (MoveSizeEnded (WindowId (int64 (abs w)), rectObs, monitorObs)))
     roundTrip entry = entry
+
+/// v2.81：`JournalPayload`の`InputPayload`以外の往復対応を追加した——型・`kindTag`/`kindOfTag`は
+/// 11種全てに対応していたが、`Payload`自体の符号化・復号化は`InputPayload`しか実装されておらず、
+/// 残りは書込み時に構造を持たない文字列へ落ち読込み時に必ず例外になっていた（`JournalWriter.fs`の
+/// `payloadToJson`型直前のコメント参照）。`EffectDispatchPayload`/`EffectBatchReturnedPayload`は
+/// `Effect`自体の符号化が無いため依然対象外のまま。
+let private mkEntryWithKind (kind: JournalKind) (payload: JournalPayload) : JournalEntry =
+    { mkEntry payload with Kind = kind }
+
+[<Property>]
+let ``EffectCallReturnedPayloadは往復しても一致する(Ok/Error全て)(v2.81)`` (rid: int) (result: Result<unit, NativeCallRecord>) =
+    let entry = mkEntryWithKind EffectCallReturnedKind (EffectCallReturnedPayload (RequestId (int64 (abs rid)), result))
+    roundTrip entry = entry
+
+[<Property>]
+let ``InternalFaultPayloadは往復しても一致する(v2.81)`` (componentName: NonNull<string>) =
+    let (NonNull name) = componentName
+    let entry = mkEntryWithKind InternalFaultKind (InternalFaultPayload name)
+    roundTrip entry = entry
+
+[<Property>]
+let ``JournalDegradedPayloadは往復しても一致する(v2.81)`` (since: int64) =
+    let entry = mkEntryWithKind JournalDegradedKind (JournalDegradedPayload since)
+    roundTrip entry = entry
+
+[<Property>]
+let ``JournalRecoveredPayloadは往復しても一致する(v2.81)`` (gapStart: int64) (gapEnd: int64) =
+    let entry = mkEntryWithKind JournalRecoveredKind (JournalRecoveredPayload (gapStart, gapEnd))
+    roundTrip entry = entry
+
+[<Property>]
+let ``SafetyRecoveryActionPayloadは往復しても一致する(v2.81)`` (description: NonNull<string>) =
+    let (NonNull desc) = description
+    let entry = mkEntryWithKind SafetyRecoveryAction (SafetyRecoveryActionPayload desc)
+    roundTrip entry = entry
+
+[<Property>]
+let ``PendingOutcomePayloadは往復しても一致する(PendingSatisfied/PendingTimedOutの両方のKind)(v2.81)`` (rid: int) (satisfied: bool) =
+    let payload = PendingOutcomePayload (RequestId (int64 (abs rid)), satisfied)
+    [ PendingSatisfied; PendingTimedOut ]
+    |> List.forall (fun kind ->
+        let entry = mkEntryWithKind kind payload
+        roundTrip entry = entry)
+
+/// `ObservationReceived`は専用のPayloadケースを持たず、既存の`InputPayload`を再利用する
+/// （`WindowObserved`等は元から`InputEvent`なので、Kindタグだけが「これは観測だった」という
+/// 分類を運ぶ）。
+[<Property>]
+let ``ObservationReceivedはInputPayloadを再利用して往復しても一致する(v2.81)`` (w: int) (obs: Observation<bool>) =
+    let entry = mkEntryWithKind ObservationReceived (InputPayload (MinimizedStateChanged (WindowId (int64 (abs w)), obs)))
+    roundTrip entry = entry
