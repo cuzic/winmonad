@@ -191,6 +191,14 @@ let applyEffect
                             Scheduled = { FireAtMs = now + delayMs; Window = w; Rect = selfRect } :: world.Scheduled }
                     dispatchedSeq <- Some dispatchSeq
                     Ok ()
+                | DisappearOnMove ->
+                    // §12.1「DisappearOnMove」。`SetRect`の呼出自体は成功するが（OS受理）、ウィンドウは
+                    // その要求に応えず即座に消滅する——観測としては`WindowObserved`ではなく
+                    // `WindowRemoved`が1件届く。`DispatchSeq`を進める必要はない（この窓は以後
+                    // 観測を生まない）。
+                    dispatchedWorld <- { world with Windows = Map.remove w world.Windows }
+                    dispatchedEvents <- [ WindowRemoved w ]
+                    Ok ()
             match executeEffectProtocol probe dispatch w with
             | Ok () -> dispatchedWorld, dispatchedEvents, [ rid, Ok (), dispatchedSeq ]
             | Error record -> world, [], [ rid, Error record, None ]

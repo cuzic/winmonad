@@ -10,6 +10,7 @@
     <Compile Include="VirtualWorldScenarioTests.fs" />
     <Compile Include="DelayedWindowScenario.fs" />
     <Compile Include="SelfRepositionScenario.fs" />
+    <Compile Include="DisappearOnMoveScenario.fs" />
   </ItemGroup>
 
   <ItemGroup>

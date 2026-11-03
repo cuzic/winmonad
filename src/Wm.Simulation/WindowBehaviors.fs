@@ -29,9 +29,17 @@
 /// 本来想定しているシナリオそのものを疑似OSで再現する——`SetRect`の呼出自体は即座に成功するが
 /// （`DelayedByMs`と同じ`Scheduled`機構を使う）、観測として届くのは要求された矩形ではなく
 /// 挙動に固定された`selfRect`（`DelayedByMs`は要求どおりの矩形を遅らせて返すだけなのに対し、
-/// こちらは要求を無視して別の矩形を返す点が異なる）。`IgnoreMove`/`DisappearOnMove`/`Compose`は依然
-/// 対象外（1ラウンドで実装するには判断点が多すぎる——特に`Compose`は複数挙動の確率的な組合せ規則が
-/// 要る）。
+/// こちらは要求を無視して別の矩形を返す点が異なる）。
+/// ~~`DisappearOnMove`は対象外~~：**v2.63で実装**。`Placement.onWindowVanished`は`Pending`/
+/// `PendingDeadline`タイマー等の後始末（Opusレビュー4-3、v2.16で一度は取りこぼしが実際に見つかった
+/// 項目）を既に実装しているが、「`SetRect`を発行してPendingが生きている最中に、その応答として窓が
+/// 本当に消滅する」という競合——`WindowRemoved`が疑似OS側の`Effect`応答として実際に生まれる経路——は
+/// これまで一度も再現されていなかった（既存のテストは`WindowRemoved`を外部から直接`reducer.Submit`
+/// するだけで、SetRectの結果として届くケースは無かった）。`SetRect`の呼出自体は成功するが
+/// （OS受理）、ウィンドウはその要求に応えず即座に消滅する（閉じる・クラッシュする）——観測としては
+/// `WindowObserved`ではなく`WindowRemoved`が1件届く。`IgnoreMove`/`Compose`は依然対象外
+/// （`IgnoreMove`は`DelayedByMs`の退化形（無限に遅い観測＝Timeout一本道）で新しい検証価値が薄く、
+/// `Compose`は複数挙動の確率的な組合せ規則が要るため1ラウンドでは判断点が多すぎる）。
 module Wm.Simulation.WindowBehaviors
 
 open Wm.Contracts.Identifiers
@@ -51,3 +59,7 @@ type WindowBehavior =
     /// `VirtualWorld.Scheduled`機構を使うが、積む矩形が要求された`rect`ではなく`selfRect`になる点が
     /// 唯一の違い）。
     | SelfRepositionAfterMs of delayMs: int64 * selfRect: PixelRect
+    /// §12.1「`DisappearOnMove`」。`SetRect`の呼出自体は成功するが、ウィンドウはその要求に応えず
+    /// 即座に消滅する（閉じる・クラッシュする）。観測としては`WindowObserved`ではなく`WindowRemoved`
+    /// が1件届く。
+    | DisappearOnMove
