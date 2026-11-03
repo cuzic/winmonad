@@ -18,6 +18,8 @@ open Wm.Core.Placement
 open Wm.Core.DecisionTrace
 open Wm.Core.WmState
 open Wm.Layouts.LayoutRegistry
+open Wm.Policy.PolicyTypes
+open Wm.Policy.MonitorSelector
 
 let private mkEnvelope (sequence: int64) (input: InputEvent) : EventEnvelope<InputEvent> =
     { Sequence = sequence; MonotonicTime = sequence; Source = "test"; SessionId = "test-session"; Input = input }
@@ -95,6 +97,34 @@ let ``最大化状態で発見された窓のReconcileは、RestoreBeforeMoveが
         Assert.Equal(w, rw)
         Assert.Equal(w, sw)
     | other -> Assert.True(false, sprintf "expected [RestoreBeforeMove; SetRect] for the maximized window (gate must not reject), got %A" other)
+
+// ===== §5.2「設定上のモニター割当」(PolicyIR.WorkspaceAssignments、R3-1、v2.80) =====
+
+[<Fact>]
+let ``initialはPolicyのWorkspaceAssignmentsをTopologyへ写し、新しいモニターの出現時に効く(v2.80)`` () =
+    // 既知のギャップ修正：initialがruntimePolicy引数を受け取っているにもかかわらず、長らく
+    // Topology.initial Map.emptyを決め打ちしており、Policyで設定したWorkspace→モニター割当が
+    // 新しいモニターの出現時に一度も効かなかった。
+    let assignedWorkspace = WorkspaceId 7
+    let assignedPolicy: PolicyIR = { PolicyIR.defaults with WorkspaceAssignments = [ (assignedWorkspace, PrimaryMonitor) ] }
+    let assignedRuntimePolicy: RuntimePolicy = { RuntimePolicy.defaults with Policy = assignedPolicy }
+    let state0 = initial assignedRuntimePolicy
+    let settleMs = TopologyConfig.defaults.SettleMs
+    let afterMonitor = step assignedRuntimePolicy state0 (mkEnvelope 1L (MonitorTopologyObserved [ mkMonitor 0 ]))
+    let afterSettle = step assignedRuntimePolicy afterMonitor.Next (mkEnvelope (1L + settleMs) (TimerElapsed (TimerId.Topology ScreenSettle)))
+    match displays afterSettle.Next.Topology with
+    | Displays (current, _) -> Assert.Equal(assignedWorkspace, current.Workspace) // 割当が無ければws0(最小未使用)になるはず
+    | NoMonitors -> Assert.True(false, "expected a monitor to be connected")
+
+[<Fact>]
+let ``WorkspaceAssignmentsが空(既定)なら、initialの挙動はv2.80以前と変わらない(回帰確認)`` () =
+    let state0 = initial RuntimePolicy.defaults
+    let settleMs = TopologyConfig.defaults.SettleMs
+    let afterMonitor = step RuntimePolicy.defaults state0 (mkEnvelope 1L (MonitorTopologyObserved [ mkMonitor 0 ]))
+    let afterSettle = step RuntimePolicy.defaults afterMonitor.Next (mkEnvelope (1L + settleMs) (TimerElapsed (TimerId.Topology ScreenSettle)))
+    match displays afterSettle.Next.Topology with
+    | Displays (current, _) -> Assert.Equal(WorkspaceId 0, current.Workspace) // 割当が無いので最小未使用のws0
+    | NoMonitors -> Assert.True(false, "expected a monitor to be connected")
 
 [<Fact>]
 let ``MinimizedStateChangedはstep経由でPlacement.Geometry.IsMinimizedへ届く`` () =

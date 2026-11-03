@@ -68,8 +68,16 @@ type WmState =
       Windows: WindowRegistry
       Placement: PlacementState }
 
+/// `runtimePolicy.Policy.WorkspaceAssignments`（§5.2「設定上のモニター割当」、R3-1）を初期状態の
+/// `Topology.Assignments`へ写す（v2.80、既知のギャップ修正：`initial`が`runtimePolicy`引数を
+/// 受け取っているにもかかわらず、長らく`Map.empty`を決め打ちしており、Policyで設定した割当が
+/// 新しいモニターの出現時に一度も効かなかった——`MonitorLifecycle.reconcile`の`byAssignment`
+/// フォールバック、`Topology.fs`型直前のコメント参照）。同じ`WorkspaceId`が複数回現れる場合は
+/// `Map.ofList`の「後が勝つ」規則に委ねる——`PolicyAnalyzer.checkDuplicateWorkspaceAssignments`
+/// （同ラウンドで追加）がこの状況自体を`Error`として検出するので、ここでは暗黙の規則をこれ以上
+/// 明文化しない。Policy再適用（`PolicyActivated`）時の再読込は依然未配線のまま（21章の未決事項）。
 let initial (runtimePolicy: RuntimePolicy) : WmState =
-    { Topology = Topology.initial Map.empty
+    { Topology = Topology.initial (runtimePolicy.Policy.WorkspaceAssignments |> Map.ofList)
       Workspaces = WorkspaceSet.empty
       Health = Health.initial
       Focus = Focus.initial

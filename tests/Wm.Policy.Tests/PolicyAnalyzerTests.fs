@@ -6,6 +6,7 @@ open Wm.Contracts.Identifiers
 open Wm.Contracts.SharedVocabulary
 open Wm.Policy.PolicyTypes
 open Wm.Policy.PolicyAnalyzer
+open Wm.Policy.MonitorSelector
 open Wm.Policy.Tests.TestHelpers
 
 let private registeredManifest: RegistryManifest =
@@ -83,3 +84,29 @@ let ``全違反を1度に蓄積する(fail-fastしない)`` () =
     Assert.Contains(DuplicateWindowRuleId (PolicyRuleId "dup"), errors)
     Assert.Contains(UnregisteredLayout (LayoutId "nope", 1, None), errors)
     Assert.Contains(InvalidMasterRatio (2.0m, None), errors)
+
+// ===== WorkspaceAssignmentsの重複検査(§5.5表3行目、v2.80、R3-1) =====
+
+[<Fact>]
+let ``WorkspaceAssignmentsに同じWorkspaceIdが2回以上現れるとDuplicateWorkspaceAssignmentになる`` () =
+    let policy =
+        { basePolicy with
+            WorkspaceAssignments = [ (WorkspaceId 1, PrimaryMonitor); (WorkspaceId 1, MonitorKey "DELL1234") ] }
+    Assert.Contains(DuplicateWorkspaceAssignment (WorkspaceId 1), (analyze registeredManifest policy).Errors)
+
+[<Fact>]
+let ``異なるWorkspaceIdへの割当はクリーン`` () =
+    let policy =
+        { basePolicy with
+            WorkspaceAssignments = [ (WorkspaceId 1, PrimaryMonitor); (WorkspaceId 2, MonitorKey "DELL1234") ] }
+    Assert.True(isClean (analyze registeredManifest policy))
+
+[<Fact>]
+let ``WorkspaceAssignmentsの重複は他の違反と同時に蓄積される(fail-fastしない)`` () =
+    let policy =
+        { basePolicy with
+            WindowRules = [ windowRule "dup" 10 AnyWindow Tiled; windowRule "dup" 20 AnyWindow Excluded ]
+            WorkspaceAssignments = [ (WorkspaceId 3, PrimaryMonitor); (WorkspaceId 3, PrimaryMonitor) ] }
+    let errors = (analyze registeredManifest policy).Errors
+    Assert.Contains(DuplicateWindowRuleId (PolicyRuleId "dup"), errors)
+    Assert.Contains(DuplicateWorkspaceAssignment (WorkspaceId 3), errors)
