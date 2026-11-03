@@ -7,19 +7,21 @@
 /// ようになった（これまでは`MonitorLifecycle.reconcile`、つまりモニター接続・切断だけが発行元だった）。
 /// `WmState.step`はv2.31でこれらのうち`WorkspaceShown`/`WorkspaceHidden`の消費（Placement側の
 /// `HiddenByWm`/`Shown None`反映）を始めており、`CurrentChanged`の消費（フォーカスを渡す窓への
-/// `RequestForeground`）はこのラウンドで追加する（WmState.fsのコメント参照）。`SwitchSettle`
-/// （切替直後の揺れの吸収、§4.4「Workspace切替は「待ち」を伴う」）はこのラウンドの対象外のまま——
-/// `Focus.startSwitchSettle`/`onSwitchSettleTimerFired`は既に実装されているが、実際のOS側の
-/// タイミング挙動（揺れの幅・頻度）の実測がまだ無く、適切なSettleMsや再要求の発火条件を決める
-/// 根拠が無いため、専用のラウンドへ切り出す。
+/// `RequestForeground`）はこのラウンドで追加する（WmState.fsのコメント参照）。~~`SwitchSettle`
+/// （切替直後の揺れの吸収、§4.4「Workspace切替は「待ち」を伴う」）はこのラウンドの対象外のまま~~：
+/// **v2.40で配線済み**（`WmState.step`。CIスパイクS20/S20bで実測した前面切替フックの配送タイミング
+/// を基に暫定`SwitchSettleMs`を採用した。このコメントがv2.32時点のまま長らく更新されていなかった
+/// 誤りを、v2.48のHWND再利用性質テストでWindows.fs/WmState.fsの同種の古いコメントを見つけた流れで
+/// 合わせて訂正した）。
 ///
 /// `FocusMonitor`（v2.36追加）：対象モニターが現在表示中（visible）ならcurrentをそのモニターへ入れ替える
 /// だけで、どのモニターがどのWorkspaceを表示しているかは変えない。`SwitchWorkspace`の「既にvisible」
 /// 分岐と同じ`CurrentChanged`を出すので、`WmState.step`のv2.32のRequestForeground受け口をそのまま
-/// 再利用できる。対象外：「Foregroundの信念が変わったらcurrentが追従する」仕組み（§4.4、R5-1）は
-/// まだ存在しない（`ForegroundChanged`DomainEventは出すが誰も消費していない）。R5-1はこの追従と
-/// `FocusMonitor`の順序（追従が同じstepでFocusMonitorを打ち消さないこと）を定めているが、追従自体が
-/// 無い今は単に無関係——追従を実装する専用のラウンドで一緒に検討する。
+/// 再利用できる。~~対象外：「Foregroundの信念が変わったらcurrentが追従する」仕組み（§4.4、R5-1）は
+/// まだ存在しない（`ForegroundChanged`DomainEventは出すが誰も消費していない）~~：**v2.39で実装済み**
+/// （`WmState.step`が`ForegroundChanged`を消費して`current`を追従させる。このコメントも`SwitchSettle`
+/// の節と同じくv2.36時点のまま更新されていなかった）。R5-1が定める追従と`FocusMonitor`の順序
+/// （追従が同じstepで`FocusMonitor`を打ち消さないこと）は、実装時にこの順序を保つよう配線済み。
 module Wm.Core.Topology
 
 open Wm.Contracts.Identifiers

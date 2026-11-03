@@ -20,6 +20,7 @@
     <Compile Include="WmStateWindowsTests.fs" />
     <Compile Include="WmStatePlacementTests.fs" />
     <Compile Include="CrossDomainInvariantTests.fs" />
+    <Compile Include="HwndReuseInvariantTests.fs" />
     <Compile Include="GatedEffectTests.fs" />
   </ItemGroup>
 

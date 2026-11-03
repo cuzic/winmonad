@@ -260,6 +260,14 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
 
     let placementState', placementEffects, placementTimerCmds, effectCallFailure =
         match envelope.Input with
+        | WindowObserved snapshot when windowsEvents |> List.exists (function WindowVanishedByReuse w -> w = snapshot.Id | _ -> false) ->
+            // HWND再利用の検知時（v2.47/v2.48で発見）：Windowsが同じ観測をこのWindowIdの信念として
+            // 採用しなかった（`onWindowObserved`参照）のに、Placementが同じ`WindowObserved`を素直に
+            // 処理すると`Geometry`等をこの`WindowId`の下で作り直してしまい、`vanishWindow`が消したはずの
+            // 信念が同じstep内で復活する（性質テスト#5で発見した実際のバグ）。Windows→Placementの処理
+            // 順序（§7.1段①）は、Windowsが「この観測は別の実体のものだ」と判断した結果を後段が無視
+            // できることを前提にしているので、ここで素通りさせない。
+            stateAfterWindows.Placement, [], [], None
         | WindowObserved snapshot ->
             // `checkDpiCrossing`（v2.45）：`onWindowObserved`が今回の観測でMonitor信念を上書きする前の
             // 値を覚えておき、上書き後の新しい値と比較して「異なるDPIのモニターへ移った」かを判定する
