@@ -20,9 +20,21 @@
 /// 満たされたのと同じ構図（消費側は既にあるが、証拠を生む側のシミュレーションが無い）。要求幅が
 /// `minWidthPx`未満なら観測される幅を`minWidthPx`へ丸める（Windowsの`WM_GETMINMAXINFO`の
 /// `MinTrackSize`相当、Phase 0スパイクS23で実機確認した「丸め済みの最終幅だけが1回のLOCATIONCHANGEで
-/// 届く」挙動と整合）。`IgnoreMove`/`SelfRepositionAfterMs`/`DisappearOnMove`/`Compose`は依然対象外
-/// （1ラウンドで実装するには判断点が多すぎる——特に`Compose`は複数挙動の確率的な組合せ規則が要る）。
+/// 届く」挙動と整合）。
+/// ~~`SelfRepositionAfterMs`は対象外~~：**v2.62で実装**。`Mismatch → Reevaluate`（v2.42、Opus敵対的
+/// レビューで設計、`PendingRequest.DispatchSeq`/`Baseline`/`PlacementState.InFlightTargets`）は
+/// これまで一度も実際のパイプラインを通して検証されていなかった——既存のテスト
+/// （`PlacementReconcileTests.fs`）は全て手で組み立てた観測を直接`onPendingDeadlineTimerFired`等へ
+/// 渡していた。「要求とは無関係にアプリが自分で選んだ矩形へ動く」という、Mismatch→Reevaluateが
+/// 本来想定しているシナリオそのものを疑似OSで再現する——`SetRect`の呼出自体は即座に成功するが
+/// （`DelayedByMs`と同じ`Scheduled`機構を使う）、観測として届くのは要求された矩形ではなく
+/// 挙動に固定された`selfRect`（`DelayedByMs`は要求どおりの矩形を遅らせて返すだけなのに対し、
+/// こちらは要求を無視して別の矩形を返す点が異なる）。`IgnoreMove`/`DisappearOnMove`/`Compose`は依然
+/// 対象外（1ラウンドで実装するには判断点が多すぎる——特に`Compose`は複数挙動の確率的な組合せ規則が
+/// 要る）。
 module Wm.Simulation.WindowBehaviors
+
+open Wm.Contracts.Identifiers
 
 type WindowBehavior =
     | Immediate
@@ -34,3 +46,8 @@ type WindowBehavior =
     /// §12.1「`MinimumWidth(700)`」。要求された幅が`minWidthPx`未満なら、観測される幅は
     /// `minWidthPx`に丸められる（高さ・X/Yは要求どおり）。物理ピクセル（`SetRect`の矩形と同じ単位）。
     | MinimumWidth of minWidthPx: int
+    /// §12.1「`SelfRepositionAfterMs(ms, rect)`」。`SetRect`の呼出自体は即座に成功するが、`delayMs`後に
+    /// 要求とは無関係な`selfRect`へ自己移動したという観測だけが届く（`DelayedByMs`と同じ
+    /// `VirtualWorld.Scheduled`機構を使うが、積む矩形が要求された`rect`ではなく`selfRect`になる点が
+    /// 唯一の違い）。
+    | SelfRepositionAfterMs of delayMs: int64 * selfRect: PixelRect

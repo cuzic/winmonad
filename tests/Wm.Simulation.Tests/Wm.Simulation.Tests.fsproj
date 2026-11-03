@@ -9,6 +9,7 @@
     <Compile Include="ConstrainedWindowScenario.fs" />
     <Compile Include="VirtualWorldScenarioTests.fs" />
     <Compile Include="DelayedWindowScenario.fs" />
+    <Compile Include="SelfRepositionScenario.fs" />
   </ItemGroup>
 
   <ItemGroup>

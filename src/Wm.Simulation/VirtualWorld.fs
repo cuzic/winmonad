@@ -178,6 +178,19 @@ let applyEffect
                                 VisibleFrameRect = Some { Value = Ok enforcedRect; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" } } ]
                     dispatchedSeq <- Some dispatchSeq
                     Ok ()
+                | SelfRepositionAfterMs (delayMs, selfRect) ->
+                    // 呼び出し自体は即座に成功するが、要求された`rect`は無視し、`delayMs`後に
+                    // アプリが自分で選んだ`selfRect`へ動いたという観測だけが届く（§12.1
+                    // 「SelfRepositionAfterMs(ms, rect)」。`Mismatch → Reevaluate`、v2.42の
+                    // DispatchSeq/Baselineが実際に正しく働くかを確かめる現実のシナリオ）。
+                    let dispatchSeq = world.NextSampleSequence
+                    dispatchedWorld <-
+                        { world with
+                            Windows = Map.add w { vw with Rect = selfRect } world.Windows
+                            NextSampleSequence = dispatchSeq + 1L
+                            Scheduled = { FireAtMs = now + delayMs; Window = w; Rect = selfRect } :: world.Scheduled }
+                    dispatchedSeq <- Some dispatchSeq
+                    Ok ()
             match executeEffectProtocol probe dispatch w with
             | Ok () -> dispatchedWorld, dispatchedEvents, [ rid, Ok (), dispatchedSeq ]
             | Error record -> world, [], [ rid, Error record, None ]
