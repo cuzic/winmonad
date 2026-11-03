@@ -134,6 +134,12 @@ let private observedSnapshotWithMonitor (w: WindowId) (rect: PixelRect) (monitor
     { observedSnapshot w rect sequence with
         Monitor = Some { Value = Ok monitor; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" } }
 
+/// `observedSnapshotWithMonitor`に、`IsMinimized = true`の観測も付け加えたもの。「最小化中」の除外
+/// （v2.73、Opusレビューの条件5）をテストするのに使う。
+let private observedSnapshotMinimized (w: WindowId) (rect: PixelRect) (monitor: MonitorId) (sequence: int64) : WindowSnapshot =
+    { observedSnapshotWithMonitor w rect monitor sequence with
+        IsMinimized = Some { Value = Ok true; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" } }
+
 [<Fact>]
 let ``観測された矩形がPendingのTargetRectと一致すればSatisfiedになりPendingが消える`` () =
     let w = WindowId 1L
@@ -855,6 +861,43 @@ let ``ドラッグ終了後は通常どおりMismatch判定に戻る(回帰確�
     let afterDragEnded = onMoveSizeEnded w afterDispatched // Draggingに入っていなくても安全にno-op
     let widerRect = { workArea with Width = 2000 }
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w widerRect m 10L) afterDragEnded
+    let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
+    let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    match Map.tryFind w afterDeadline.MinWidth with
+    | Some { Confidence = Inferred _ } -> ()
+    | other -> Assert.True(false, sprintf "expected an Inferred MinWidth belief (normal Mismatch evidence capture), got %A" other)
+
+// ===== 「最小化・非表示中」の除外（§7.2、Opusレビューの条件5、v2.73） =====
+
+[<Fact>]
+let ``最小化中の窓はPendingDeadline発火時にMismatch判定もRetryもせず、戦わずに終端する(v2.73、Opusレビューの条件5)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    // ユーザーが最小化した直後、`-32000`付近の座標が観測される(CIスパイクS25、幅も要求より広い
+    // ——MinWidthの証拠候補)。
+    let minimizedRect = { X = -32000; Y = -32000; Width = 2000; Height = 2000 }
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotMinimized w minimizedRect m 10L) afterDispatched
+    let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
+    let afterDeadline, effects, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    Assert.Empty(afterDeadline.Pending) // 終端はする(Reevaluateと同じ、戦わない)
+    Assert.Empty(effects) // Retryしない
+    Assert.Equal(None, Map.tryFind w afterDeadline.RetryAttempts)
+    // 最小化中の観測はMinWidthの証拠にもしない(`-32000`付近の座標・幅はアプリの最小幅制約の
+    // 証拠ではない——条件5の除外そのもの)。
+    Assert.Equal(None, Map.tryFind w afterDeadline.MinWidth)
+
+[<Fact>]
+let ``最小化から復元した後は通常どおりMismatch判定に戻る(回帰確認、v2.73)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let widerRect = { workArea with Width = 2000 }
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w widerRect m 10L) afterDispatched
     let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
     let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
     match Map.tryFind w afterDeadline.MinWidth with

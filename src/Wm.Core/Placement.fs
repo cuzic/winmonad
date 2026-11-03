@@ -112,15 +112,17 @@
 ///   S11参照）が無いと、中間状態を偽陽性のMismatchと誤判定する危険が残るため（Opus敵対的レビュー
 ///   `/tmp/.../opus-review-mismatch-reevaluate.md`、段階2の節参照）。「ユーザーのドラッグ」「最小化・
 ///   非表示中の除外」（同レビューの条件5・6）は、下記`MinWidth`の消費実装（v2.43）に合わせて見直す
-///   機会があったが、まだ実装していない——専用のラウンドへ持ち越す。CIスパイクS24/S25
+///   機会があったが、当初は実装していなかった——専用のラウンドへ持ち越した。CIスパイクS24/S25
 ///   （docs/spikes.md）で一次データを得た：条件5（最小化中の除外）は、`EVENT_SYSTEM_MINIMIZESTART`
 ///   より先に（または同時に）最小化後の`-32000`付近の`EVENT_OBJECT_LOCATIONCHANGE`が届く場合がある
-///   ため、「`IsMinimized`信念が先に確定している」ことを前提にできない（デバウンス等の追加対策が
-///   要る可能性）——依然未実装のまま、専用のラウンドへ持ち越す。条件6（ユーザードラッグの除外）は、
-///   S18と同じ安全な投稿メッセージ技法では`EVENT_SYSTEM_MOVESIZESTART`/`MOVESIZEEND`自体が発火しないと
-///   判明し、実デスクトップでの再検証（S11r等と同じ限定）が必要だったが、~~実装自体は依然専用の
-///   ラウンドへ持ち越す~~：**v2.65で実装**（`PlacementState.Dragging`、`onMoveSizeStarted`/
-///   `onMoveSizeEnded`、`onPendingDeadlineTimerFired`の各型直前のコメント参照）。
+///   ため、「`IsMinimized`信念が先に確定している」ことを前提にできない——が、判定を`PendingDeadline`
+///   満了時点（既定2秒後）まで遅らせれば、実機で観測された到着順序の揺れ（S24/S25、ミリ秒未満）より
+///   大幅に長いため実質無害：**v2.73で実装**（`onPendingDeadlineTimerFired`の型直前のコメント参照。
+///   条件6と同じ形の除外で、`Dragging`の代わりに`Geometry.IsMinimized`信念を見る）。条件6
+///   （ユーザードラッグの除外）は、S18と同じ安全な投稿メッセージ技法では`EVENT_SYSTEM_MOVESIZESTART`/
+///   `MOVESIZEEND`自体が発火しないと判明し、実デスクトップでの再検証（S11r等と同じ限定）が必要だったが、
+///   ~~実装自体は依然専用のラウンドへ持ち越す~~：**v2.65で実装**（`PlacementState.Dragging`、
+///   `onMoveSizeStarted`/`onMoveSizeEnded`、`onPendingDeadlineTimerFired`の各型直前のコメント参照）。
 /// - **ユーザー操作による1回だけの試し直し**：ユーザーコマンド経由でPlacementへの新しい入口が要る
 ///   ——専用のラウンドへ切り出す。
 /// - ~~**`MinWidth`（Accumulating規則）**~~：v2.43で実装（`reviseMinWidth`、型直前のコメント参照）。
@@ -754,9 +756,10 @@ let private retryOrGiveUp (now: int64) (rid: RequestId) (pr: PendingRequest) (st
 /// 5. 観測が`InFlightTargets`のどの旧目標とも異なる（旧Epochの遅延適用を新Epochの不一致と取り違えない）
 /// 「ユーザーのドラッグ」の除外（Opusレビューの条件6）はv2.65で実装した——`onPendingDeadlineTimerFired`
 /// 側で、発火時点で`pr.Window`が`state.Dragging`に含まれていればこの関数を呼ばず、Mismatch証拠に
-/// しない（下記`onPendingDeadlineTimerFired`参照）。「最小化・非表示中」の除外（条件5）は、
-/// 判定に使う信号（`IsVisible`/Presence等、ドラッグの`Dragging`集合のように単純な開始/終了の対で
-/// 表せない）が条件6と異なる形を要るため、依然専用のラウンドへ持ち越す。
+/// しない（下記`onPendingDeadlineTimerFired`参照）。「最小化」の除外（条件5）はv2.73で同じ形で
+/// 実装した——発火時点で`pr.Window`の`Geometry.IsMinimized`信念が`true`ならこの関数を呼ばない
+/// （下記`onPendingDeadlineTimerFired`参照）。「非表示中」（`Presence`、WMが隠した以外の経路）は
+/// 判定に使う信号がまだ無く（`ObservedPresence`はWM自身が隠した場合の確認用、R5-2）、依然対象外のまま。
 let private tryMismatchObservation (pr: PendingRequest) (state: PlacementState) : (PixelRect * int64) option =
     match pr.DispatchSeq with
     | None -> None
@@ -817,11 +820,26 @@ let onPendingDeadlineTimerFired
     (dpiOf: MonitorId -> int option)
     (state: PlacementState)
     : PlacementState * Effect list * TimerCommand<TimerId> list =
+    let isMinimized (w: WindowId) : bool =
+        Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.IsMinimized) |> Option.defaultValue false
     match Map.tryFind rid state.Pending with
     | Some pr when awaitDeadline (Some pr.Deadline) now && Set.contains pr.Window state.Dragging ->
         // 「ユーザーのドラッグ」の除外（v2.65、Opusレビューの条件6、ファイル冒頭`tryMismatchObservation`の
         // コメント参照）：ドラッグ中はいかなる観測もユーザー操作そのものの結果でしかないので、
         // Mismatch証拠にもTimeoutのRetry対象にもしない——Reevaluateと同じ「戦わない」終端だけを行う。
+        { state with
+            Pending = Map.remove rid state.Pending
+            RetryAttempts = Map.remove pr.Window state.RetryAttempts },
+        [], []
+    | Some pr when awaitDeadline (Some pr.Deadline) now && isMinimized pr.Window ->
+        // 「最小化」の除外（v2.73、Opusレビューの条件5、ファイル冒頭`tryMismatchObservation`の
+        // コメント参照）：最小化中は観測される矩形が`-32000`付近へ移るだけで、ユーザー操作
+        // （最小化そのもの）の結果でしかないので、条件6（ドラッグ）と同じ理由でMismatch証拠にも
+        // TimeoutのRetry対象にもしない。CIスパイクS24/S25で確認済みの`EVENT_SYSTEM_MINIMIZESTART`と
+        // `-32000`付近の`EVENT_OBJECT_LOCATIONCHANGE`の到着順序の不定（`IsMinimized`信念が先に
+        // 確定しているとは限らない）は、この判定を`PendingDeadline`満了時点（既定2秒後、
+        // `pendingDeadlineMs`）まで遅らせることで実質無害になる——実機で観測された順序の揺れは
+        // この遅延より大幅に短い。
         { state with
             Pending = Map.remove rid state.Pending
             RetryAttempts = Map.remove pr.Window state.RetryAttempts },
