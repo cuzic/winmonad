@@ -21,6 +21,7 @@
     <Compile Include="WmStatePlacementTests.fs" />
     <Compile Include="CrossDomainInvariantTests.fs" />
     <Compile Include="HwndReuseInvariantTests.fs" />
+    <Compile Include="UserOverridePersistenceTests.fs" />
     <Compile Include="GatedEffectTests.fs" />
   </ItemGroup>
 
