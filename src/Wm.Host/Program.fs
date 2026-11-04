@@ -906,7 +906,14 @@ let main _argv =
     printfn "Simulating a main-loop heartbeat gap (not the real thing) for 700ms -- Core is never told to restore anything..."
     Thread.Sleep(700)
     lastHeartbeat2 <- Environment.TickCount64
-    Thread.Sleep(300) // ウォッチドッグの復旧(ShowWindowAsync)が実際に反映されるまでの余裕
+    // メインループが（ハングから）回復したことを表す：`ShowWindowAsync`はキューへ投函するだけなので、
+    // 対象窓のスレッド（＝このメインスレッド）が実際にポンプしないと見た目に反映されない
+    // （`SetWindowPos`のSWP_ASYNCWINDOWPOSと同じ理由）。単に`Thread.Sleep`するだけでは届かない——
+    // 実機で最初に`minimizedAfterRecovery=true`になった実際の原因（ここで発見・修正）。
+    let recoveryPumpDeadline = liveNow () + 300L
+    while liveNow () < recoveryPumpDeadline do
+        Application.DoEvents()
+        Thread.Sleep(1)
 
     let minimizedAfterRecovery = IsIconic(hwnd7)
     let trackedAfterRecovery = lastHiddenHwnds.ContainsKey(hwnd7)
