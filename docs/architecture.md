@@ -20,7 +20,12 @@ Version: 2.100（**ラウンド8の実機ログ調査で発見した実在のバ
 矩形に反映するのはMasterStackのLayout計算自身）ので、Layoutを明示的に切り替えないままでは
 矩形が変わらないのが正しい挙動だった——Coreのバグでもpumpタイマーのバグでもなく、ラウンド7/8の
 テストシナリオ自体がLayoutを選んでいなかった不備。`UserCommand (ChangeLayout masterStackRef)`を
-両窓の観測後に明示的に発行し、実際にmaster-stack分割を検証できるようにした）／
+両窓の観測後に明示的に発行し、実際にmaster-stack分割を検証できるようにした。
+**この修正の後も矩形は変わらなかった**——`addWindow`が最後に追加した窓(B)へzipperのFocusを
+置くため（Before=[A]; Focus=B）、先にFocusNextを押すとFocusがmaster(A)自身へ回ってしまい、
+その後のSwapWithMasterは「masterと（master自身である）focusedの交換」という無意味な操作に
+なっていた——ホットキーの押す順序を入れ替え、まだstack側(B)にFocusが残っている間にSwapWithMaster
+を押すようにした）／
 2.99（**Phase B ラウンド8**：ラウンド7の2枚のテスト窓・隔離Reducerをそのまま使い、
 2本目のホットキー（Ctrl+Shift+K）で`UserCommand SwapWithMaster`を発行した。実装中に発見した
 重要な前提：`SwapWithMaster`（`PromoteToMaster`/`CloseFocused`も同様）は`focused`

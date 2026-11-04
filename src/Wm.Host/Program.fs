@@ -517,9 +517,11 @@ let main _argv =
         keybd_event (key, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
         for m in List.rev modifiers do keybd_event (m, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
 
-    if registeredFocusNext then pressChord [ VK_LCONTROL; VK_LSHIFT ] VK_J
-    pump4 800 // FocusNextのRequestForeground発行・実際のSetForegroundWindow・EVENT_SYSTEM_FOREGROUNDの折返しに余裕を取る
-
+    // 順序が重要：`addWindow`は最後に追加した窓(B)へzipperのFocusを置く（型直前の診断ログの
+    // `Before=[A]; Focus=B`参照）。先にFocusNextを押すとFocusがmaster(A)自身へ回ってしまい、
+    // その後のSwapWithMasterは「masterとfocused(=master自身)の交換」という無意味な操作になる
+    // （実機でこの順序のまま矩形が変化しなかった、最初の実装ミス）。SwapWithMasterは
+    // まだstack側(B)にFocusが残っている今のうちに押す。
     let rectOfForm (form: Form) : RECT =
         let mutable r = RECT()
         GetWindowRect(form.Handle, &r) |> ignore
@@ -532,6 +534,9 @@ let main _argv =
 
     let afterSwapA = rectOfForm testFormA
     let afterSwapB = rectOfForm testFormB
+
+    if registeredFocusNext then pressChord [ VK_LCONTROL; VK_LSHIFT ] VK_J
+    pump4 800 // FocusNextのRequestForeground発行・実際のSetForegroundWindow・EVENT_SYSTEM_FOREGROUNDの折返しに余裕を取る
 
     UnregisterHotKey(hotkeyForm.Handle, hotkeyIdFocusNext) |> ignore
     UnregisterHotKey(hotkeyForm.Handle, hotkeyIdSwapWithMaster) |> ignore
