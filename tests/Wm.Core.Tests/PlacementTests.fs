@@ -362,47 +362,78 @@ let ``onWindowVanishedはDpiCrossingも消す(v2.45)`` () =
     let afterVanished, _ = onWindowVanished w afterCheck
     Assert.False(Map.containsKey w afterVanished.DpiCrossing)
 
-// ===== FrameInset（v2.114、Round 2スライス1。まだ配線は無い純粋な修正規則だけを検査する） =====
+// ===== FrameInset（v2.114、Round 2スライス1の純粋な修正規則；v2.117でモニターIdを使う形に見直し、
+// PlacementStateへのキャッシュ配線を追加） =====
+
+let private m0 = Some (MonitorId 0L)
 
 [<Fact>]
-let ``pad2py-pad-host実機で実測した値(X+7/Width-14/Height-7/Y不変)をそのまま証拠として採用する(v2.114)`` () =
+let ``pad2py-pad-host実機で実測した値(X+7/Width-14/Height-7/Y不変)をそのまま証拠として採用する(v2.114/v2.117)`` () =
     let native: PixelRect = { X = 0; Y = 0; Width = 1920; Height = 1240 }
     let visible: PixelRect = { X = 7; Y = 0; Width = 1906; Height = 1233 }
-    match reviseFrameInset 96 false false native visible with
-    | Some inset -> Assert.Equal({ Left = 7; Top = 0; Right = 7; Bottom = 7; AtDpi = 96 }, inset)
+    match reviseFrameInset m0 false false native visible with
+    | Some inset -> Assert.Equal({ Left = 7; Top = 0; Right = 7; Bottom = 7; Monitor = MonitorId 0L }, inset)
     | None -> Assert.True(false, "expected the realistic inset to be accepted")
+
+[<Fact>]
+let ``モニターが分からない観測は採用しない(v2.117)`` () =
+    let native: PixelRect = { X = 0; Y = 0; Width = 1920; Height = 1240 }
+    let visible: PixelRect = { X = 7; Y = 0; Width = 1906; Height = 1233 }
+    Assert.Equal(None, reviseFrameInset None false false native visible)
 
 [<Fact>]
 let ``最大化中の観測は採用しない(v2.114、1-B対策)`` () =
     let native: PixelRect = { X = -8; Y = -8; Width = 1936; Height = 1256 }
     let visible: PixelRect = { X = 0; Y = 0; Width = 1920; Height = 1240 }
-    Assert.Equal(None, reviseFrameInset 96 true false native visible)
+    Assert.Equal(None, reviseFrameInset m0 true false native visible)
 
 [<Fact>]
 let ``最小化中の観測は採用しない(v2.114、1-B対策)`` () =
     let native: PixelRect = { X = -32000; Y = -32000; Width = 160; Height = 28 }
     let visible: PixelRect = { X = -32000; Y = -32000; Width = 160; Height = 28 }
-    Assert.Equal(None, reviseFrameInset 96 false true native visible)
+    Assert.Equal(None, reviseFrameInset m0 false true native visible)
 
 [<Fact>]
 let ``NativeRectとVisibleFrameRectが完全に一致する(生成直後等)観測は採用しない(v2.114、1-C対策)`` () =
     let rect: PixelRect = { X = 100; Y = 100; Width = 300; Height = 200 }
-    Assert.Equal(None, reviseFrameInset 96 false false rect rect)
+    Assert.Equal(None, reviseFrameInset m0 false false rect rect)
 
 [<Fact>]
-let ``範囲外の異常な差分は採用しない(v2.114、1-D/1-G対策)`` () =
+let ``粗い範囲外の異常な差分は採用しない(v2.114/v2.117、1-D/1-G対策)`` () =
     // 150%スケーリングされたプロセスが100%モニターのNativeRectをそのまま読んだ場合等を想定した
-    // 極端な値——frameInsetMaxPx(96dpi)=16を大きく超える。
+    // 極端な値——frameInsetCrudeMaxPx(=64)を大きく超える。
     let native: PixelRect = { X = 0; Y = 0; Width = 1920; Height = 1240 }
     let visible: PixelRect = { X = 200; Y = 0; Width = 1520; Height = 1240 }
-    Assert.Equal(None, reviseFrameInset 96 false false native visible)
+    Assert.Equal(None, reviseFrameInset m0 false false native visible)
+
+// ===== PlacementState.FrameInsets への配線（v2.117：onWindowObserved/onWindowVanished） =====
 
 [<Fact>]
-let ``DPIが高いほど許容範囲が広がる(v2.114、1-F対策の一部)`` () =
-    // 96dpiでは範囲外(maxPx=16)だが、192dpi(200%)ではmaxPx=32なので同じ物理ピクセル差が範囲内になる。
+let ``onWindowObservedはNativeRect/VisibleFrameRectが両方Okの観測からFrameInsetsを更新する(v2.117)`` () =
+    let w = WindowId 1L
     let native: PixelRect = { X = 0; Y = 0; Width = 1920; Height = 1240 }
-    let visible: PixelRect = { X = 20; Y = 0; Width = 1880; Height = 1240 }
-    Assert.Equal(None, reviseFrameInset 96 false false native visible)
-    match reviseFrameInset 192 false false native visible with
-    | Some inset -> Assert.Equal(20, inset.Left)
-    | None -> Assert.True(false, "expected the same physical-pixel inset to be accepted at a higher DPI")
+    let visible: PixelRect = { X = 7; Y = 0; Width = 1906; Height = 1233 }
+    let snapshot =
+        { snapshotWith (Some (obs 1L visible)) (Some (obs 1L (MonitorId 0L))) None None None with NativeRect = Some (obs 1L native) }
+    let state', _, _ = onWindowObserved 10L snapshot initial
+    Assert.Equal(Some { Left = 7; Top = 0; Right = 7; Bottom = 7; Monitor = MonitorId 0L }, Map.tryFind w state'.FrameInsets)
+
+[<Fact>]
+let ``onWindowObservedはNativeRectが無い観測ではFrameInsetsを変えない(v2.117)`` () =
+    let w = WindowId 1L
+    let visible: PixelRect = { X = 7; Y = 0; Width = 1906; Height = 1233 }
+    let snapshot = snapshotWith (Some (obs 1L visible)) (Some (obs 1L (MonitorId 0L))) None None None
+    let state', _, _ = onWindowObserved 10L snapshot initial
+    Assert.Equal(None, Map.tryFind w state'.FrameInsets)
+
+[<Fact>]
+let ``onWindowVanishedはFrameInsetsも消す(v2.117)`` () =
+    let w = WindowId 1L
+    let native: PixelRect = { X = 0; Y = 0; Width = 1920; Height = 1240 }
+    let visible: PixelRect = { X = 7; Y = 0; Width = 1906; Height = 1233 }
+    let snapshot =
+        { snapshotWith (Some (obs 1L visible)) (Some (obs 1L (MonitorId 0L))) None None None with NativeRect = Some (obs 1L native) }
+    let state', _, _ = onWindowObserved 10L snapshot initial
+    Assert.True(Map.containsKey w state'.FrameInsets)
+    let afterVanished, _ = onWindowVanished w state'
+    Assert.False(Map.containsKey w afterVanished.FrameInsets)

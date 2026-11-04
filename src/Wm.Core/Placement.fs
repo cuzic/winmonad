@@ -240,6 +240,54 @@ type PendingRequest =
 /// 要らない。
 type PendingPresence = { Window: WindowId; DesiredVisible: bool; IssuedAt: int64; Deadline: int64 }
 
+/// 不可視リサイズ枠（§4.2「座標系契約」/§13、v2.112でpad2py-pad-host実機から実測）の信念
+/// （v2.114、Round 2スライス1；v2.117でモニターDPIの扱いを見直し）。`NativeRect`が
+/// `VisibleFrameRect`より各辺どれだけ外側に広いかを辺ごとに独立して保持する——対称とは仮定しない。
+/// `Monitor`は観測時にこの窓がいたモニター（Opusレビュー論点1-F：insetはDPIで変わるため、別DPIの
+/// モニターへ移った窓の発行にはそのまま使えない）。`onWindowObserved`は`dpiOf`投影を受け取らない
+/// （既存の呼び出し元60箇所以上を移行する必要が出るため、v2.117ではこれを避けた）ので、ここでは
+/// DPIそのものではなくモニターIdだけを記録し、実際のDPI比較・範囲チェックは消費側（`dispatchPlacements`、
+/// 未配線）で`dpiOf`が使える時点に遅らせる——ここでは粗い絶対値の安全網だけを置く（下記）。
+/// **この型・`reviseFrameInset`はまだ`PlacementState`/`dispatchPlacements`への配線は無い**
+/// （Opus敵対的レビュー`/tmp/opus-review-frame-inset.md`で見つかった4つの高リスク論点——リトライ
+/// 経路の漏れ、`SetRect`契約の変更によるWm.Cli破壊、Mismatch→Reevaluateの自己修復不能、MinWidthへの
+/// 偽の証拠混入——は、信念の修正規則とPlacementStateへのキャッシュだけでは解決しない。配線は
+/// Round 2の残りスライスで行う）。
+type FrameInset = { Left: int; Top: int; Right: int; Bottom: int; Monitor: MonitorId }
+
+/// 算出したinsetが暴走していないかの粗い安全網（Opusレビュー1-D/1-G：分断された読み取り・DPI非対応
+/// プロセスでのスケール誤差混入を弾く）。DPIに依存しない絶対値の上限——実測（7px@96dpi）の
+/// 数倍の余裕を持たせた暫定値。モニターのDPIに応じた厳密な範囲チェックは消費側へ持ち越す
+/// （型直前のコメント参照）。
+let private frameInsetCrudeMaxPx = 64
+
+let private frameInsetWithinCrudeRange (inset: FrameInset) : bool =
+    let inRange v = v >= 0 && v <= frameInsetCrudeMaxPx
+    inRange inset.Left && inRange inset.Top && inRange inset.Right && inRange inset.Bottom
+
+/// 1回の観測から`FrameInset`の証拠を採用するか判定する純粋関数。採用しない条件（Opusレビュー
+/// 1-B/1-C/1-D、全てAND）：
+/// - モニターが分からない（DPI比較の基準を持てないので記録しない）
+/// - 最大化中・最小化中の観測（1-B：最大化中は枠が約8pxへ変わり、復元後の本来値とずれる）
+/// - 全辺0（生成直後は`NativeRect`=`VisibleFrameRect`になるという§4.2自身の既知の注意点——これを
+///   「既知のinset=0」として確定させると、Mismatch→Reevaluate後は`Desired`が変わらず再発行されない
+///   ため本当の値が来ても二度と直らない。真に枠が無い窓は結局無補正のままで実害が無いので、
+///   0の証拠を採用しないことにデメリットは無い——1-C対策）
+/// - 粗い範囲外（1-D/1-G：分断された読み取り・DPI非対応プロセスでの暴走を弾く最後の安全網）
+let reviseFrameInset (monitor: MonitorId option) (isMaximized: bool) (isMinimized: bool) (native: PixelRect) (visible: PixelRect) : FrameInset option =
+    match monitor with
+    | None -> None
+    | Some _ when isMaximized || isMinimized -> None
+    | Some m ->
+        let candidate =
+            { Left = visible.X - native.X
+              Top = visible.Y - native.Y
+              Right = (native.X + native.Width) - (visible.X + visible.Width)
+              Bottom = (native.Y + native.Height) - (visible.Y + visible.Height)
+              Monitor = m }
+        let isZero = candidate.Left = 0 && candidate.Top = 0 && candidate.Right = 0 && candidate.Bottom = 0
+        if isZero || not (frameInsetWithinCrudeRange candidate) then None else Some candidate
+
 type PlacementState =
     { Geometry: Map<WindowId, GeometryBeliefs>
       Movability: Map<WindowId, Belief<Movability>>
@@ -303,7 +351,12 @@ type PlacementState =
       /// 数えない）。`RetryAttempts`と違い新しい意図が来てもリセットしない——「意図をまたいで外から
       /// 戻された回数」を数えるのが目的で、Layoutが少しでも動くたびに数え直すと、戦い続けるアプリを
       /// 永久に劣化させられなくなる。
-      DriftCorrections: Map<WindowId, int64 list> }
+      DriftCorrections: Map<WindowId, int64 list>
+      /// 窓ごとの最後に採用された`FrameInset`（v2.117、`FrameInset`/`reviseFrameInset`の型直前の
+      /// コメント参照）。`Map`に無い＝まだ証拠が無い、または不採用（他のAccumulating信念と同じ規約）。
+      /// まだ`dispatchPlacements`での消費は配線していない——`onWindowObserved`が観測のたびに
+      /// 更新するだけ。
+      FrameInsets: Map<WindowId, FrameInset> }
 
 /// `MoveCause.Unattributed`の振動の打ち止め閾値（v2.70。実機測定が無いため暫定値、Opusレビュー§Q2）。
 /// `unattributedWindowMs`は`limit × (pendingDeadlineMs + アプリの遅延)`より長くなければ、Pending満了を
@@ -328,7 +381,8 @@ let initial: PlacementState =
       DpiCrossing = Map.empty
       Dragging = Set.empty
       Accepted = Map.empty
-      DriftCorrections = Map.empty }
+      DriftCorrections = Map.empty
+      FrameInsets = Map.empty }
 
 /// `WmState.step`が、Placement自身のReconcile以外の理由（Focus.SwitchSettleの再要求、
 /// `MoveFocusedToWorkspace`のRequestForeground等、v2.27）で新しいRequestIdが要るときに呼ぶ最小の窓口。
@@ -488,13 +542,31 @@ let onWindowObserved (now: int64) (snapshot: WindowSnapshot) (state: PlacementSt
                 let ti' = Map.add w (Unformed [ MissingTargetIntegrity w ]) state.TargetIntegrity
                 ti', movability0, state.IntegrityReprobes, [ Reprobe (w, KTargetIntegrity) ], []
 
+    // `FrameInsets`（v2.117、`FrameInset`/`reviseFrameInset`の型直前のコメント参照）：
+    // 同じ`snapshot`内でNativeRect/VisibleFrameRectが両方`Ok`で届いた場合だけ採用を試みる
+    // （1-D「同じスナップショット内の対」）。最大化/最小化/モニター不明は`reviseFrameInset`自身が
+    // 除外する——判定には今まさに更新された`geometry'`（このsnapshot自身のIsMaximized/IsMinimized/
+    // Monitorを反映済み）を使う。
+    let frameInsets' =
+        match snapshot.NativeRect, snapshot.VisibleFrameRect with
+        | Some { Value = Ok nr }, Some { Value = Ok vr } ->
+            let geom = Map.find w geometry'
+            let isMax = LatestWins.value geom.IsMaximized |> Option.defaultValue false
+            let isMin = LatestWins.value geom.IsMinimized |> Option.defaultValue false
+            let monitor = LatestWins.value geom.Monitor
+            match reviseFrameInset monitor isMax isMin nr vr with
+            | Some inset -> Map.add w inset state.FrameInsets
+            | None -> state.FrameInsets
+        | _ -> state.FrameInsets
+
     let stateAfterBeliefs =
         { state with
             Geometry = geometry'
             Movability = movability'
             TargetIntegrity = targetIntegrity'
             IntegrityReprobes = integrityReprobes'
-            DpiBehavior = dpiBehavior' }
+            DpiBehavior = dpiBehavior'
+            FrameInsets = frameInsets' }
 
     // §7.2「SetRectのネイティブAPI呼出が成功しても、目標矩形を観測するまではSatisfiedにしない」：
     // ここでGeometryが今まさに更新されたVisibleFrameRectと、窓宛てのPendingのTargetRectを照合する。
@@ -843,48 +915,6 @@ let private tryMismatchObservation (pr: PendingRequest) (state: PlacementState) 
                 if observed <> pr.TargetRect && not matchesBaseline && not matchesInFlight then Some (observed, valueSeq) else None
             | _ -> None
 
-/// 不可視リサイズ枠（§4.2「座標系契約」/§13、v2.112でpad2py-pad-host実機から実測）の信念
-/// （v2.114、Round 2スライス1）。`NativeRect`が`VisibleFrameRect`より各辺どれだけ外側に広いかを
-/// 辺ごとに独立して保持する——対称とは仮定しない。`AtDpi`は観測時のモニターDPI（Opusレビュー論点
-/// 1-F：insetはDPIで変わるため、別DPIのモニターへ移った窓の発行にはそのまま使えない、`Placement`
-/// 側で発行先モニターのDPIと比較する責務は未配線のまま——このスライスは信念の型と修正規則だけ）。
-/// **この型・`reviseFrameInset`はまだ`PlacementState`/`onWindowObserved`/`dispatchPlacements`へ
-/// 配線していない**（Opus敵対的レビュー`/tmp/opus-review-frame-inset.md`で見つかった4つの高リスク
-/// 論点——リトライ経路の漏れ、`SetRect`契約の変更によるWm.Cli破壊、Mismatch→Reevaluateの自己修復
-/// 不能、MinWidthへの偽の証拠混入——は、信念の修正規則だけでは解決しない。配線はRound 2の残り
-/// スライス（`SetRect`にinsetを別フィールドとして載せる契約変更、MinWidthガード）で行う）。
-type FrameInset = { Left: int; Top: int; Right: int; Bottom: int; AtDpi: int }
-
-/// 算出したinsetが暴走していないかの範囲チェック（Opusレビュー1-D/1-G：DPI非対応プロセスでの
-/// スケール誤差混入、分断された読み取りでの異常値を最後の安全網として弾く）。`k`は実測（7px@96dpi）の
-/// 数倍の余裕を持たせた暫定値——実機チューニング待ち（§21）。
-let private frameInsetMaxPx (dpi: int) : int = 16 * dpi / 96
-
-let private frameInsetInRange (dpi: int) (inset: FrameInset) : bool =
-    let maxPx = frameInsetMaxPx dpi
-    let inRange v = v >= 0 && v <= maxPx
-    inRange inset.Left && inRange inset.Top && inRange inset.Right && inRange inset.Bottom
-
-/// 1回の観測から`FrameInset`の証拠を採用するか判定する純粋関数（まだ信念Mapへの配線は無い、
-/// 型直前のコメント参照）。採用しない条件（Opusレビュー1-B/1-C/1-D、全てAND）：
-/// - 最大化中・最小化中の観測（1-B：最大化中は枠が約8pxへ変わり、復元後の本来値とずれる）
-/// - 全辺0（生成直後は`NativeRect`=`VisibleFrameRect`になるという§4.2自身の既知の注意点——これを
-///   「既知のinset=0」として確定させると、Mismatch→Reevaluate後は`Desired`が変わらず再発行されない
-///   ため本当の値が来ても二度と直らない。真に枠が無い窓は結局無補正のままで実害が無いので、
-///   0の証拠を採用しないことにデメリットは無い——1-C対策）
-/// - 範囲外（1-D：分断された読み取り・DPI非対応プロセスでの暴走を弾く最後の安全網）
-let reviseFrameInset (dpi: int) (isMaximized: bool) (isMinimized: bool) (native: PixelRect) (visible: PixelRect) : FrameInset option =
-    if isMaximized || isMinimized then
-        None
-    else
-        let candidate =
-            { Left = visible.X - native.X
-              Top = visible.Y - native.Y
-              Right = (native.X + native.Width) - (visible.X + visible.Width)
-              Bottom = (native.Y + native.Height) - (visible.Y + visible.Height)
-              AtDpi = dpi }
-        let isZero = candidate.Left = 0 && candidate.Top = 0 && candidate.Right = 0 && candidate.Bottom = 0
-        if isZero || not (frameInsetInRange dpi candidate) then None else Some candidate
 
 /// §4.5「最小幅」（Accumulating）：`SetRect`で幅`r`を要求して幅`o > r`が観測された（`Mismatch`）ことを
 /// 証拠に、`o`を物理ピクセルからDIPへ正規化した値（`o × 96 / dpi`）を`Inferred`の最小幅とする
@@ -1194,5 +1224,6 @@ let onWindowVanished (w: WindowId) (state: PlacementState) : PlacementState * Ti
         DpiCrossing = Map.remove w state.DpiCrossing
         Dragging = Set.remove w state.Dragging
         Accepted = Map.remove w state.Accepted
-        DriftCorrections = Map.remove w state.DriftCorrections },
+        DriftCorrections = Map.remove w state.DriftCorrections
+        FrameInsets = Map.remove w state.FrameInsets },
     integrityCancel @ pendingCancel @ pendingPresenceCancel
