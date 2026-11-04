@@ -217,6 +217,17 @@ let candidateBehaviors : WindowBehavior list =
 /// （机上の仮定を含まない）。同じ窓に新しい`SetRect`が発行されたら前回分（未達のまま）は捨て、
 /// 最後に発行された`SetRect`への応答だけを測る——Retryで新しい`RequestId`が発行された場合も、
 /// Simulationの`DelayedByMs`が「1回の発行→1回の遅延応答」を模すのと対応する単位になる。
+///
+/// **実機Journal（pad2py-pad-hostでの最初の実機検証、v2.112）で見つかった`classifySetRectOutcomes`
+/// の実在のバグに合わせた防御的な一貫性修正**：窓の「発見」（最初の`WindowObserved`）自体が
+/// Topology settled後であれば、Reconcileが同じ`Submit`呼び出しの中で即座に`SetRect`を発行する
+/// （§4.4の発見→Reconcile→SetRectが同期的に起きる、というCoreの実際の設計どおり）。この関数自体は
+/// 不一致時に`pendingByWindow`を消さない作りのため、発見時点の矩形を自分自身の`SetRect`への応答と
+/// 誤って「一致」判定することは無く（不一致のまま素通りし、後続の本当の応答が同じエントリを
+/// 正しく使う——ミューテーションテストで確認済み、該当テストはこの理由で追加しなかった）、実害は
+/// 無かった。ただし`classifySetRectOutcomes`は不一致でも`RelocatedElsewhereLike`等で無条件に
+/// 消費してしまうため実害があった（そちらのコメント参照）。両者を同じ順序に揃えておく方が、
+/// 「不一致時に消費しない」という暗黙の前提に将来の変更が依存しなくて済む。
 let measuredLatenciesMs (entries: JournalEntry list) : (WindowId * int64) list =
     let reducer = Reducer(RuntimePolicy.defaults, "calibrate-measure", "wm-cli", "no-policy-artifact", None)
     let mutable pendingByWindow : Map<WindowId, int64 * PixelRect> = Map.empty
@@ -225,10 +236,6 @@ let measuredLatenciesMs (entries: JournalEntry list) : (WindowId * int64) list =
         match entry.Payload with
         | InputPayload input ->
             let sr = reducer.Submit entry.MonotonicTicks "calibrate-measure" input
-            for g in sr.Effects do
-                match GatedEffect.effect g with
-                | SetRect (_, w, rect) -> pendingByWindow <- Map.add w (entry.MonotonicTicks, rect) pendingByWindow
-                | _ -> ()
             match input with
             | WindowObserved snapshot ->
                 match Map.tryFind snapshot.Id pendingByWindow, snapshot.VisibleFrameRect with
@@ -240,6 +247,10 @@ let measuredLatenciesMs (entries: JournalEntry list) : (WindowId * int64) list =
                     | _ -> ()
                 | _ -> ()
             | _ -> ()
+            for g in sr.Effects do
+                match GatedEffect.effect g with
+                | SetRect (_, w, rect) -> pendingByWindow <- Map.add w (entry.MonotonicTicks, rect) pendingByWindow
+                | _ -> ()
         | _ -> ()
     List.rev measured
 
@@ -286,6 +297,11 @@ type SetRectOutcome =
 
 /// 窓ごとに「最後に発行された`SetRect`」の結末だけを分類する（`measuredLatenciesMs`と同じ
 /// 「最後の発行への応答だけを見る」単純化）。
+///
+/// `measuredLatenciesMs`と同じ理由（その関数直前のコメント参照、pad2py-pad-hostでの最初の実機
+/// 検証で発見、v2.112）で、`input`の判定を、このEntry自身が生んだ`SetRect`を積む*前*の
+/// `pendingByWindow`に対して行う——発見と同じEntryでReconcileが即座に`SetRect`を発行する場合、
+/// 発見時点のまだ移動していない矩形をその`SetRect`への応答と誤認してはならない。
 let classifySetRectOutcomes (entries: JournalEntry list) : (WindowId * SetRectOutcome) list =
     let reducer = Reducer(RuntimePolicy.defaults, "calibrate-classify", "wm-cli", "no-policy-artifact", None)
     let mutable pendingByWindow : Map<WindowId, int64 * PixelRect> = Map.empty
@@ -294,13 +310,6 @@ let classifySetRectOutcomes (entries: JournalEntry list) : (WindowId * SetRectOu
         match entry.Payload with
         | InputPayload input ->
             let sr = reducer.Submit entry.MonotonicTicks "calibrate-classify" input
-            for g in sr.Effects do
-                match GatedEffect.effect g with
-                | SetRect (_, w, rect) ->
-                    // 新しい発行があったら、前回分の未確定判定は捨てる——最後の発行への応答だけを見る。
-                    pendingByWindow <- Map.add w (entry.MonotonicTicks, rect) pendingByWindow
-                    outcomes <- Map.remove w outcomes
-                | _ -> ()
             match input with
             | WindowObserved snapshot ->
                 match Map.tryFind snapshot.Id pendingByWindow, snapshot.VisibleFrameRect with
@@ -321,6 +330,13 @@ let classifySetRectOutcomes (entries: JournalEntry list) : (WindowId * SetRectOu
                 outcomes <- Map.add w DisappearedLike outcomes
                 pendingByWindow <- Map.remove w pendingByWindow
             | _ -> ()
+            for g in sr.Effects do
+                match GatedEffect.effect g with
+                | SetRect (_, w, rect) ->
+                    // 新しい発行があったら、前回分の未確定判定は捨てる——最後の発行への応答だけを見る。
+                    pendingByWindow <- Map.add w (entry.MonotonicTicks, rect) pendingByWindow
+                    outcomes <- Map.remove w outcomes
+                | _ -> ()
         | _ -> ()
     // Journalが終わった時点でまだ応答が無かった窓（pendingByWindowに残っている）は、
     // 最終的なResponsiveness信念でHungLike/Unknownへ振り分ける。

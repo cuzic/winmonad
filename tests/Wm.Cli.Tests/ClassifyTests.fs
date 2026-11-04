@@ -78,6 +78,38 @@ let private runClassify (path: string) : (WindowId * SetRectOutcome) list =
     let entries = Wm.Journal.JournalWriter.readAll path |> List.ofSeq
     classifySetRectOutcomes entries
 
+/// pad2py-pad-hostでの最初の実機検証（v2.112）で実際に踏んだ形を再現する：Topologyが既に
+/// settle済みの状態で窓を発見すると、Reconcileが「発見」と同じ`Submit`呼び出しの中で即座に
+/// `SetRect`を発行する。この場合、発見時点のまだ移動していない矩形をその`SetRect`への応答と
+/// 誤認してはならない（`CalibrateTests.fs`の同名の規律を`classifySetRectOutcomes`側でも確認する）。
+let private buildJournalWhereSetRectFiresOnDiscovery (w: WindowId) (mismatchedInitialRect: PixelRect) (laterRect: PixelRect) (laterTick: int64) : string =
+    let path = IO.Path.Combine(IO.Path.GetTempPath(), sprintf "wm-cli-classify-test-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    let reducer = Reducer(RuntimePolicy.defaults, "test", "test-build", "no-policy-artifact", Some path)
+    reducer.Submit 0L "test" (MonitorTopologyObserved [ sampleMonitor ]) |> ignore
+    let mutable more = true
+    while more do
+        match reducer.Timers.NextDeadline with
+        | Some _ -> reducer.AdvanceToNextTimer() |> ignore
+        | None -> more <- false
+    let sr = reducer.Submit 1L "test" (WindowObserved (sampleWindow w mismatchedInitialRect))
+    let dispatchedOnDiscovery =
+        sr.Effects |> List.exists (fun g -> match GatedEffect.effect g with SetRect _ -> true | _ -> false)
+    if not dispatchedOnDiscovery then
+        failwith "fixture precondition broken: SetRect was not dispatched synchronously on discovery"
+    reducer.Submit laterTick "test" (WindowObserved (sampleWindow w laterRect)) |> ignore
+    path
+
+[<Fact>]
+let ``発見と同じSubmitでSetRectが即座に発行された場合でも、発見時点の矩形を応答と誤認しない`` () =
+    let w = WindowId 1L
+    let initialRect = { X = 50; Y = 50; Width = 300; Height = 200 }
+    let targetRect = { X = 0; Y = 0; Width = 1920; Height = 1080 }
+    let path = buildJournalWhereSetRectFiresOnDiscovery w initialRect targetRect 123L
+    try
+        Assert.Equal<(WindowId * SetRectOutcome) list>([ (w, ResolvedExactly (123L - 1L)) ], runClassify path)
+    finally
+        if IO.File.Exists path then IO.File.Delete path
+
 [<Fact>]
 let ``目標どおりの矩形が観測されるとResolvedExactlyへ分類される`` () =
     let w = WindowId 1L
