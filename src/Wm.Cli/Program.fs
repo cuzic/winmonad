@@ -1,49 +1,75 @@
 /// architecture.md §18 Phase A「最小JournalとCLI Explain」：長らく型（`StepResult.Trace`/
 /// `DecisionTrace`）だけがあり、実際に読む側のCLIが無かった既知のギャップ（Phase Bで発見・
-/// 自己選定）。Replayの駆動そのものは`Replay.fs`（テストから直接呼べる）、ここは表示（`printfn`）と
+/// 自己選定、v2.105で解消）。
+///
+/// `golden-save`/`golden-check`（v2.107で追加）：AIデバッグ・リファクタリング支援フレームワーク
+/// 構想（§11 Golden Master）との比較検討から持ち込んだ、Golden Masterの最小実装。v2.106の
+/// `EffectHarness`リファクタで実際にやった検証（実機CIのログを再実行し、各ラウンドの正否判定行を
+/// 目で読み比べる）を、再利用可能な形に起こした——`formatReplay`が作る決定論的なテキストを
+/// 保存・比較するだけで、同じJournal入力列に対する意味的な振る舞いの退行を検出できる。
+/// Replayの駆動そのものは`Replay.fs`（テストから直接呼べる）、ここは表示（`printfn`）と
 /// エントリポイントだけを持つ。
 module Wm.Cli.Program
 
 open System
-open Wm.Contracts.GatedEffect
 open Wm.Contracts.JournalTypes
-open Wm.Core.WmState
-open Wm.Runtime.Reducer
 open Wm.Cli.Replay
 
-let private run (path: string) : int =
-    let entries = Wm.Journal.JournalWriter.readAll path |> List.ofSeq
-    printfn "Journal: %s (%d entries)" path entries.Length
-    let reducer = Reducer(RuntimePolicy.defaults, "replay", "wm-cli", "no-policy-artifact", None)
-    for entry, srOpt in replayAll reducer entries do
-        match srOpt, entry.Payload with
-        | Some sr, InputPayload input ->
-            printfn "[seq=%d kind=%A t=%d] %A" entry.Sequence entry.Kind entry.MonotonicTicks input
-            for g in sr.Effects do
-                printfn "  -> Effect: %A" (GatedEffect.effect g)
-            for t in sr.Trace do
-                printfn "  -> DecisionTrace: %A" t
-        | _ ->
-            // 9.2の決定6層9（Contractsの型だけで書ける永続化対象）のうち、`InputPayload`以外
-            // （`SafetyRecoveryActionPayload`等）はReplayで再現する`step`の入力ではないので、
-            // そのまま記録として表示するだけに留める。
-            printfn "[seq=%d kind=%A t=%d] (non-replayable payload) %A" entry.Sequence entry.Kind entry.MonotonicTicks entry.Payload
+let private loadEntries (path: string) : JournalEntry list =
+    Wm.Journal.JournalWriter.readAll path |> List.ofSeq
 
-    printfn "\nFinal classification:"
-    for KeyValue (w, record) in reducer.State.Windows.Records do
-        printfn "  %A -> %A" w record.Classification
-    printfn "\nFinal Placement.Pending: %d entries" (Map.count reducer.State.Placement.Pending)
+let private explain (path: string) : int =
+    let entries = loadEntries path
+    printfn "Journal: %s (%d entries)" path entries.Length
+    printf "%s" (formatReplay entries)
     0
+
+let private goldenSave (journalPath: string) (goldenPath: string) : int =
+    let entries = loadEntries journalPath
+    IO.File.WriteAllText(goldenPath, formatReplay entries)
+    printfn "Saved golden master (%d entries replayed) to %s" entries.Length goldenPath
+    0
+
+let private goldenCheck (journalPath: string) (goldenPath: string) : int =
+    let entries = loadEntries journalPath
+    let actual = formatReplay entries
+    let expected = IO.File.ReadAllText(goldenPath)
+    match diffLines expected actual with
+    | [] ->
+        printfn "OK: replay matches golden master %s (%d entries)" goldenPath entries.Length
+        0
+    | diffs ->
+        printfn "MISMATCH: replay diverged from golden master %s (%d line(s) differ)" goldenPath diffs.Length
+        for (lineNo, expectedLine, actualLine) in diffs do
+            printfn "  line %d:" lineNo
+            printfn "    golden : %s" (expectedLine |> Option.defaultValue "<missing>")
+            printfn "    replay : %s" (actualLine |> Option.defaultValue "<missing>")
+        1
+
+let private usage () =
+    eprintfn "Usage:"
+    eprintfn "  wm-cli explain <journal-file.ndjson>"
+    eprintfn "      Replays a Wm.Runtime.Reducer journal through Wm.Core.WmState.step, printing"
+    eprintfn "      each input alongside the Effects/DecisionTrace it produced, plus final state."
+    eprintfn "  wm-cli golden-save <journal-file.ndjson> <golden-file.txt>"
+    eprintfn "      Replays the journal and saves the formatted result as a reference (Golden Master)."
+    eprintfn "  wm-cli golden-check <journal-file.ndjson> <golden-file.txt>"
+    eprintfn "      Replays the journal and compares against a previously saved reference,"
+    eprintfn "      reporting any semantic divergence (non-zero exit on mismatch)."
+    1
+
+let private requireFile (label: string) (path: string) : bool =
+    if IO.File.Exists path then true
+    else
+        eprintfn "File not found (%s): %s" label path
+        false
 
 [<EntryPoint>]
 let main argv =
     match argv with
-    | [| path |] when IO.File.Exists path -> run path
-    | [| path |] ->
-        eprintfn "File not found: %s" path
-        1
-    | _ ->
-        eprintfn "Usage: wm-cli <journal-file.ndjson>"
-        eprintfn "Replays a Wm.Runtime.Reducer journal through Wm.Core.WmState.step, printing each"
-        eprintfn "input alongside the Effects/DecisionTrace it produced, plus the final classification."
-        1
+    | [| "explain"; path |] -> if requireFile "journal" path then explain path else 1
+    | [| "golden-save"; journalPath; goldenPath |] -> if requireFile "journal" journalPath then goldenSave journalPath goldenPath else 1
+    | [| "golden-check"; journalPath; goldenPath |] ->
+        if requireFile "journal" journalPath && requireFile "golden" goldenPath then goldenCheck journalPath goldenPath else 1
+    | [| path |] -> if requireFile "journal" path then explain path else 1 // 後方互換：v2.105時点の既定動作
+    | _ -> usage ()

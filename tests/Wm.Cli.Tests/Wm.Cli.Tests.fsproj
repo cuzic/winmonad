@@ -7,6 +7,7 @@
 
   <ItemGroup>
     <Compile Include="ReplayTests.fs" />
+    <Compile Include="GoldenMasterTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
