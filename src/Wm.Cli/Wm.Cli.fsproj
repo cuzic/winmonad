@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- architecture.md §18 Phase A「最小JournalとCLI Explain（9.1の方針：判断は永続化せずReplay
+       再構成、B-1）」：長らく型（StepResult.Trace/DecisionTrace）だけがあり、実際に読む側のCLIが
+       無かった既知のギャップ（Phase Bで発見・自己選定）。Core/Policy/Layouts/Journal/Runtimeだけに
+       依存し、Windows固有の型は一切参照しないため、winmonad.slnに含めてLinux CIでも検証できる
+       （Wm.Host/Wm.Windowsとは違い、専用のWindowsワークフローは不要）。 -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Replay.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Wm.Contracts/Wm.Contracts.fsproj" />
+    <ProjectReference Include="../Wm.Core/Wm.Core.fsproj" />
+    <ProjectReference Include="../Wm.Policy/Wm.Policy.fsproj" />
+    <ProjectReference Include="../Wm.Layouts/Wm.Layouts.fsproj" />
+    <ProjectReference Include="../Wm.Journal/Wm.Journal.fsproj" />
+    <ProjectReference Include="../Wm.Runtime/Wm.Runtime.fsproj" />
+  </ItemGroup>
+
+</Project>
