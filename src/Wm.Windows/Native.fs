@@ -112,6 +112,32 @@ extern int GetWindowTextW(IntPtr hWnd, System.Text.StringBuilder lpString, int n
 
 let PROCESS_QUERY_LIMITED_INFORMATION = 0x1000u
 
+// Phase B ラウンド7：ホットキー（architecture.md §8.1、Phase 0のF11で`Alt+J`等がCI実機で
+// 登録できることを確認済み）と、実際にそのキーを押させる・結果の実フォアグラウンド窓を確認するAPI。
+// `keybd_event`での合成は`VK_MENU`(Alt)を絶対に押さない——spikes/Phase0CiSpikes/Program.fsのS4の
+// コメントが記録する実際のCI実機ハング（Altのbare keydownがWM_ENTERMENULOOPへ入り、
+// `Application.DoEvents()`がそこから戻れなくなった）を再発させないため、このラウンドのテスト用
+// ホットキーはCtrl+Shift+<key>に限定する。
+[<DllImport("user32.dll")>]
+extern bool RegisterHotKey(IntPtr hWnd, int id, uint32 fsModifiers, uint32 vk)
+
+[<DllImport("user32.dll")>]
+extern bool UnregisterHotKey(IntPtr hWnd, int id)
+
+[<DllImport("user32.dll")>]
+extern void keybd_event(byte bVk, byte bScan, uint32 dwFlags, UIntPtr dwExtraInfo)
+
+[<DllImport("user32.dll")>]
+extern IntPtr GetForegroundWindow()
+
+let WM_HOTKEY = 0x0312
+let MOD_CONTROL = 0x0002u
+let MOD_SHIFT = 0x0004u
+let KEYEVENTF_KEYUP = 2u
+let VK_LCONTROL = 0xA2uy
+let VK_LSHIFT = 0xA0uy
+let VK_J = 0x4Auy
+
 let DWMWA_EXTENDED_FRAME_BOUNDS = 9
 let DWMWA_CLOAKED = 14
 let MDT_EFFECTIVE_DPI = 0

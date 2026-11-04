@@ -57,6 +57,15 @@ open Wm.Windows.Native
 open Wm.Windows.RealObservation
 open Wm.Windows.EventHooks
 
+/// Phase B ラウンド7：`RegisterHotKey`→`WM_HOTKEY`を受け取るためだけの、見えない専用窓。
+/// `WM_HOTKEY`は`RegisterHotKey`に渡したHWNDへ配送されるので、`Application.DoEvents()`で
+/// 既にポンプしているのと同じスレッド上にこの窓を作るだけでよい（新しいメッセージループは要らない）。
+type private HotkeyForm(onHotkey: int -> unit) =
+    inherit Form(Text = "wm-host-round7-hotkey-sink", ShowInTaskbar = false, Width = 1, Height = 1)
+    override _.WndProc(m: Message byref) =
+        if m.Msg = WM_HOTKEY then onHotkey (m.WParam.ToInt32())
+        base.WndProc(&m)
+
 /// 保留中の全タイマーを仮想時計で発火し切る。発火したStepResultが運んだEffectも集めて返す
 /// (Reconcile・分類期限超過等、タイマー発火の結果として生まれるEffectも報告対象にするため)。
 let private drainTimers (reducer: Reducer) : Effect list * int =
@@ -328,6 +337,125 @@ let main _argv =
     |> List.iter (fun e -> printfn "  [seq=%d] InputReceived(WindowObserved)" e.Sequence)
 
     testForm3.Close()
+
+    // 段8：ラウンド7。実際のホットキー（RegisterHotKey→WM_HOTKEY）からUserCommand FocusNextを
+    // 投入し、Coreが発行するRequestForegroundを実際のOSへ発行する。Alt系の合成はCI実機で実際に
+    // ハングした既知の罠（型直前の`Native.fs`のコメント参照）のため、合成するキーはCtrl+Shift+Jに
+    // 限定する。ラウンド3/4と同じ理由で、専用の隔離された別Reducer・自分で作ったテスト窓2枚だけを
+    // 対象にする。
+    printfn "\n--- Round 7: real hotkey (RegisterHotKey -> WM_HOTKEY -> UserCommand FocusNext -> RequestForeground) ---"
+    let journalPath4 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round7-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    let reducer4 = Reducer(RuntimePolicy.defaults, "phase-b-round7", "wm-host-round7", "no-policy-artifact", Some journalPath4)
+    let effectQueue4 = ConcurrentQueue<GatedEffect>()
+    let resultQueue4 = ConcurrentQueue<RequestId * Result<unit, NativeCallRecord>>()
+    let mutable keepDispatching4 = true
+
+    let effectApplyThread4 =
+        Thread(fun () ->
+            while keepDispatching4 do
+                match effectQueue4.TryDequeue() with
+                | true, gated ->
+                    let effect = GatedEffect.effect gated
+                    match Wm.Windows.EffectDispatch.apply effect with
+                    | Some result ->
+                        let ridOpt =
+                            match effect with
+                            | SetRect (rid, _, _) -> Some rid
+                            | RequestForeground (rid, _) -> Some rid
+                            | RestoreBeforeMove (rid, _) -> Some rid
+                            | _ -> None
+                        match ridOpt with
+                        | Some rid -> resultQueue4.Enqueue(rid, result)
+                        | None -> ()
+                    | None -> ()
+                | false, _ -> Thread.Sleep(1))
+    effectApplyThread4.IsBackground <- true
+    effectApplyThread4.Name <- "wm-effect-apply-round7"
+    effectApplyThread4.Start()
+
+    let enqueueEffects4 (effects: GatedEffect list) = for g in effects do effectQueue4.Enqueue(g)
+
+    let submit4 (now: int64) (source: string) (input: InputEvent) =
+        let sr = reducer4.Submit now source input
+        enqueueEffects4 sr.Effects
+        sr
+
+    let advance4 () =
+        match reducer4.AdvanceToNextTimer() with
+        | Some sr -> enqueueEffects4 sr.Effects; true
+        | None -> false
+
+    let drainResults4 (now: int64) =
+        let mutable more = true
+        while more do
+            match resultQueue4.TryDequeue() with
+            | true, (rid, result) -> submit4 now "wm-host-effect-thread" (EffectCallReturned (rid, result, None)) |> ignore
+            | false, _ -> more <- false
+
+    let pump4 (ms: int) =
+        let deadline = liveNow () + int64 ms
+        while liveNow () < deadline do
+            Application.DoEvents()
+            drainResults4 (liveNow ())
+            while advance4 () do ()
+            Thread.Sleep(1)
+
+    let mutable focusNextTarget : WindowId option = None
+    let onHotkey (id: int) =
+        let now = liveNow ()
+        let sr = submit4 now "wm-host-hotkey" (UserCommand FocusNext)
+        let target =
+            sr.Effects
+            |> List.map GatedEffect.effect
+            |> List.tryPick (function RequestForeground (_, w) -> Some w | _ -> None)
+        focusNextTarget <- target
+        printfn "  [round7] WM_HOTKEY id=%d -> UserCommand FocusNext -> RequestForeground target=%A" id target
+
+    use hotkeyForm = new HotkeyForm(onHotkey)
+    hotkeyForm.Show()
+    use testFormA = new Form(Text = "wm-host-round7-a", Width = 300, Height = 200)
+    use testFormB = new Form(Text = "wm-host-round7-b", Width = 300, Height = 200)
+    testFormA.Show()
+    testFormB.Show()
+    pump4 300
+
+    let hotkeyId = 1
+    let registered = RegisterHotKey(hotkeyForm.Handle, hotkeyId, MOD_CONTROL ||| MOD_SHIFT, uint32 VK_J)
+    printfn "RegisterHotKey(Ctrl+Shift+J)=%b" registered
+
+    submit4 (liveNow ()) "wm-host" (MonitorTopologyObserved monitors) |> ignore
+    pump4 300
+    submit4 (liveNow ()) "wm-host" (RawFirstSeen (observeWindow (liveNow ()) monitorHandles titleMatcher testFormA.Handle) |> normalize |> List.exactlyOne) |> ignore
+    pump4 800
+    submit4 (liveNow ()) "wm-host" (RawFirstSeen (observeWindow (liveNow ()) monitorHandles titleMatcher testFormB.Handle) |> normalize |> List.exactlyOne) |> ignore
+    pump4 800
+
+    if registered then
+        // Ctrl+Shift+Jだけを合成する——VK_MENU(Alt)は型直前のコメントが記録する既知のCI実機ハングの
+        // 罠のため絶対に押さない。
+        keybd_event (VK_LCONTROL, 0uy, 0u, UIntPtr.Zero)
+        keybd_event (VK_LSHIFT, 0uy, 0u, UIntPtr.Zero)
+        keybd_event (VK_J, 0uy, 0u, UIntPtr.Zero)
+        keybd_event (VK_J, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
+        keybd_event (VK_LSHIFT, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
+        keybd_event (VK_LCONTROL, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
+    pump4 800
+
+    UnregisterHotKey(hotkeyForm.Handle, hotkeyId) |> ignore
+    keepDispatching4 <- false
+    effectApplyThread4.Join(2000) |> ignore
+
+    // Coreとは無関係に、実際のOSフォアグラウンド窓を直接問い合わせて確認する（ラウンド3/4/6と
+    // 同じ、Core状態への依存だけに頼らない二重確認）。
+    let realForeground = GetForegroundWindow()
+    printfn "\nRound 7 summary: registered=%b focusNextTarget=%A realForegroundHwnd=%A" registered focusNextTarget realForeground
+    match focusNextTarget with
+    | Some (WindowId raw) -> printfn "Real foreground matches FocusNext's RequestForeground target: %b" (IntPtr raw = realForeground)
+    | None -> printfn "FocusNext produced no RequestForeground effect (no observable target to compare)"
+
+    testFormA.Close()
+    testFormB.Close()
+    hotkeyForm.Close()
 
     printfn "\nDone."
     0
