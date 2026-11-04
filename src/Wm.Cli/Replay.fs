@@ -5,6 +5,7 @@ module Wm.Cli.Replay
 
 open System
 open Wm.Contracts.Identifiers
+open Wm.Contracts.Beliefs
 open Wm.Contracts.Observation
 open Wm.Contracts.CoreCommand
 open Wm.Contracts.GatedEffect
@@ -259,3 +260,80 @@ let calibrate (entries: JournalEntry list) : (WindowId * WindowBehavior * int64)
                 | _ -> Int64.MaxValue)
         w, bestFit, latencyMs)
     |> List.sortBy (fun (WindowId id, _, _) -> id)
+
+/// 1回の`SetRect`発行の結末を、実機Journalに実際に記録されたイベントだけから離散カテゴリへ
+/// 分類する——`calibrate`が担う「`Immediate`/`DelayedByMs`のどちらで、何msか」という連続値
+/// フィッティングとは別腹に、まず「要求とどう違う結末になったか」という振る舞いの型を見つける
+/// （§12.3「実測モデルの育成」、ユーザーとの合意：数値精度よりカテゴリ発見の方が実機の
+/// WindowBehaviorの欠落を見つける力が強い）。
+type SetRectOutcome =
+    /// 要求どおりの矩形がそのまま観測された（`measuredLatenciesMs`と同じ判定）。
+    | ResolvedExactly of latencyMs: int64
+    /// 位置・高さは要求どおりだが、幅だけが要求より大きい値に揃って観測された
+    /// （`WindowBehavior.MinimumWidth`の兆候）。
+    | WidthFlooredLike of requestedWidth: int * observedWidth: int
+    /// 観測された矩形が要求と無関係（位置・高さも違う）
+    /// （`WindowBehavior.SelfRepositionAfterMs`の兆候）。
+    | RelocatedElsewhereLike of requested: PixelRect * observed: PixelRect
+    /// 観測の代わりに`WindowRemoved`が届いた（`WindowBehavior.DisappearOnMove`の兆候）。
+    | DisappearedLike
+    /// 観測が一切届かないまま、`Health.Responsiveness`が`Hung`へ確定した
+    /// （`WindowBehavior.HungAfterMs`の兆候）。
+    | HungLike
+    /// 観測が一切届かず、`Responsiveness`もまだ`Hung`に確定していない（証拠不足、Journalが
+    /// 途中で終わっている等）——既存の6候補のどれにも当てはめず、素直に「わからない」と報告する。
+    | Unknown
+
+/// 窓ごとに「最後に発行された`SetRect`」の結末だけを分類する（`measuredLatenciesMs`と同じ
+/// 「最後の発行への応答だけを見る」単純化）。
+let classifySetRectOutcomes (entries: JournalEntry list) : (WindowId * SetRectOutcome) list =
+    let reducer = Reducer(RuntimePolicy.defaults, "calibrate-classify", "wm-cli", "no-policy-artifact", None)
+    let mutable pendingByWindow : Map<WindowId, int64 * PixelRect> = Map.empty
+    let mutable outcomes : Map<WindowId, SetRectOutcome> = Map.empty
+    for entry in entries do
+        match entry.Payload with
+        | InputPayload input ->
+            let sr = reducer.Submit entry.MonotonicTicks "calibrate-classify" input
+            for g in sr.Effects do
+                match GatedEffect.effect g with
+                | SetRect (_, w, rect) ->
+                    // 新しい発行があったら、前回分の未確定判定は捨てる——最後の発行への応答だけを見る。
+                    pendingByWindow <- Map.add w (entry.MonotonicTicks, rect) pendingByWindow
+                    outcomes <- Map.remove w outcomes
+                | _ -> ()
+            match input with
+            | WindowObserved snapshot ->
+                match Map.tryFind snapshot.Id pendingByWindow, snapshot.VisibleFrameRect with
+                | Some (issuedAt, target), Some obs ->
+                    match obs.Value with
+                    | Ok rect when rect = target ->
+                        outcomes <- Map.add snapshot.Id (ResolvedExactly (entry.MonotonicTicks - issuedAt)) outcomes
+                        pendingByWindow <- Map.remove snapshot.Id pendingByWindow
+                    | Ok rect when rect.X = target.X && rect.Y = target.Y && rect.Height = target.Height && rect.Width <> target.Width ->
+                        outcomes <- Map.add snapshot.Id (WidthFlooredLike (target.Width, rect.Width)) outcomes
+                        pendingByWindow <- Map.remove snapshot.Id pendingByWindow
+                    | Ok rect ->
+                        outcomes <- Map.add snapshot.Id (RelocatedElsewhereLike (target, rect)) outcomes
+                        pendingByWindow <- Map.remove snapshot.Id pendingByWindow
+                    | Error _ -> ()
+                | _ -> ()
+            | WindowRemoved w when Map.containsKey w pendingByWindow ->
+                outcomes <- Map.add w DisappearedLike outcomes
+                pendingByWindow <- Map.remove w pendingByWindow
+            | _ -> ()
+        | _ -> ()
+    // Journalが終わった時点でまだ応答が無かった窓（pendingByWindowに残っている）は、
+    // 最終的なResponsiveness信念でHungLike/Unknownへ振り分ける。
+    let unresolved =
+        pendingByWindow
+        |> Map.toList
+        |> List.map (fun (w, _) ->
+            let outcome =
+                match Map.tryFind w reducer.State.Health.Responsiveness with
+                | Some belief when belief.Value = Hung -> HungLike
+                | _ -> Unknown
+            w, outcome)
+    outcomes
+    |> Map.toList
+    |> (fun resolved -> resolved @ unresolved)
+    |> List.sortBy (fun (WindowId id, _) -> id)

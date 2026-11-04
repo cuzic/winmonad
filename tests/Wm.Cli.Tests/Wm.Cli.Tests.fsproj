@@ -10,6 +10,7 @@
     <Compile Include="GoldenMasterTests.fs" />
     <Compile Include="SimulateTests.fs" />
     <Compile Include="CalibrateTests.fs" />
+    <Compile Include="ClassifyTests.fs" />
   </ItemGroup>
 
   <ItemGroup>

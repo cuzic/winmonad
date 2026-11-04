@@ -24,6 +24,11 @@
 /// の出力をgoldenへ行diffする案で作ったが、実際に試して「形式が違う上に最終収束状態は遅延量に
 /// 関わらずほぼ同じになる」ため意味のある順位付けにならないと判明し（`Replay.fs`の`calibrate`
 /// 直前のコメント参照）、実測tickの数値比較へ置き換えた。
+///
+/// `classify`（v2.111で追加）：`calibrate`が担う「数値（ms）をどれだけ正確に当てるか」とは別腹に、
+/// 「要求とどう違う結末になったか」という離散的な振る舞いの型をまず見つける（ユーザーとの合意：
+/// 実機で見つかった本当のバグは`calibrate`導入時も含め一貫して数値精度ではなく質的な欠落だった
+/// ため、カテゴリ発見の方が`WindowBehavior`に無い振る舞いを見つける力が強い、§12.3）。
 module Wm.Cli.Program
 
 open System
@@ -98,6 +103,30 @@ let private calibrate (journalPath: string) : int =
             printfn "  %A: measured latency=%dms -> best-fit candidate=%A" w measuredMs bestFit
         0
 
+let private describeOutcome (outcome: Wm.Cli.Replay.SetRectOutcome) : string =
+    match outcome with
+    | Wm.Cli.Replay.ResolvedExactly latencyMs -> sprintf "ResolvedExactly (latency=%dms) -- matches Immediate/DelayedByMs" latencyMs
+    | Wm.Cli.Replay.WidthFlooredLike (requested, observed) ->
+        sprintf "WidthFlooredLike (requested width=%d, observed width=%d) -- candidate: MinimumWidth %d" requested observed observed
+    | Wm.Cli.Replay.RelocatedElsewhereLike (requested, observed) ->
+        sprintf "RelocatedElsewhereLike (requested=%A, observed=%A) -- candidate: SelfRepositionAfterMs" requested observed
+    | Wm.Cli.Replay.DisappearedLike -> "DisappearedLike -- candidate: DisappearOnMove"
+    | Wm.Cli.Replay.HungLike -> "HungLike -- candidate: HungAfterMs"
+    | Wm.Cli.Replay.Unknown -> "Unknown -- no response and not yet confirmed Hung (insufficient evidence)"
+
+let private classify (journalPath: string) : int =
+    let entries = loadEntries journalPath
+    let outcomes = Wm.Cli.Replay.classifySetRectOutcomes entries
+    match outcomes with
+    | [] ->
+        printfn "No SetRect was dispatched in %s." journalPath
+        1
+    | _ ->
+        printfn "Behavior-category classification from %s (%d window(s) with a dispatched SetRect):" journalPath outcomes.Length
+        for (w, outcome) in outcomes do
+            printfn "  %A: %s" w (describeOutcome outcome)
+        0
+
 let private usage () =
     eprintfn "Usage:"
     eprintfn "  wm-cli explain <journal-file.ndjson>"
@@ -117,6 +146,11 @@ let private usage () =
     eprintfn "      Measures, per window, how many ms really elapsed between Core dispatching a SetRect"
     eprintfn "      and a matching WindowObserved arriving, then reports the candidate WindowBehavior"
     eprintfn "      (Immediate/DelayedByMs) whose delay is numerically closest to that measured latency."
+    eprintfn "  wm-cli classify <journal-file.ndjson>"
+    eprintfn "      Classifies, per window, what actually happened to the last dispatched SetRect into"
+    eprintfn "      a discrete behavior category (resolved exactly / width floored / relocated elsewhere /"
+    eprintfn "      disappeared / hung / unknown) -- discovering which WindowBehavior shape an app needs,"
+    eprintfn "      rather than fitting a numeric delay (see 'calibrate' for that)."
     1
 
 let private requireFile (label: string) (path: string) : bool =
@@ -136,5 +170,6 @@ let main argv =
     | [| "simulate"; journalPath; goldenPath |] ->
         if requireFile "journal" journalPath && requireFile "golden" goldenPath then simulate journalPath (Some goldenPath) else 1
     | [| "calibrate"; journalPath |] -> if requireFile "journal" journalPath then calibrate journalPath else 1
+    | [| "classify"; journalPath |] -> if requireFile "journal" journalPath then classify journalPath else 1
     | [| path |] -> if requireFile "journal" path then explain path else 1 // 後方互換：v2.105時点の既定動作
     | _ -> usage ()
