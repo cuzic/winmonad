@@ -46,6 +46,25 @@
 // rect before settling; S24/S25 check WinEvent arrival order around a
 // (safely posted, not real-drag) move/size cycle and a minimize, to
 // ground the deferred user-drag/minimized-window Mismatch exclusions.
+// S26/S27 ground an Opus adversarial-consult round on the invisible-resize-
+// border self-healing design (/tmp/opus-review-frameinset-selfheal.md,
+// architecture.md 21章): that review's point 3 argues the real risk is NOT
+// "FrameInset is wrong" but "FrameInset is unknown at the very first SetRect
+// a newly-opened or maximized-launch window ever receives" (EVENT_OBJECT_
+// CREATE fires before the window is shown, so GetWindowRect=DWM bounds and
+// the crude-range/zero-delta guards in reviseFrameInset correctly refuse to
+// adopt it; EVENT_OBJECT_SHOW carries no rect at all). S26 measures, for a
+// freshly created window, the GetWindowRect/DWMWA_EXTENDED_FRAME_BOUNDS pair
+// and whether LOCATIONCHANGE fires at each of: handle-creation (not yet
+// shown), Show(), and the first SetWindowPos a Tiled placement would issue --
+// this decides which of the review's two branches (3-3) is real on actual
+// Windows: does the first post-SetWindowPos observation already show a
+// nonzero inset ("Mismatch, fixable by the deadline-time self-heal alone"),
+// or does it still read inset=0 ("fake Satisfied", needing the after-the-
+// fact path + delayed reprobe too)? S27 repeats the same measurement for the
+// maximized-launch case (ShowMaximized -> SW_RESTORE -> first SetWindowPos),
+// since RestoreBeforeMove's restore and the first Tiled SetRect can race the
+// same way.
 // The *r-suffixed spikes (S4r/S5r/S7r/S11r) are real-desktop-
 // only: they need a genuine interactive desktop (an existing third-party
 // foreground window, a modern UWP shell, an already-running elevated
@@ -2182,6 +2201,194 @@ let spikeS25_MinimizeEventOrder () =
             UnhookWinEvent(hookMinimize) |> ignore
             UnhookWinEvent(hookLocation) |> ignore
 
+// S26 (frameinset-selfheal §3-3): for a freshly created window, measure
+// GetWindowRect vs DWMWA_EXTENDED_FRAME_BOUNDS and whether LOCATIONCHANGE
+// fires at (a) handle creation before Show(), (b) immediately after Show(),
+// (c) immediately after the first SetWindowPos a Tiled placement would
+// issue, and (d) after a short settle delay. The decisive question is at
+// (c): does the DWM frame already show the nonzero inset S1/S21 measured
+// (7,0,7,7) for this same window type), or does it still read inset=0
+// (same as GetWindowRect) because DWM has not yet composited a frame for
+// this window?
+let spikeS26_NewWindowInsetTiming () =
+    let DWMWA_EXTENDED_FRAME_BOUNDS = 9
+    let EVENT_OBJECT_LOCATIONCHANGE = 0x800Bu
+    let WINEVENT_OUTOFCONTEXT = 0x0000u
+    let OBJID_WINDOW = 0
+    let SWP_NOZORDER = 0x0004u
+    let SWP_ASYNCWINDOWPOS = 0x4000u
+
+    let readDwmFrame (hwnd: IntPtr) : RECT option =
+        let mutable r = RECT()
+        let hr = DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &r, Marshal.SizeOf(typeof<RECT>))
+        if hr = 0 then Some r else None
+
+    let readWindowRect (hwnd: IntPtr) : RECT option =
+        let mutable r = RECT()
+        if GetWindowRect(hwnd, &r) then Some r else None
+
+    let reportInsetAt (label: string) (hwnd: IntPtr) =
+        match readWindowRect hwnd, readDwmFrame hwnd with
+        | Some wr, Some dwm ->
+            let insetL, insetT, insetR, insetB = dwm.Left - wr.Left, dwm.Top - wr.Top, wr.Right - dwm.Right, wr.Bottom - dwm.Bottom
+            log (
+                sprintf
+                    "- %s: GetWindowRect=(%d,%d,%d,%d) DWM-bounds=(%d,%d,%d,%d) inset(L,T,R,B)=(%d,%d,%d,%d)"
+                    label wr.Left wr.Top wr.Right wr.Bottom dwm.Left dwm.Top dwm.Right dwm.Bottom insetL insetT insetR insetB
+            )
+        | wr, dwm -> log (sprintf "- %s: GetWindowRect=%b DwmGetWindowAttribute=%b (one or both unavailable at this point)" label wr.IsSome dwm.IsSome)
+
+    let events = ResizeArray<int64 * string>()
+    let sw = Stopwatch()
+    let mutable targetHwnd = IntPtr.Zero
+    let callback =
+        WinEventProc(fun _hWinEventHook eventType hwnd idObject _idChild _idEventThread _dwmsEventTime ->
+            if eventType = EVENT_OBJECT_LOCATIONCHANGE && hwnd = targetHwnd && idObject = OBJID_WINDOW then
+                events.Add(sw.ElapsedMilliseconds, "LOCATIONCHANGE"))
+
+    let hook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, IntPtr.Zero, callback, 0u, 0u, WINEVENT_OUTOFCONTEXT)
+    if hook = IntPtr.Zero then
+        log (sprintf "- SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE) failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+    else
+        try
+            use form = new Form(Text = "S26", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(150, 150, 400, 300))
+            // .Handle forces CreateWindowEx without WS_VISIBLE -- this is the closest a self-
+            // owned WinForms Form gets to observing the real EVENT_OBJECT_CREATE moment, since
+            // .NET does not expose a "hooked before Show" construction step otherwise.
+            let hwnd = form.Handle
+            targetHwnd <- hwnd
+            sw.Restart()
+            reportInsetAt "(a) handle created, before Show()" hwnd
+
+            events.Clear()
+            form.Show()
+            pump 5
+            reportInsetAt "(b) immediately after Show()" hwnd
+            log (
+                sprintf
+                    "  LOCATIONCHANGE between (a) and (b): %s"
+                    (if events.Count = 0 then "none" else events |> Seq.map (fun (t, n) -> sprintf "(%dms,%s)" t n) |> String.concat " ")
+            )
+
+            events.Clear()
+            let tx, ty, tw, th = 100, 100, 500, 350
+            let apiOk = SetWindowPos(hwnd, IntPtr.Zero, tx, ty, tw, th, SWP_NOZORDER ||| SWP_ASYNCWINDOWPOS)
+            pump 5
+            reportInsetAt (sprintf "(c) immediately after first SetWindowPos(ASYNC)->(%d,%d,%d,%d) (API returned=%b)" tx ty tw th apiOk) hwnd
+            log (
+                sprintf
+                    "  LOCATIONCHANGE between (b) and (c): %s"
+                    (if events.Count = 0 then "none" else events |> Seq.map (fun (t, n) -> sprintf "(%dms,%s)" t n) |> String.concat " ")
+            )
+
+            events.Clear()
+            let deadline = 500L
+            let settleSw = Stopwatch.StartNew()
+            while settleSw.ElapsedMilliseconds < deadline do
+                Application.DoEvents()
+                Thread.Sleep(1)
+            reportInsetAt (sprintf "(d) %dms after (c)" deadline) hwnd
+            log (
+                sprintf
+                    "  LOCATIONCHANGE between (c) and (d): %s"
+                    (if events.Count = 0 then "none" else events |> Seq.map (fun (t, n) -> sprintf "(%dms,%s)" t n) |> String.concat " ")
+            )
+        finally
+            UnhookWinEvent(hook) |> ignore
+
+// S27 (frameinset-selfheal §3-3): same measurement as S26, but for a window
+// that launches maximized and is then restored before its first Tiled
+// SetRect -- the RestoreBeforeMove sequence (architecture.md 7.1). Checks
+// whether the inset is already known (nonzero DWM-vs-GetWindowRect delta)
+// by the time the first post-restore SetWindowPos lands, or whether that
+// first dispatch also races DWM's compositing of the restored frame.
+let spikeS27_MaximizedLaunchInsetTiming () =
+    let DWMWA_EXTENDED_FRAME_BOUNDS = 9
+    let EVENT_OBJECT_LOCATIONCHANGE = 0x800Bu
+    let WINEVENT_OUTOFCONTEXT = 0x0000u
+    let OBJID_WINDOW = 0
+    let SW_RESTORE = 9
+    let SWP_NOZORDER = 0x0004u
+    let SWP_ASYNCWINDOWPOS = 0x4000u
+
+    let readDwmFrame (hwnd: IntPtr) : RECT option =
+        let mutable r = RECT()
+        let hr = DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &r, Marshal.SizeOf(typeof<RECT>))
+        if hr = 0 then Some r else None
+
+    let readWindowRect (hwnd: IntPtr) : RECT option =
+        let mutable r = RECT()
+        if GetWindowRect(hwnd, &r) then Some r else None
+
+    let reportInsetAt (label: string) (hwnd: IntPtr) =
+        match readWindowRect hwnd, readDwmFrame hwnd with
+        | Some wr, Some dwm ->
+            let insetL, insetT, insetR, insetB = dwm.Left - wr.Left, dwm.Top - wr.Top, wr.Right - dwm.Right, wr.Bottom - dwm.Bottom
+            log (
+                sprintf
+                    "- %s: IsZoomed=%b GetWindowRect=(%d,%d,%d,%d) DWM-bounds=(%d,%d,%d,%d) inset(L,T,R,B)=(%d,%d,%d,%d)"
+                    label (IsZoomed hwnd) wr.Left wr.Top wr.Right wr.Bottom dwm.Left dwm.Top dwm.Right dwm.Bottom insetL insetT insetR insetB
+            )
+        | wr, dwm -> log (sprintf "- %s: GetWindowRect=%b DwmGetWindowAttribute=%b" label wr.IsSome dwm.IsSome)
+
+    let events = ResizeArray<int64 * string>()
+    let sw = Stopwatch()
+    let mutable targetHwnd = IntPtr.Zero
+    let callback =
+        WinEventProc(fun _hWinEventHook eventType hwnd idObject _idChild _idEventThread _dwmsEventTime ->
+            if eventType = EVENT_OBJECT_LOCATIONCHANGE && hwnd = targetHwnd && idObject = OBJID_WINDOW then
+                events.Add(sw.ElapsedMilliseconds, "LOCATIONCHANGE"))
+
+    let hook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, IntPtr.Zero, callback, 0u, 0u, WINEVENT_OUTOFCONTEXT)
+    if hook = IntPtr.Zero then
+        log (sprintf "- SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE) failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+    else
+        try
+            use form = new Form(Text = "S27", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(150, 150, 400, 300))
+            form.Show()
+            pump 5
+            form.WindowState <- FormWindowState.Maximized
+            pump 5
+            targetHwnd <- form.Handle
+            sw.Restart()
+            reportInsetAt "(a) launched maximized" form.Handle
+
+            events.Clear()
+            ShowWindow(form.Handle, SW_RESTORE) |> ignore
+            pump 5
+            reportInsetAt "(b) immediately after ShowWindow(SW_RESTORE)" form.Handle
+            log (
+                sprintf
+                    "  LOCATIONCHANGE between (a) and (b): %s"
+                    (if events.Count = 0 then "none" else events |> Seq.map (fun (t, n) -> sprintf "(%dms,%s)" t n) |> String.concat " ")
+            )
+
+            events.Clear()
+            let tx, ty, tw, th = 100, 100, 500, 350
+            let apiOk = SetWindowPos(form.Handle, IntPtr.Zero, tx, ty, tw, th, SWP_NOZORDER ||| SWP_ASYNCWINDOWPOS)
+            pump 5
+            reportInsetAt (sprintf "(c) immediately after first post-restore SetWindowPos(ASYNC)->(%d,%d,%d,%d) (API returned=%b)" tx ty tw th apiOk) form.Handle
+            log (
+                sprintf
+                    "  LOCATIONCHANGE between (b) and (c): %s"
+                    (if events.Count = 0 then "none" else events |> Seq.map (fun (t, n) -> sprintf "(%dms,%s)" t n) |> String.concat " ")
+            )
+
+            events.Clear()
+            let deadline = 500L
+            let settleSw = Stopwatch.StartNew()
+            while settleSw.ElapsedMilliseconds < deadline do
+                Application.DoEvents()
+                Thread.Sleep(1)
+            reportInsetAt (sprintf "(d) %dms after (c)" deadline) form.Handle
+            log (
+                sprintf
+                    "  LOCATIONCHANGE between (c) and (d): %s"
+                    (if events.Count = 0 then "none" else events |> Seq.map (fun (t, n) -> sprintf "(%dms,%s)" t n) |> String.concat " ")
+            )
+        finally
+            UnhookWinEvent(hook) |> ignore
+
 [<STAThread>]
 [<EntryPoint>]
 let main argv =
@@ -2249,6 +2456,8 @@ let main argv =
         tryRun "S23 最小幅での丸めに未丸め矩形の中間観測が出るか(M2)" spikeS23_MinWidthRoundingObservation
         tryRun "S24 MOVESIZESTART/LOCATIONCHANGE/MOVESIZEENDの到着順(M6)" spikeS24_MoveSizeEventOrder
         tryRun "S25 最小化時のMINIMIZESTART/LOCATIONCHANGEの到着順(M7)" spikeS25_MinimizeEventOrder
+        tryRun "S26 新規窓の最初のSetRect時点でFrameInsetが既知か(frameinset-selfheal§3-3)" spikeS26_NewWindowInsetTiming
+        tryRun "S27 最大化起動窓のRestoreBeforeMove直後にFrameInsetが既知か(frameinset-selfheal§3-3)" spikeS27_MaximizedLaunchInsetTiming
 
         log "\n(all spikes finished without the watchdog firing)"
         0
