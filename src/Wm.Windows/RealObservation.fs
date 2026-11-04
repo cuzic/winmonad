@@ -62,6 +62,71 @@ let enumerateMonitors (monitorHandles: IntPtr list) : MonitorSnapshot list =
 let private monitorIdOf (monitorHandles: IntPtr list) (hMonitor: IntPtr) : MonitorId option =
     monitorHandles |> List.tryFindIndex (fun h -> h = hMonitor) |> Option.map (fun i -> MonitorId (int64 i))
 
+let private queryNativeRect (hWnd: IntPtr) : Result<PixelRect, NativeCallRecord> =
+    let mutable r = RECT()
+    match callBoolRead "GetWindowRect" (fun () -> GetWindowRect(hWnd, &r)) with
+    | Ok () -> Ok (rectOf r)
+    | Error e -> Error e
+
+let private queryVisibleFrameRect (hWnd: IntPtr) : Result<PixelRect, NativeCallRecord> =
+    let mutable r = RECT()
+    let hr = DwmGetWindowAttribute(hWnd, DWMWA_EXTENDED_FRAME_BOUNDS, &r, Marshal.SizeOf(typeof<RECT>))
+    if hr = 0 (* S_OK *) then Ok (rectOf r)
+    else Error { Api = "DwmGetWindowAttribute"; Space = HResult; Code = hr; ElapsedUs = 1L }
+
+/// `Ok true`/`Ok false`のResultで返す（`callBoolRead`はBOOLの成否自体しか運ばないため）。
+let queryVisible (hWnd: IntPtr) : Result<bool, NativeCallRecord> =
+    callBoolRead "IsWindowVisible" (fun () -> IsWindowVisible(hWnd)) |> Result.map (fun () -> true)
+
+let queryMinimized (hWnd: IntPtr) : Result<bool, NativeCallRecord> =
+    callBoolRead "IsIconic" (fun () -> IsIconic(hWnd)) |> Result.map (fun () -> true)
+
+let private queryMaximized (hWnd: IntPtr) : Result<bool, NativeCallRecord> =
+    callBoolRead "IsZoomed" (fun () -> IsZoomed(hWnd)) |> Result.map (fun () -> true)
+
+let queryCloak (hWnd: IntPtr) : Result<CloakState, NativeCallRecord> =
+    let mutable cloakVal = 0
+    let hr = DwmGetWindowAttributeInt(hWnd, DWMWA_CLOAKED, &cloakVal, 4)
+    if hr = 0 (* S_OK *) then
+        Ok { App = (cloakVal &&& 1) <> 0; Shell = (cloakVal &&& 2) <> 0; Inherited = (cloakVal &&& 4) <> 0 }
+    else
+        Error { Api = "DwmGetWindowAttribute"; Space = HResult; Code = hr; ElapsedUs = 1L }
+
+let queryMonitor (monitorHandles: IntPtr list) (hWnd: IntPtr) : Result<MonitorId, NativeCallRecord> =
+    let hMonitor = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST)
+    match monitorIdOf monitorHandles hMonitor with
+    | Some mid -> Ok mid
+    | None -> Error { Api = "MonitorFromWindow"; Space = BoolFalseNoCode; Code = 0; ElapsedUs = 1L }
+
+/// 1件のHWNDについて、ラウンド1が問い合わせる属性一式(`IsVisible`/`NativeRect`/`VisibleFrameRect`/
+/// `IsMinimized`/`IsMaximized`/`Cloak`/`Monitor`)を全て問い合わせ、`WindowSnapshot`を組み立てる。
+/// `enumerateTopLevelWindows`（全体列挙）と、ラウンド2の`EVENT_OBJECT_CREATE`時の`RawFirstSeen`の
+/// 両方がこの同じ関数を使う。`monitorHandles`は`enumerateMonitorHandles`の結果をそのまま渡す。
+let observeWindow (now: int64) (monitorHandles: IntPtr list) (hWnd: IntPtr) : WindowSnapshot =
+    let w = WindowId (hWnd.ToInt64())
+    { Id = w
+      Process = None
+      AppIdentity = { Exe = None; HostExe = None; Aumid = None; CoreWindowExe = None }
+      Owner = None
+      IsDialog = None
+      NativeRect = Some (obs now (queryNativeRect hWnd))
+      VisibleFrameRect = Some (obs now (queryVisibleFrameRect hWnd))
+      IsVisible = Some (obs now (queryVisible hWnd))
+      IsMinimized = Some (obs now (queryMinimized hWnd))
+      IsMaximized = Some (obs now (queryMaximized hWnd))
+      Cloak = Some (obs now (queryCloak hWnd))
+      Monitor = Some (obs now (queryMonitor monitorHandles hWnd))
+      MinWidthHint = None
+      TargetIntegrity = None
+      Responsiveness = None
+      Presence = None
+      DpiAwareness = None
+      TitleMatches = None }
+
+/// `Observation<'T>`を1件だけ組み立てる薄いヘルパー（ラウンド2の個別イベント再問合せ用、
+/// `RawVisibility`/`RawMinimized`/`RawCloak`が運ぶ値を直接作れる）。
+let observation (now: int64) (value: Result<'T, NativeCallRecord>) : Observation<'T> = obs now value
+
 /// `EnumWindows`で見つかった全トップレベルHWNDを`WindowSnapshot`へ変換する。
 /// `WindowId`はHWNDの値そのもの（この1回の実行内でだけ意味を持つ、再起動後は不変ではない）。
 /// `monitorHandles`は`enumerateMonitorHandles`の結果をそのまま渡す（`enumerateMonitors`が割り当てた
@@ -70,57 +135,4 @@ let enumerateTopLevelWindows (now: int64) (monitorHandles: IntPtr list) : Window
     let hwnds = ResizeArray<IntPtr>()
     let cb = EnumChildProc(fun hWnd _ -> hwnds.Add(hWnd) |> ignore; true)
     EnumWindows(cb, IntPtr.Zero) |> ignore
-
-    hwnds
-    |> Seq.map (fun hWnd ->
-        let w = WindowId (hWnd.ToInt64())
-
-        let isVisible = callBoolRead "IsWindowVisible" (fun () -> IsWindowVisible(hWnd)) |> Result.map (fun () -> true)
-        let isMinimized = callBoolRead "IsIconic" (fun () -> IsIconic(hWnd)) |> Result.map (fun () -> true)
-        let isMaximized = callBoolRead "IsZoomed" (fun () -> IsZoomed(hWnd)) |> Result.map (fun () -> true)
-
-        let nativeRect =
-            let mutable r = RECT()
-            match callBoolRead "GetWindowRect" (fun () -> GetWindowRect(hWnd, &r)) with
-            | Ok () -> Ok (rectOf r)
-            | Error e -> Error e
-
-        let visibleFrameRect =
-            let mutable r = RECT()
-            let hr = DwmGetWindowAttribute(hWnd, DWMWA_EXTENDED_FRAME_BOUNDS, &r, Marshal.SizeOf(typeof<RECT>))
-            if hr = 0 (* S_OK *) then Ok (rectOf r)
-            else Error { Api = "DwmGetWindowAttribute"; Space = HResult; Code = hr; ElapsedUs = 1L }
-
-        let cloak =
-            let mutable cloakVal = 0
-            let hr = DwmGetWindowAttributeInt(hWnd, DWMWA_CLOAKED, &cloakVal, 4)
-            if hr = 0 (* S_OK *) then
-                Ok { App = (cloakVal &&& 1) <> 0; Shell = (cloakVal &&& 2) <> 0; Inherited = (cloakVal &&& 4) <> 0 }
-            else
-                Error { Api = "DwmGetWindowAttribute"; Space = HResult; Code = hr; ElapsedUs = 1L }
-
-        let monitor =
-            let hMonitor = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST)
-            match monitorIdOf monitorHandles hMonitor with
-            | Some mid -> Ok mid
-            | None -> Error { Api = "MonitorFromWindow"; Space = BoolFalseNoCode; Code = 0; ElapsedUs = 1L }
-
-        { Id = w
-          Process = None
-          AppIdentity = { Exe = None; HostExe = None; Aumid = None; CoreWindowExe = None }
-          Owner = None
-          IsDialog = None
-          NativeRect = Some (obs now nativeRect)
-          VisibleFrameRect = Some (obs now visibleFrameRect)
-          IsVisible = Some (obs now isVisible)
-          IsMinimized = Some (obs now isMinimized)
-          IsMaximized = Some (obs now isMaximized)
-          Cloak = Some (obs now cloak)
-          Monitor = Some (obs now monitor)
-          MinWidthHint = None
-          TargetIntegrity = None
-          Responsiveness = None
-          Presence = None
-          DpiAwareness = None
-          TitleMatches = None })
-    |> List.ofSeq
+    hwnds |> Seq.map (observeWindow now monitorHandles) |> List.ofSeq

@@ -7,6 +7,10 @@
     <OutputType>Exe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Phase B ラウンド2：Application.DoEvents()によるメッセージポンプ（SetWinEventHookの配送に必要、
+         spikes/Phase0CiSpikes/Program.fsのS20/S20b等と同じ確立済みの方式）と、実機CI検証用の
+         使い捨てテスト窓(Form)の生成に使う。 -->
+    <UseWindowsForms>true</UseWindowsForms>
   </PropertyGroup>
 
   <ItemGroup>
