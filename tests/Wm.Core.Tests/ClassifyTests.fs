@@ -40,6 +40,16 @@ let ``ERROR_ACCESS_DENIED(5)はApi/Spaceを問わずDenied OtherDenialになる(
     Assert.Equal(Denied OtherDenial, classify (rec' "SetWindowPos" Win32LastError 5 0L))
     Assert.Equal(Denied OtherDenial, classify (rec' "SetForegroundWindow" Win32LastError 5 999L))
 
+/// v2.94（Phase B ラウンド3）：`SetForegroundWindow`は`SetLastError`を立てないため失敗時は
+/// `BoolFalseNoCode`/`Code=0`で運ばれる（`callBoolNoCode`）。Apiをワイルドカードにすると
+/// `ShowWindowAsync`（同じ`BoolFalseNoCode`/`Code=0`の形だが「前は可視だったか」を返すだけで
+/// 失敗シグナルではない）まで誤って`Denied`に分類してしまうため、`SetForegroundWindow`だけに
+/// 絞っていることを確認する。
+[<Fact>]
+let ``SetForegroundWindow+BoolFalseNoCode+0はDenied ForegroundDenialになるが、ShowWindowAsyncは対象外(8.1対応表、v2.94)`` () =
+    Assert.Equal(Denied ForegroundDenied, classify (rec' "SetForegroundWindow" BoolFalseNoCode 0 0L))
+    Assert.Equal(Unclassified, classify (rec' "ShowWindowAsync" BoolFalseNoCode 0 0L))
+
 [<Fact>]
 let ``対応表に無い組合せはUnclassifiedになる(8.1対応表)`` () =
     Assert.Equal(Unclassified, classify (rec' "SomeOtherApi" HResult 42 0L))

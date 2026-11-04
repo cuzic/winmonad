@@ -14,6 +14,7 @@
     <Compile Include="Native.fs" />
     <Compile Include="RealObservation.fs" />
     <Compile Include="EventHooks.fs" />
+    <Compile Include="EffectDispatch.fs" />
   </ItemGroup>
 
   <ItemGroup>

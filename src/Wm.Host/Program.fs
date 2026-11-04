@@ -1,4 +1,4 @@
-/// architecture.md §17：Wm.Host、Phase B ラウンド1+2の実行入口。
+/// architecture.md §17：Wm.Host、Phase B ラウンド1+2+3の実行入口。
 ///
 /// ラウンド1：実際のWin32(`Wm.Windows`)から1回だけ観測を取り、`Wm.Normalization`→
 /// `Wm.Runtime.Reducer`へ通して分類結果を報告する。
@@ -7,25 +7,38 @@
 /// 使い捨てのテスト窓(`Form`)をこのプロセス自身がWinForms APIで直接操作して確定的なイベント系列
 /// （Show→Minimize→Restore→Hide→Close）を発生させ、パイプが正しく追従することを検証する。
 ///
-/// どちらのラウンドも読み取りだけで、`SetRect`/`RequestForeground`等のEffectは一切実際のOSへ
-/// 発行しない（計画の「このラウンドで対象外にしたこと」参照）。`StepResult.Effects`はこの投入で
-/// 実際に発生した値をそのまま記録し、表示するだけに留める（同じ観測の再投入は一切しない——
-/// 状態が壊れるため、ラウンド1の時点でこれは一度実際に踏んで修正済みの誤り）。テスト窓はProgram.fs
-/// 自身がWinForms APIで直接操作するだけで、`GatedEffect`/Reducerの発行経路を一切経由しない
-/// （Coreはこの窓を一切「管理」しない）。
+/// ラウンド1/2はどちらも読み取りだけで、`SetRect`/`RequestForeground`等のEffectは一切実際のOSへ
+/// 発行しない。`StepResult.Effects`はこの投入で実際に発生した値をそのまま記録し、表示するだけに
+/// 留める（同じ観測の再投入は一切しない——状態が壊れるため、ラウンド1の時点でこれは一度実際に
+/// 踏んで修正済みの誤り）。テスト窓はProgram.fs自身がWinForms APIで直接操作するだけで、
+/// `GatedEffect`/Reducerの発行経路を一切経由しない（Coreはこの窓を一切「管理」しない）。
+///
+/// ラウンド3：実際にEffectをOSへ発行する最初のラウンド。ラウンド1/2が観測する実アンビエント窓
+/// （CI実機で69〜75個、`AppIdentity`/`TitleMatches`が未配線のため`PolicyIR.defaults`の
+/// `DefaultManagement = Tiled`で全てTiled判定される）を実際に動かすと実機上の無関係な窓まで
+/// 動かしてしまうため、ラウンド3は意図的に**隔離された別の`Reducer`と、自分で作った使い捨ての
+/// テスト窓だけ**を対象にする（計画の「重要なスコープ決定」参照、spikes/Phase0CiSpikes/
+/// Program.fsのS2/S2c/S4が実際にSetWindowPos/SetForegroundWindowを呼ぶときも常に自分で
+/// 作ったForm/子プロセスだけが対象という既存の方針と同じ）。architecture.md §7.1/ADR-012の
+/// 「Effect適用はWinEventコールバックや安全停止の制御経路と同じスレッドで行わない」という
+/// 明文の要求に従い、専用のEffect適用スレッドを新設する——メインスレッド(`Application.DoEvents()`
+/// を回す側)はEffectをキューへ積むだけで、実際のOS呼出は専用スレッドが行う。
 module Wm.Host.Program
 
 open System
+open System.Collections.Concurrent
 open System.Diagnostics
 open System.IO
 open System.Threading
 open System.Windows.Forms
 open Wm.Contracts.Identifiers
+open Wm.Contracts.ErrorTypes
 open Wm.Contracts.CoreCommand
 open Wm.Contracts.GatedEffect
 open Wm.Core.WmState
 open Wm.Runtime.Reducer
 open Wm.Normalization.WindowEventNormalizer
+open Wm.Windows.Native
 open Wm.Windows.RealObservation
 open Wm.Windows.EventHooks
 
@@ -158,6 +171,99 @@ let main _argv =
 
     // 段5：ラウンド2後の最終報告。
     printClassification "after round 2 live phase" reducer
+
+    // 段6：ラウンド3。隔離された別のReducer・自分で作ったテスト窓だけを対象に、実際にEffectを
+    // OSへ発行する（型直前のコメント参照）。
+    printfn "\n--- Round 3: real Effect dispatch against an isolated test window ---"
+    let reducer3 = Reducer(RuntimePolicy.defaults, "phase-b-round3", "wm-host-round3", "no-policy-artifact", None)
+    let effectQueue = ConcurrentQueue<GatedEffect>()
+    let resultQueue = ConcurrentQueue<RequestId * Result<unit, NativeCallRecord>>()
+    let mutable keepDispatching = true
+    let mutable dispatchedCount = 0
+    let mutable skippedCount = 0
+
+    // §7.1/ADR-012「Effect適用は専用スレッドで行う」：ここだけが実際のOS変更APIを呼ぶ。
+    let effectApplyThread =
+        Thread(fun () ->
+            while keepDispatching do
+                match effectQueue.TryDequeue() with
+                | true, gated ->
+                    let effect = GatedEffect.effect gated
+                    match Wm.Windows.EffectDispatch.apply effect with
+                    | Some result ->
+                        let ridOpt =
+                            match effect with
+                            | SetRect (rid, _, _) -> Some rid
+                            | RequestForeground (rid, _) -> Some rid
+                            | RestoreBeforeMove (rid, _) -> Some rid
+                            | _ -> None
+                        match ridOpt with
+                        | Some rid ->
+                            Interlocked.Increment(&dispatchedCount) |> ignore
+                            resultQueue.Enqueue(rid, result)
+                        | None -> ()
+                    | None -> Interlocked.Increment(&skippedCount) |> ignore
+                | false, _ -> Thread.Sleep(1))
+    effectApplyThread.IsBackground <- true
+    effectApplyThread.Name <- "wm-effect-apply"
+    effectApplyThread.Start()
+
+    let enqueueEffects (effects: GatedEffect list) = for g in effects do effectQueue.Enqueue(g)
+
+    let submit3 (now: int64) (source: string) (input: InputEvent) =
+        let sr = reducer3.Submit now source input
+        enqueueEffects sr.Effects
+        sr
+
+    let advance3 () =
+        match reducer3.AdvanceToNextTimer() with
+        | Some sr -> enqueueEffects sr.Effects; true
+        | None -> false
+
+    let drainResults3 (now: int64) =
+        let mutable more = true
+        while more do
+            match resultQueue.TryDequeue() with
+            | true, (rid, result) -> submit3 now "wm-host-effect-thread" (EffectCallReturned (rid, result, None)) |> ignore
+            | false, _ -> more <- false
+
+    let pump3 (ms: int) =
+        let deadline = liveNow () + int64 ms
+        while liveNow () < deadline do
+            Application.DoEvents()
+            drainResults3 (liveNow ())
+            while advance3 () do ()
+            Thread.Sleep(1)
+
+    use testForm3 = new Form(Text = "wm-host-round3-test-window", Width = 300, Height = 200)
+    testForm3.Show()
+    pump3 300
+
+    submit3 (liveNow ()) "wm-host" (MonitorTopologyObserved monitors) |> ignore
+    pump3 500
+
+    let testHWnd = testForm3.Handle
+    let testWindowId = WindowId (testHWnd.ToInt64())
+    submit3 (liveNow ()) "wm-host" (RawFirstSeen (observeWindow (liveNow ()) monitorHandles testHWnd) |> normalize |> List.exactlyOne) |> ignore
+    pump3 1500 // 分類・Reconcile・実際のSetWindowPos・結果の折り返しに十分な余裕を取る
+
+    keepDispatching <- false
+    effectApplyThread.Join(2000) |> ignore
+
+    // Coreとは無関係に、実際にOSが報告する最終状態を直接問い合わせて確認する
+    // （計画の「Pending→Satisfiedループはこのラウンドでは閉じない」参照）。
+    let mutable finalRect = RECT()
+    let gotFinalRect = GetWindowRect(testHWnd, &finalRect)
+    printfn "\nRound 3 dispatch summary: dispatched=%d skipped(no handler)=%d" dispatchedCount skippedCount
+    printfn "Test window's real on-screen rect after dispatch (queried directly, bypassing Core): found=%b rect=%A"
+        gotFinalRect
+        { X = finalRect.Left; Y = finalRect.Top; Width = finalRect.Right - finalRect.Left; Height = finalRect.Bottom - finalRect.Top }
+    match Map.tryFind testWindowId reducer3.State.Windows.Records with
+    | Some record -> printfn "Core's classification for the test window: %A" record.Classification
+    | None -> printfn "Core's classification for the test window: (not found in Windows.Records)"
+    printfn "Core's remaining Pending requests: %d" (Map.count reducer3.State.Placement.Pending)
+
+    testForm3.Close()
 
     printfn "\nDone."
     0

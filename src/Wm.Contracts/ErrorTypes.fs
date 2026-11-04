@@ -40,6 +40,13 @@ let classify (record: NativeCallRecord) : EffectFailure =
         if record.ElapsedUs <= 0L then TargetHung else Transient
     | _, Win32LastError, 1400 (* ERROR_INVALID_WINDOW_HANDLE *) -> TargetGone
     | _, Win32LastError, 5 (* ERROR_ACCESS_DENIED *) -> Denied OtherDenial
+    // v2.94で追加（Phase B ラウンド3）：architecture.md §8.1の対応表。`SetForegroundWindow`は
+    // `SetLastError`を立てないため失敗時は`BoolFalseNoCode`/`Code=0`で運ばれる（`callBoolNoCode`、
+    // Native.fsの型直前のコメント参照）——Apiをワイルドカードにすると`ShowWindowAsync`（同じ
+    // `BoolFalseNoCode`/`Code=0`の形だが「前は可視だったか」を返すだけで失敗シグナルではない、
+    // `RestoreBeforeMove`の型直前のコメント参照）の戻り値を誤って`Denied`に分類してしまうため、
+    // `SetForegroundWindow`だけに絞る。
+    | "SetForegroundWindow", BoolFalseNoCode, 0 -> Denied ForegroundDenied
     | _ -> Unclassified
 
 /// Shell/Simulationが共有する純粋な手順（§7.1「事前確認→ASYNC呼出」）。
