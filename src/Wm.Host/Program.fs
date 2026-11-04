@@ -53,6 +53,12 @@
 /// ラウンド10：§8.4「窓を破壊・終了するEffectを提供しない」の唯一の例外`RequestClose`
 /// （`WM_CLOSE`による丁寧な要求）を実際に発行する。`SetPresence`のような§21の未決の設計判断
 /// （ワークスペースの非表示方式）に依存しないため、他のEffectより先に実装できた。
+///
+/// ラウンド11：§21の未決事項がv2.102でプロジェクトオーナーに解決され（最小化を採用）、
+/// `SetPresence`を実際に発行できるようになった。`UserCommand (SwitchWorkspace _)`で
+/// 窓のいるWorkspaceを隠す/戻すと、Topology→Placementの既存の経路（v2.31以来）が
+/// `SetPresence(shown=false/true)`を発行する——これを実際の`ShowWindowAsync(SW_MINIMIZE/SW_RESTORE)`
+/// へ変換し、`IsIconic`で実窓が本当に最小化・復元されたかを確認する。
 module Wm.Host.Program
 
 open System
@@ -700,6 +706,87 @@ let main _argv =
     // 同じ、Core状態への依存だけに頼らない二重確認）。
     let stillExists = IsWindow(hwnd5)
     printfn "Round 10 summary: real window still exists after RequestClose dispatch: %b (expected false)" stillExists
+
+    // 段11：ラウンド11。§21（v2.102、プロジェクトオーナー確認済み：最小化を採用）に基づき実装した
+    // `SetPresence`を実際に発行する。`UserCommand (SwitchWorkspace _)`で今の窓のWorkspaceを隠すと
+    // Topology.fsが`WorkspaceHidden`を出し、Placement.onWorkspaceHiddenが`SetPresence(shown=false)`を
+    // 発行する——これをEffectDispatchが実際の`ShowWindowAsync(SW_MINIMIZE)`へ変換する。元の
+    // Workspaceへ戻せば逆（`shown=true`→復元）も同じ経路で検証できる。隔離された自分専用のテスト窓
+    // 1枚だけを対象にする（ラウンド3/4と同じ安全上の理由）。
+    printfn "\n--- Round 11: real SetPresence (minimize/restore via SwitchWorkspace) dispatch ---"
+    let reducer6 = Reducer(RuntimePolicy.defaults, "phase-b-round11", "wm-host-round11", "no-policy-artifact", None)
+    let effectQueue6 = ConcurrentQueue<GatedEffect>()
+    let resultQueue6 = ConcurrentQueue<RequestId * Result<unit, NativeCallRecord>>()
+    let mutable keepDispatching6 = true
+    let effectApplyThread6 =
+        Thread(fun () ->
+            while keepDispatching6 do
+                match effectQueue6.TryDequeue() with
+                | true, gated ->
+                    let effect = GatedEffect.effect gated
+                    match Wm.Windows.EffectDispatch.apply effect with
+                    | Some result ->
+                        let ridOpt = match effect with SetPresence (rid, _, _) -> Some rid | _ -> None
+                        match ridOpt with
+                        | Some rid -> resultQueue6.Enqueue(rid, result)
+                        | None -> ()
+                    | None -> ()
+                | false, _ -> Thread.Sleep(1))
+    effectApplyThread6.IsBackground <- true
+    effectApplyThread6.Name <- "wm-effect-apply-round11"
+    effectApplyThread6.Start()
+
+    let enqueueEffects6 (effects: GatedEffect list) = for g in effects do effectQueue6.Enqueue(g)
+    let submit6 (now: int64) (source: string) (input: InputEvent) =
+        let sr = reducer6.Submit now source input
+        enqueueEffects6 sr.Effects
+        sr
+    let advance6 () =
+        match reducer6.AdvanceToNextTimer() with
+        | Some sr -> enqueueEffects6 sr.Effects; true
+        | None -> false
+    let drainResults6 (now: int64) =
+        let mutable more = true
+        while more do
+            match resultQueue6.TryDequeue() with
+            | true, (rid, result) -> submit6 now "wm-host-effect-thread" (EffectCallReturned (rid, result, None)) |> ignore
+            | false, _ -> more <- false
+    let pump6 (ms: int) =
+        let deadline = liveNow () + int64 ms
+        while liveNow () < deadline do
+            Application.DoEvents()
+            drainResults6 (liveNow ())
+            while reducer6.Timers.NextDeadline |> Option.exists (fun d -> d <= liveNow ()) do
+                advance6 () |> ignore
+            Thread.Sleep(1)
+
+    use testForm6 = new Form(Text = "wm-host-round11-test-window", Width = 300, Height = 200)
+    testForm6.Show()
+    pump6 300
+    let hwnd6 = testForm6.Handle
+
+    submit6 (liveNow ()) "wm-host" (MonitorTopologyObserved monitors) |> ignore
+    pump6 300
+    submit6 (liveNow ()) "wm-host" (RawFirstSeen (observeWindow (liveNow ()) monitorHandles titleMatcher hwnd6) |> normalize |> List.exactlyOne) |> ignore
+    pump6 500
+
+    let minimizedBeforeHide = IsIconic(hwnd6)
+    submit6 (liveNow ()) "wm-host" (UserCommand (SwitchWorkspace (WorkspaceId 1))) |> ignore
+    pump6 500
+    let minimizedAfterHide = IsIconic(hwnd6)
+
+    submit6 (liveNow ()) "wm-host" (UserCommand (SwitchWorkspace (WorkspaceId 0))) |> ignore
+    pump6 500
+    let minimizedAfterShow = IsIconic(hwnd6)
+
+    keepDispatching6 <- false
+    effectApplyThread6.Join(2000) |> ignore
+    testForm6.Close()
+
+    // Coreとは無関係に、実際のIsIconicを直接問い合わせて確認する（ラウンド3/4/6/7/8/10と同じ）。
+    printfn "Round 11 summary: IsIconic before-hide=%b after-SwitchWorkspace-hide=%b after-SwitchWorkspace-restore=%b" minimizedBeforeHide minimizedAfterHide minimizedAfterShow
+    printfn "SetPresence actually minimized the real window on hide, and restored it on show: %b"
+        (not minimizedBeforeHide && minimizedAfterHide && not minimizedAfterShow)
 
     printfn "\nDone."
     0

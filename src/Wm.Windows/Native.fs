@@ -159,6 +159,8 @@ let MONITOR_DEFAULTTONEAREST = 2u
 let SWP_NOZORDER = 0x0004u
 let SWP_ASYNCWINDOWPOS = 0x4000u
 let SW_RESTORE = 9
+/// §21「ワークスペースの実装方式」v2.102でプロジェクトオーナーが最小化を採用。
+let SW_MINIMIZE = 6
 
 let elapsedUsOf (sw: Stopwatch) : int64 =
     max 1L (sw.ElapsedTicks * 1_000_000L / Stopwatch.Frequency) // R2-22：0を入れない

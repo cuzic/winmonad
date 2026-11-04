@@ -11,6 +11,8 @@
 /// 唯一の例外（`WM_CLOSE`による丁寧な要求、アプリは無視・キャンセルできる）であり、`SetPresence`の
 /// ような未決の設計判断（§21「ワークスペースの実装方式」）に依存しないため、他のEffectより先に
 /// 実装できた。
+/// **Phase B ラウンド11で`SetPresence`を追加した**：§21の未決事項がv2.102でプロジェクトオーナーに
+/// よって解決され（最小化を採用、Cloak・画面外移動は不採用）、ようやく実装できるようになった。
 module Wm.Windows.EffectDispatch
 
 open System
@@ -54,8 +56,20 @@ let private dispatchRequestClose (w: WindowId) : unit -> Result<unit, NativeCall
         let hWnd = IntPtr raw
         callBool "PostMessage" (fun () -> PostMessage(hWnd, WM_CLOSE, UIntPtr.Zero, IntPtr.Zero))
 
+/// §21（v2.102、プロジェクトオーナー確認済み）：ワークスペースの非表示は最小化、復元は
+/// `RestoreBeforeMove`と同じ`ShowWindowAsync(SW_RESTORE)`を使う（別の実装を増やさない——
+/// 「復元」の意味は`NeedsRestore`文脈でもここでも同じ）。`shown=false`の最小化も
+/// `ShowWindowAsync`（同期の`ShowWindow`ではない）で発行し、ハングした対象でも呼び出し側を
+/// 止めない一貫性を保つ（ADR-012）。
+let private dispatchSetPresence (w: WindowId) (shown: bool) : unit -> Result<unit, NativeCallRecord> =
+    fun () ->
+        let (WindowId raw) = w
+        let hWnd = IntPtr raw
+        let nCmdShow = if shown then SW_RESTORE else SW_MINIMIZE
+        callBoolNoCode "ShowWindowAsync" (fun () -> ShowWindowAsync(hWnd, nCmdShow))
+
 /// 1件のEffectについて、対象窓と実際の`dispatch`クロージャを返す。このラウンドで対応しない
-/// Effect種別（`Reprobe`/`SetPresence`/`ForgetWindow`/`ObserveAll`/`ApplyBatch`）は
+/// Effect種別（`Reprobe`/`ForgetWindow`/`ObserveAll`/`ApplyBatch`）は
 /// `None`——呼び出し側はこれを「ログに残すだけで実際には発行しない」と解釈する。
 let toDispatch (effect: Effect) : (WindowId * (unit -> Result<unit, NativeCallRecord>)) option =
     match effect with
@@ -63,6 +77,7 @@ let toDispatch (effect: Effect) : (WindowId * (unit -> Result<unit, NativeCallRe
     | RequestForeground (_, w) -> Some (w, dispatchRequestForeground w)
     | RestoreBeforeMove (_, w) -> Some (w, dispatchRestoreBeforeMove w)
     | RequestClose (_, w) -> Some (w, dispatchRequestClose w)
+    | SetPresence (_, w, shown) -> Some (w, dispatchSetPresence w shown)
     | _ -> None
 
 /// `executeEffectProtocol`（既存、Wm.Contracts.ErrorTypes）を実際の`probe`/`dispatch`で呼ぶ。
