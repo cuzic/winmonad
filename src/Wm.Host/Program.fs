@@ -272,12 +272,20 @@ let main _argv =
             | true, (rid, result) -> submit3 now "wm-host-effect-thread" (EffectCallReturned (rid, result, None)) |> ignore
             | false, _ -> more <- false
 
+    // ラウンド8の実機ログ調査で発見した実在のバグ：ここが`while advance3 () do ()`（無条件に
+    // 溜まっている仮想タイマーを全部即時発火させる）になっていた。ラウンド2の`pump`はタイマーの
+    // 期限が実時間で本当に来てから発火させていた（`NextDeadline <= liveNow()`のゲート）のに、
+    // ラウンド3でこのゲートが落ちた——`PendingDeadline`（既定2000ms）が実時間でほぼ0msのうちに
+    // 発火し、実際のSetWindowPos/実観測が追いつく前にTimeout→Retryを3回即座に使い切って諦める。
+    // 単一窓（ラウンド3/4/6）では同じ目標へ何度再発行しても見た目の結果が変わらないため気づかれず、
+    // 2窓のラウンド7/8でMasterStackの分割が実機で崩れて初めて症状が見えた。
     let pump3 (ms: int) =
         let deadline = liveNow () + int64 ms
         while liveNow () < deadline do
             Application.DoEvents()
             drainResults3 (liveNow ())
-            while advance3 () do ()
+            while reducer3.Timers.NextDeadline |> Option.exists (fun d -> d <= liveNow ()) do
+                advance3 () |> ignore
             Thread.Sleep(1)
 
     use testForm3 = new Form(Text = "wm-host-round3-test-window", Width = 300, Height = 200)
@@ -403,12 +411,15 @@ let main _argv =
             | true, (rid, result) -> submit4 now "wm-host-effect-thread" (EffectCallReturned (rid, result, None)) |> ignore
             | false, _ -> more <- false
 
+    // ラウンド3のpump3と同じ修正（型直前のコメント参照）：実時間でまだ来ていないタイマーまで
+    // 無条件に即時発火させない。
     let pump4 (ms: int) =
         let deadline = liveNow () + int64 ms
         while liveNow () < deadline do
             Application.DoEvents()
             drainResults4 (liveNow ())
-            while advance4 () do ()
+            while reducer4.Timers.NextDeadline |> Option.exists (fun d -> d <= liveNow ()) do
+                advance4 () |> ignore
             Thread.Sleep(1)
 
     let mutable focusNextTarget : WindowId option = None
