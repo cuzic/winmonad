@@ -86,6 +86,7 @@ open Wm.Normalization.WindowEventNormalizer
 open Wm.Windows.Native
 open Wm.Windows.RealObservation
 open Wm.Windows.EventHooks
+open Wm.Host.EffectHarness
 
 /// Phase B ラウンド7：`RegisterHotKey`→`WM_HOTKEY`を受け取るためだけの、見えない専用窓。
 /// `WM_HOTKEY`は`RegisterHotKey`に渡したHWNDへ配送されるので、`Application.DoEvents()`で
@@ -244,72 +245,15 @@ let main _argv =
     let journalPath3 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round3-%s.ndjson" (Guid.NewGuid().ToString("N")))
     printfn "Round 3+4+6 journal: %s" journalPath3
     let reducer3 = Reducer(RuntimePolicy.defaults, "phase-b-round3", "wm-host-round3", "no-policy-artifact", Some journalPath3)
-    let effectQueue = ConcurrentQueue<GatedEffect>()
-    let resultQueue = ConcurrentQueue<RequestId * Result<unit, NativeCallRecord>>()
-    let mutable keepDispatching = true
     let mutable dispatchedCount = 0
     let mutable skippedCount = 0
-
-    // §7.1/ADR-012「Effect適用は専用スレッドで行う」：ここだけが実際のOS変更APIを呼ぶ。
-    let effectApplyThread =
-        Thread(fun () ->
-            while keepDispatching do
-                match effectQueue.TryDequeue() with
-                | true, gated ->
-                    let effect = GatedEffect.effect gated
-                    match Wm.Windows.EffectDispatch.apply effect with
-                    | Some result ->
-                        let ridOpt =
-                            match effect with
-                            | SetRect (rid, _, _) -> Some rid
-                            | RequestForeground (rid, _) -> Some rid
-                            | RestoreBeforeMove (rid, _) -> Some rid
-                            | _ -> None
-                        match ridOpt with
-                        | Some rid ->
-                            Interlocked.Increment(&dispatchedCount) |> ignore
-                            resultQueue.Enqueue(rid, result)
-                        | None -> ()
-                    | None -> Interlocked.Increment(&skippedCount) |> ignore
-                | false, _ -> Thread.Sleep(1))
-    effectApplyThread.IsBackground <- true
-    effectApplyThread.Name <- "wm-effect-apply"
-    effectApplyThread.Start()
-
-    let enqueueEffects (effects: GatedEffect list) = for g in effects do effectQueue.Enqueue(g)
-
-    let submit3 (now: int64) (source: string) (input: InputEvent) =
-        let sr = reducer3.Submit now source input
-        enqueueEffects sr.Effects
-        sr
-
-    let advance3 () =
-        match reducer3.AdvanceToNextTimer() with
-        | Some sr -> enqueueEffects sr.Effects; true
-        | None -> false
-
-    let drainResults3 (now: int64) =
-        let mutable more = true
-        while more do
-            match resultQueue.TryDequeue() with
-            | true, (rid, result) -> submit3 now "wm-host-effect-thread" (EffectCallReturned (rid, result, None)) |> ignore
-            | false, _ -> more <- false
-
-    // ラウンド8の実機ログ調査で発見した実在のバグ：ここが`while advance3 () do ()`（無条件に
-    // 溜まっている仮想タイマーを全部即時発火させる）になっていた。ラウンド2の`pump`はタイマーの
-    // 期限が実時間で本当に来てから発火させていた（`NextDeadline <= liveNow()`のゲート）のに、
-    // ラウンド3でこのゲートが落ちた——`PendingDeadline`（既定2000ms）が実時間でほぼ0msのうちに
-    // 発火し、実際のSetWindowPos/実観測が追いつく前にTimeout→Retryを3回即座に使い切って諦める。
-    // 単一窓（ラウンド3/4/6）では同じ目標へ何度再発行しても見た目の結果が変わらないため気づかれず、
-    // 2窓のラウンド7/8でMasterStackの分割が実機で崩れて初めて症状が見えた。
-    let pump3 (ms: int) =
-        let deadline = liveNow () + int64 ms
-        while liveNow () < deadline do
-            Application.DoEvents()
-            drainResults3 (liveNow ())
-            while reducer3.Timers.NextDeadline |> Option.exists (fun d -> d <= liveNow ()) do
-                advance3 () |> ignore
-            Thread.Sleep(1)
+    let harness3 =
+        EffectHarness(
+            reducer3, liveNow,
+            onDispatch = (fun _ _ -> Interlocked.Increment(&dispatchedCount) |> ignore),
+            onSkip = (fun () -> Interlocked.Increment(&skippedCount) |> ignore))
+    let submit3 = harness3.Submit
+    let pump3 (ms: int) = harness3.Pump ms
 
     use testForm3 = new Form(Text = "wm-host-round3-test-window", Width = 300, Height = 200)
     testForm3.Show()
@@ -343,8 +287,7 @@ let main _argv =
 
     let pendingBeforeUnhook = Map.count reducer3.State.Placement.Pending
     locationHook.Unhook ()
-    keepDispatching <- false
-    effectApplyThread.Join(2000) |> ignore
+    harness3.Stop()
 
     // Coreとは無関係に、実際にOSが報告する最終状態を直接問い合わせて確認する（ラウンド3と同じ、
     // Core状態への依存だけに頼らない二重確認）。
@@ -384,66 +327,17 @@ let main _argv =
     printfn "\n--- Round 7: real hotkey (RegisterHotKey -> WM_HOTKEY -> UserCommand FocusNext -> RequestForeground) ---"
     let journalPath4 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round7-%s.ndjson" (Guid.NewGuid().ToString("N")))
     let reducer4 = Reducer(RuntimePolicy.defaults, "phase-b-round7", "wm-host-round7", "no-policy-artifact", Some journalPath4)
-    let effectQueue4 = ConcurrentQueue<GatedEffect>()
-    let resultQueue4 = ConcurrentQueue<RequestId * Result<unit, NativeCallRecord>>()
-    let mutable keepDispatching4 = true
     let mutable dispatchedCount4 = 0
     let mutable skippedCount4 = 0
-
-    let effectApplyThread4 =
-        Thread(fun () ->
-            while keepDispatching4 do
-                match effectQueue4.TryDequeue() with
-                | true, gated ->
-                    let effect = GatedEffect.effect gated
-                    match Wm.Windows.EffectDispatch.apply effect with
-                    | Some result ->
-                        printfn "  [round7/8 dispatch] %A -> %A" effect result
-                        let ridOpt =
-                            match effect with
-                            | SetRect (rid, _, _) -> Some rid
-                            | RequestForeground (rid, _) -> Some rid
-                            | RestoreBeforeMove (rid, _) -> Some rid
-                            | _ -> None
-                        Interlocked.Increment(&dispatchedCount4) |> ignore
-                        match ridOpt with
-                        | Some rid -> resultQueue4.Enqueue(rid, result)
-                        | None -> ()
-                    | None -> Interlocked.Increment(&skippedCount4) |> ignore
-                | false, _ -> Thread.Sleep(1))
-    effectApplyThread4.IsBackground <- true
-    effectApplyThread4.Name <- "wm-effect-apply-round7"
-    effectApplyThread4.Start()
-
-    let enqueueEffects4 (effects: GatedEffect list) = for g in effects do effectQueue4.Enqueue(g)
-
-    let submit4 (now: int64) (source: string) (input: InputEvent) =
-        let sr = reducer4.Submit now source input
-        enqueueEffects4 sr.Effects
-        sr
-
-    let advance4 () =
-        match reducer4.AdvanceToNextTimer() with
-        | Some sr -> enqueueEffects4 sr.Effects; true
-        | None -> false
-
-    let drainResults4 (now: int64) =
-        let mutable more = true
-        while more do
-            match resultQueue4.TryDequeue() with
-            | true, (rid, result) -> submit4 now "wm-host-effect-thread" (EffectCallReturned (rid, result, None)) |> ignore
-            | false, _ -> more <- false
-
-    // ラウンド3のpump3と同じ修正（型直前のコメント参照）：実時間でまだ来ていないタイマーまで
-    // 無条件に即時発火させない。
-    let pump4 (ms: int) =
-        let deadline = liveNow () + int64 ms
-        while liveNow () < deadline do
-            Application.DoEvents()
-            drainResults4 (liveNow ())
-            while reducer4.Timers.NextDeadline |> Option.exists (fun d -> d <= liveNow ()) do
-                advance4 () |> ignore
-            Thread.Sleep(1)
+    let harness4 =
+        EffectHarness(
+            reducer4, liveNow,
+            onDispatch = (fun effect result ->
+                printfn "  [round7/8 dispatch] %A -> %A" effect result
+                Interlocked.Increment(&dispatchedCount4) |> ignore),
+            onSkip = (fun () -> Interlocked.Increment(&skippedCount4) |> ignore))
+    let submit4 = harness4.Submit
+    let pump4 (ms: int) = harness4.Pump ms
 
     let mutable focusNextTarget : WindowId option = None
     let onHotkey (id: int) =
@@ -564,8 +458,7 @@ let main _argv =
     UnregisterHotKey(hotkeyForm.Handle, hotkeyIdSwapWithMaster) |> ignore
     foregroundHook.Unhook ()
     locationHook4.Unhook ()
-    keepDispatching4 <- false
-    effectApplyThread4.Join(2000) |> ignore
+    harness4.Stop()
 
     // Coreとは無関係に、実際のOSフォアグラウンド窓を直接問い合わせて確認する（ラウンド3/4/6と
     // 同じ、Core状態への依存だけに頼らない二重確認）。
@@ -644,50 +537,9 @@ let main _argv =
     // ラウンド7/8のような実時間のEVENT_SYSTEM_FOREGROUND中継は不要。
     printfn "\n--- Round 10: real RequestClose (WM_CLOSE) dispatch against a self-owned test window ---"
     let reducer5 = Reducer(RuntimePolicy.defaults, "phase-b-round10", "wm-host-round10", "no-policy-artifact", None)
-    let effectQueue5 = ConcurrentQueue<GatedEffect>()
-    let resultQueue5 = ConcurrentQueue<RequestId * Result<unit, NativeCallRecord>>()
-    let mutable keepDispatching5 = true
-    let effectApplyThread5 =
-        Thread(fun () ->
-            while keepDispatching5 do
-                match effectQueue5.TryDequeue() with
-                | true, gated ->
-                    let effect = GatedEffect.effect gated
-                    match Wm.Windows.EffectDispatch.apply effect with
-                    | Some result ->
-                        let ridOpt = match effect with RequestClose (rid, _) -> Some rid | _ -> None
-                        match ridOpt with
-                        | Some rid -> resultQueue5.Enqueue(rid, result)
-                        | None -> ()
-                    | None -> ()
-                | false, _ -> Thread.Sleep(1))
-    effectApplyThread5.IsBackground <- true
-    effectApplyThread5.Name <- "wm-effect-apply-round10"
-    effectApplyThread5.Start()
-
-    let enqueueEffects5 (effects: GatedEffect list) = for g in effects do effectQueue5.Enqueue(g)
-    let submit5 (now: int64) (source: string) (input: InputEvent) =
-        let sr = reducer5.Submit now source input
-        enqueueEffects5 sr.Effects
-        sr
-    let advance5 () =
-        match reducer5.AdvanceToNextTimer() with
-        | Some sr -> enqueueEffects5 sr.Effects; true
-        | None -> false
-    let drainResults5 (now: int64) =
-        let mutable more = true
-        while more do
-            match resultQueue5.TryDequeue() with
-            | true, (rid, result) -> submit5 now "wm-host-effect-thread" (EffectCallReturned (rid, result, None)) |> ignore
-            | false, _ -> more <- false
-    let pump5 (ms: int) =
-        let deadline = liveNow () + int64 ms
-        while liveNow () < deadline do
-            Application.DoEvents()
-            drainResults5 (liveNow ())
-            while reducer5.Timers.NextDeadline |> Option.exists (fun d -> d <= liveNow ()) do
-                advance5 () |> ignore
-            Thread.Sleep(1)
+    let harness5 = EffectHarness(reducer5, liveNow)
+    let submit5 = harness5.Submit
+    let pump5 (ms: int) = harness5.Pump ms
 
     use testForm5 = new Form(Text = "wm-host-round10-test-window", Width = 300, Height = 200)
     testForm5.Show()
@@ -705,8 +557,7 @@ let main _argv =
     submit5 (liveNow ()) "wm-host" (UserCommand CloseFocused) |> ignore
     pump5 500
 
-    keepDispatching5 <- false
-    effectApplyThread5.Join(2000) |> ignore
+    harness5.Stop()
 
     // Coreとは無関係に、実際にそのHWNDが本当に消えたかを直接問い合わせて確認する（ラウンド3/4/6/7/8と
     // 同じ、Core状態への依存だけに頼らない二重確認）。
@@ -721,50 +572,9 @@ let main _argv =
     // 1枚だけを対象にする（ラウンド3/4と同じ安全上の理由）。
     printfn "\n--- Round 11: real SetPresence (minimize/restore via SwitchWorkspace) dispatch ---"
     let reducer6 = Reducer(RuntimePolicy.defaults, "phase-b-round11", "wm-host-round11", "no-policy-artifact", None)
-    let effectQueue6 = ConcurrentQueue<GatedEffect>()
-    let resultQueue6 = ConcurrentQueue<RequestId * Result<unit, NativeCallRecord>>()
-    let mutable keepDispatching6 = true
-    let effectApplyThread6 =
-        Thread(fun () ->
-            while keepDispatching6 do
-                match effectQueue6.TryDequeue() with
-                | true, gated ->
-                    let effect = GatedEffect.effect gated
-                    match Wm.Windows.EffectDispatch.apply effect with
-                    | Some result ->
-                        let ridOpt = match effect with SetPresence (rid, _, _) -> Some rid | _ -> None
-                        match ridOpt with
-                        | Some rid -> resultQueue6.Enqueue(rid, result)
-                        | None -> ()
-                    | None -> ()
-                | false, _ -> Thread.Sleep(1))
-    effectApplyThread6.IsBackground <- true
-    effectApplyThread6.Name <- "wm-effect-apply-round11"
-    effectApplyThread6.Start()
-
-    let enqueueEffects6 (effects: GatedEffect list) = for g in effects do effectQueue6.Enqueue(g)
-    let submit6 (now: int64) (source: string) (input: InputEvent) =
-        let sr = reducer6.Submit now source input
-        enqueueEffects6 sr.Effects
-        sr
-    let advance6 () =
-        match reducer6.AdvanceToNextTimer() with
-        | Some sr -> enqueueEffects6 sr.Effects; true
-        | None -> false
-    let drainResults6 (now: int64) =
-        let mutable more = true
-        while more do
-            match resultQueue6.TryDequeue() with
-            | true, (rid, result) -> submit6 now "wm-host-effect-thread" (EffectCallReturned (rid, result, None)) |> ignore
-            | false, _ -> more <- false
-    let pump6 (ms: int) =
-        let deadline = liveNow () + int64 ms
-        while liveNow () < deadline do
-            Application.DoEvents()
-            drainResults6 (liveNow ())
-            while reducer6.Timers.NextDeadline |> Option.exists (fun d -> d <= liveNow ()) do
-                advance6 () |> ignore
-            Thread.Sleep(1)
+    let harness6 = EffectHarness(reducer6, liveNow)
+    let submit6 = harness6.Submit
+    let pump6 (ms: int) = harness6.Pump ms
 
     use testForm6 = new Form(Text = "wm-host-round11-test-window", Width = 300, Height = 200)
     testForm6.Show()
@@ -785,8 +595,7 @@ let main _argv =
     pump6 500
     let minimizedAfterShow = IsIconic(hwnd6)
 
-    keepDispatching6 <- false
-    effectApplyThread6.Join(2000) |> ignore
+    harness6.Stop()
     testForm6.Close()
 
     // Coreとは無関係に、実際のIsIconicを直接問い合わせて確認する（ラウンド3/4/6/7/8/10と同じ）。
@@ -804,57 +613,19 @@ let main _argv =
     printfn "\n--- Round 12: §8.4 safety-stop recovery (watcher restores last-hidden windows, bypassing Core) ---"
     let watchdog2JournalPath = Path.Combine(Path.GetTempPath(), sprintf "wm-watchdog2-%s.ndjson" (Guid.NewGuid().ToString("N")))
     let reducer7 = Reducer(RuntimePolicy.defaults, "phase-b-round12", "wm-host-round12", "no-policy-artifact", None)
-    let effectQueue7 = ConcurrentQueue<GatedEffect>()
-    let resultQueue7 = ConcurrentQueue<RequestId * Result<unit, NativeCallRecord>>()
-    let mutable keepDispatching7 = true
     let lastHiddenHwnds = Collections.Concurrent.ConcurrentDictionary<IntPtr, unit>()
-    let effectApplyThread7 =
-        Thread(fun () ->
-            while keepDispatching7 do
-                match effectQueue7.TryDequeue() with
-                | true, gated ->
-                    let effect = GatedEffect.effect gated
-                    match Wm.Windows.EffectDispatch.apply effect with
-                    | Some result ->
-                        match effect with
-                        | SetPresence (rid, WindowId raw, shown) ->
-                            (match result with
-                             | Ok () ->
-                                 let hwnd = IntPtr raw
-                                 if shown then lastHiddenHwnds.TryRemove(hwnd) |> ignore
-                                 else lastHiddenHwnds.[hwnd] <- ()
-                             | Error _ -> ())
-                            resultQueue7.Enqueue(rid, result)
-                        | _ -> ()
-                    | None -> ()
-                | false, _ -> Thread.Sleep(1))
-    effectApplyThread7.IsBackground <- true
-    effectApplyThread7.Name <- "wm-effect-apply-round12"
-    effectApplyThread7.Start()
-
-    let enqueueEffects7 (effects: GatedEffect list) = for g in effects do effectQueue7.Enqueue(g)
-    let submit7 (now: int64) (source: string) (input: InputEvent) =
-        let sr = reducer7.Submit now source input
-        enqueueEffects7 sr.Effects
-        sr
-    let advance7 () =
-        match reducer7.AdvanceToNextTimer() with
-        | Some sr -> enqueueEffects7 sr.Effects; true
-        | None -> false
-    let drainResults7 (now: int64) =
-        let mutable more = true
-        while more do
-            match resultQueue7.TryDequeue() with
-            | true, (rid, result) -> submit7 now "wm-host-effect-thread" (EffectCallReturned (rid, result, None)) |> ignore
-            | false, _ -> more <- false
-    let pump7 (ms: int) =
-        let deadline = liveNow () + int64 ms
-        while liveNow () < deadline do
-            Application.DoEvents()
-            drainResults7 (liveNow ())
-            while reducer7.Timers.NextDeadline |> Option.exists (fun d -> d <= liveNow ()) do
-                advance7 () |> ignore
-            Thread.Sleep(1)
+    let harness7 =
+        EffectHarness(
+            reducer7, liveNow,
+            onDispatch = (fun effect result ->
+                match effect, result with
+                | SetPresence (_, WindowId raw, shown), Ok () ->
+                    let hwnd = IntPtr raw
+                    if shown then lastHiddenHwnds.TryRemove(hwnd) |> ignore
+                    else lastHiddenHwnds.[hwnd] <- ()
+                | _ -> ()))
+    let submit7 = harness7.Submit
+    let pump7 (ms: int) = harness7.Pump ms
 
     use testForm7 = new Form(Text = "wm-host-round12-test-window", Width = 300, Height = 200)
     testForm7.Show()
@@ -918,8 +689,7 @@ let main _argv =
     let minimizedAfterRecovery = IsIconic(hwnd7)
     let trackedAfterRecovery = lastHiddenHwnds.ContainsKey(hwnd7)
 
-    keepDispatching7 <- false
-    effectApplyThread7.Join(2000) |> ignore
+    harness7.Stop()
     testForm7.Close()
 
     let watchdog2Entries = Wm.Journal.JournalWriter.readAll watchdog2JournalPath |> List.ofSeq
