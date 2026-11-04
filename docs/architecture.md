@@ -13,7 +13,14 @@ Version: 2.100（**ラウンド8の実機ログ調査で発見した実在のバ
 最終結果が変わらないため気づかれず（実際のOS移動自体は初回のSetWindowPosで既に成功している）、
 2窓でMasterStackの分割を検証したラウンド7/8で初めて症状が表面化した（両窓が常に同じ全域矩形を
 得ていた）。`pump3`/`pump4`をラウンド2の`pump`と同じ実時間ゲート付きループへ修正した——Core側
-（`Placement`/`SimulationTimerExecutor`）は一切変更していない、Shell側ハーネスだけの誤用だった）／
+（`Placement`/`SimulationTimerExecutor`）は一切変更していない、Shell側ハーネスだけの誤用だった。
+**この修正の後も両窓は依然同じ全域矩形のままだった**——さらに調査し、本当の理由は別にあると判明：
+`PolicyIR.defaults.DefaultLayout`は"monocle"であり、Monocleの意味論はTiled窓全部へ同じWorkArea
+全域を与えること（§5.6）。`SwapWithMaster`はzipperの並びだけを変える（master/stackの区別を実際の
+矩形に反映するのはMasterStackのLayout計算自身）ので、Layoutを明示的に切り替えないままでは
+矩形が変わらないのが正しい挙動だった——Coreのバグでもpumpタイマーのバグでもなく、ラウンド7/8の
+テストシナリオ自体がLayoutを選んでいなかった不備。`UserCommand (ChangeLayout masterStackRef)`を
+両窓の観測後に明示的に発行し、実際にmaster-stack分割を検証できるようにした）／
 2.99（**Phase B ラウンド8**：ラウンド7の2枚のテスト窓・隔離Reducerをそのまま使い、
 2本目のホットキー（Ctrl+Shift+K）で`UserCommand SwapWithMaster`を発行した。実装中に発見した
 重要な前提：`SwapWithMaster`（`PromoteToMaster`/`CloseFocused`も同様）は`focused`

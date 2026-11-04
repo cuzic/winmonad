@@ -52,6 +52,7 @@ open System.IO
 open System.Threading
 open System.Windows.Forms
 open Wm.Contracts.Identifiers
+open Wm.Contracts.SharedVocabulary
 open Wm.Contracts.ErrorTypes
 open Wm.Contracts.CoreCommand
 open Wm.Contracts.GatedEffect
@@ -486,6 +487,14 @@ let main _argv =
     pump4 800
     submit4 (liveNow ()) "wm-host" (RawFirstSeen (observeWindow (liveNow ()) monitorHandles titleMatcher testFormB.Handle) |> normalize |> List.exactlyOne) |> ignore
     pump4 800
+
+    // 原因が判明した：`PolicyIR.defaults.DefaultLayout`は"monocle"であり、MonocleはTiled窓全部に
+    // 同じWorkArea全域を与える意味論（§5.6）——SwapWithMasterはzipperの並びだけを変え、master/stackの
+    // 区別を矩形に反映するのはMasterStackなので、Monocleのままでは矩形が変わらないのは当然の挙動
+    // だった（CoreやpumpタイマーのバグではなくこのシナリオがLayoutを明示的に選んでいなかった不備）。
+    // SwapWithMasterの効果を実際に見るため、このWorkspaceのLayoutを明示的にmaster-stackへ切り替える。
+    submit4 (liveNow ()) "wm-host" (UserCommand (ChangeLayout { Id = LayoutId "master-stack"; ApiVersion = 1; Args = NoArgs })) |> ignore
+    pump4 500
 
     // 診断：両窓が本当に同じWorkspaceのzipperに入っているかを直接確認する（SwapWithMasterの
     // 実矩形検証が実機でfalseになった原因調査、両窓が同一矩形になった実際の原因はまだ未確定）。
