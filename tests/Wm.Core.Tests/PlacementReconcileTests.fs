@@ -888,6 +888,44 @@ let ``onWindowVanishedはMinWidthも消す(v2.43)`` () =
     let afterVanished, _ = onWindowVanished w afterDeadline
     Assert.Equal(None, Map.tryFind w afterVanished.MinWidth)
 
+// ===== MinWidthの過補正ガード（v2.120、Opusレビュー論点2-C対策） =====
+
+[<Fact>]
+let ``FrameInset補正済みの発行で、幅超過がinsetの左右合計以内ならMinWidthの証拠にしない(v2.120)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    // pad2py-pad-host実機（v2.112）で実測した不可視リサイズ枠：X+7/Width-14/Height-7/Y不変。
+    let inset: FrameInset = { Left = 7; Top = 0; Right = 7; Bottom = 7; Monitor = m }
+    let seeded = { initial with FrameInsets = Map.ofList [ w, inset ] }
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) seeded
+    let rid = pendingRidFor afterReconcile w
+    Assert.Equal(Some inset, Map.tryFind rid afterReconcile.Pending |> Option.bind (fun pr -> pr.DispatchedInset))
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    // 超過13px（左右合計14pxの枠の範囲内）——補正の誤差として説明できるので証拠にしない。
+    let slightlyWiderRect = { workArea with Width = workArea.Width + 13 }
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w slightlyWiderRect m 10L) afterDispatched
+    let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
+    let afterDeadline, _, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    Assert.Equal(None, Map.tryFind w afterDeadline.MinWidth)
+
+[<Fact>]
+let ``FrameInset補正済みの発行でも、幅超過がinsetの左右合計を超えればMinWidthの証拠にする(v2.120)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let inset: FrameInset = { Left = 7; Top = 0; Right = 7; Bottom = 7; Monitor = m }
+    let seeded = { initial with FrameInsets = Map.ofList [ w, inset ] }
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) seeded
+    let rid = pendingRidFor afterReconcile w
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    // 超過100px（左右合計14pxの枠を大きく超える）——補正誤差では説明できない、本物のMinWidth証拠。
+    let muchWiderRect = { workArea with Width = workArea.Width + 100 }
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w muchWiderRect m 10L) afterDispatched
+    let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
+    let afterDeadline, _, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    match Map.tryFind w afterDeadline.MinWidth with
+    | Some { Value = v; Confidence = Inferred _ } -> Assert.Equal(workArea.Width + 100, v)
+    | other -> Assert.True(false, sprintf "expected an Inferred MinWidth belief, got %A" other)
+
 [<Fact>]
 let ``DpiBehavior=RescalesItselfで2段目リサイズ待ち中(DpiCrossing未決着)のMismatchはMinWidthの証拠にしない(v2.45)`` () =
     let w = WindowId 1L
@@ -1181,7 +1219,14 @@ let ``checkUnattributedDriftはPendingが残っている窓には作用しない
     let afterMoved0, _, _ = onWindowObserved 30L (observedSnapshotWithMonitor w workArea m1 2L) afterObserved
     Assert.Equal(Some workArea, Map.tryFind w afterMoved0.Accepted) // Pendingが無いのでSatisfied判定は起きない
     let artificialPending: PendingRequest =
-        { Window = w; Epoch = IntentEpoch 0L; TargetRect = { workArea with Width = workArea.Width - 1 }; IssuedAt = 30L; Deadline = 30L + pendingDeadlineMs; DispatchSeq = None; Baseline = None }
+        { Window = w
+          Epoch = IntentEpoch 0L
+          TargetRect = { workArea with Width = workArea.Width - 1 }
+          IssuedAt = 30L
+          Deadline = 30L + pendingDeadlineMs
+          DispatchSeq = None
+          Baseline = None
+          DispatchedInset = None }
     let afterMoved = { afterMoved0 with Pending = Map.ofList [ RequestId 999L, artificialPending ] }
     let afterDrift, corrected, _ = checkUnattributedDrift 30L isTiledTrue (fun _ -> Some m0) alwaysStable w afterMoved
     Assert.False(corrected)

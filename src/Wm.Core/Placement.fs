@@ -221,25 +221,6 @@ type DesiredPresence =
 /// `DispatchSeq`は`EffectCallReturned (rid, Ok (), dispatchSeq)`で受け取った、発行が実際に受け付けられた
 /// 時点のSampleSequence（まだ届いていなければ`None`）。`Baseline`は発行時点の`VisibleFrameRect`信念の
 /// 値（無ければ`None`）——Mismatch判定の「何も変わっていない」除外に使う。
-type PendingRequest =
-    { Window: WindowId
-      Epoch: IntentEpoch
-      TargetRect: PixelRect
-      IssuedAt: int64
-      Deadline: int64
-      DispatchSeq: int64 option
-      Baseline: PixelRect option }
-
-/// `PendingRequest`と同じ考え方（§7.2「待ちをデータで表す」）を`SetPresence`へ適用した最小形
-/// （v2.41新設、ファイル冒頭「`SetPresence`の観測による確認」参照）。`Epoch`/`Retry`は持たない——
-/// `onWorkspaceHidden`/`onWorkspaceShown`は呼ばれるたびに無条件で新しい`SetPresence`を発行する
-/// （`dispatchPlacements`の`desiredChanged`のような「前回と同じ意図かどうか」の判定を持たない）ため、
-/// 同じ窓を指す古い`PendingPresence`が残っていれば（例：隠した直後に再び見せた）`dispatchPlacements`と
-/// 同じ要領で必ず先に失効させる（下記）。この不変条件（1窓につき同時に1つまで）が保たれる限り、
-/// 複数のPendingPresenceが同じ窓を指して競合することは無く、`Epoch`で古い要求を失効させる仕組みは
-/// 要らない。
-type PendingPresence = { Window: WindowId; DesiredVisible: bool; IssuedAt: int64; Deadline: int64 }
-
 /// 不可視リサイズ枠（§4.2「座標系契約」/§13、v2.112でpad2py-pad-host実機から実測）の信念
 /// （v2.114、Round 2スライス1；v2.117でモニターDPIの扱いを見直し）。`NativeRect`が
 /// `VisibleFrameRect`より各辺どれだけ外側に広いかを辺ごとに独立して保持する——対称とは仮定しない。
@@ -287,6 +268,32 @@ let reviseFrameInset (monitor: MonitorId option) (isMaximized: bool) (isMinimize
               Monitor = m }
         let isZero = candidate.Left = 0 && candidate.Top = 0 && candidate.Right = 0 && candidate.Bottom = 0
         if isZero || not (frameInsetWithinCrudeRange candidate) then None else Some candidate
+
+
+type PendingRequest =
+    { Window: WindowId
+      Epoch: IntentEpoch
+      TargetRect: PixelRect
+      IssuedAt: int64
+      Deadline: int64
+      DispatchSeq: int64 option
+      Baseline: PixelRect option
+      /// 発行時に`correctedDispatchTarget`が実際に使った`FrameInset`（v2.120、Opus敵対的レビュー
+      /// 論点2-C対策）。補正が無かった発行（信念が無かった等）は`None`。`tryMismatchObservation`が
+      /// Mismatchと判定した観測の幅超過が、この時使ったinsetの左右合計で説明できる範囲なら
+      /// （＝過大補正の誤差でしかない可能性がある）、`reviseMinWidth`の証拠として採用しない
+      /// （`onPendingDeadlineTimerFired`のMinWidth判定箇所参照）。
+      DispatchedInset: FrameInset option }
+
+/// `PendingRequest`と同じ考え方（§7.2「待ちをデータで表す」）を`SetPresence`へ適用した最小形
+/// （v2.41新設、ファイル冒頭「`SetPresence`の観測による確認」参照）。`Epoch`/`Retry`は持たない——
+/// `onWorkspaceHidden`/`onWorkspaceShown`は呼ばれるたびに無条件で新しい`SetPresence`を発行する
+/// （`dispatchPlacements`の`desiredChanged`のような「前回と同じ意図かどうか」の判定を持たない）ため、
+/// 同じ窓を指す古い`PendingPresence`が残っていれば（例：隠した直後に再び見せた）`dispatchPlacements`と
+/// 同じ要領で必ず先に失効させる（下記）。この不変条件（1窓につき同時に1つまで）が保たれる限り、
+/// 複数のPendingPresenceが同じ窓を指して競合することは無く、`Epoch`で古い要求を失効させる仕組みは
+/// 要らない。
+type PendingPresence = { Window: WindowId; DesiredVisible: bool; IssuedAt: int64; Deadline: int64 }
 
 type PlacementState =
     { Geometry: Map<WindowId, GeometryBeliefs>
@@ -817,8 +824,20 @@ let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: P
                 // いない」除外に使う（型直前のコメント参照）。`DispatchSeq`は`EffectCallReturned`が
                 // 届くまで`None`。
                 let baseline = Map.tryFind p.Window st.Geometry |> Option.bind (fun g -> LatestWins.value g.VisibleFrameRect)
+                // `FrameInset`補正（v2.118、`correctedDispatchTarget`/`dispatchPlacements`の型直前の
+                // コメント参照）：使ったinset（あれば）を`PendingRequest.DispatchedInset`へ記録する
+                // （v2.120、MinWidthの過補正ガード対策、型直前のコメント参照）。
+                let usedInset = Map.tryFind p.Window st.FrameInsets
+                let dispatchTarget = correctedDispatchTarget p.Window p.Target st.FrameInsets
                 let pendingRequest =
-                    { Window = p.Window; Epoch = epoch'; TargetRect = p.Target; IssuedAt = now; Deadline = deadline; DispatchSeq = None; Baseline = baseline }
+                    { Window = p.Window
+                      Epoch = epoch'
+                      TargetRect = p.Target
+                      IssuedAt = now
+                      Deadline = deadline
+                      DispatchSeq = None
+                      Baseline = baseline
+                      DispatchedInset = usedInset }
                 let st' =
                     { st with
                         Desired = Map.add p.Window (Shown (Some p.Target)) st.Desired
@@ -842,11 +861,9 @@ let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: P
                     match restoreRid with
                     | Some rrid -> [ RestoreBeforeMove (rrid, p.Window) ]
                     | None -> []
-                // `FrameInset`補正（v2.118、`correctedDispatchTarget`/`dispatchPlacements`の型直前の
-                // コメント参照）：実際に補正を適用した場合（信念があり、結果が`p.Target`と異なる）
-                // だけ`FrameInsetApplied`を積む——補正が無かった（信念が無い、または差が無い）場合は
+                // 実際に補正を適用した場合（信念があり、結果が`p.Target`と異なる）だけ
+                // `FrameInsetApplied`を積む——補正が無かった（信念が無い、または差が無い）場合は
                 // `SetRect`の矩形がそのまま「望ましい可視矩形」なので、Trace無しで既存どおり読める。
-                let dispatchTarget = correctedDispatchTarget p.Window p.Target st.FrameInsets
                 let correctionTrace =
                     if dispatchTarget <> p.Target then [ FrameInsetApplied (rid, p.Target, dispatchTarget) ] else []
                 st', effects @ restoreEffects @ [ SetRect (rid, p.Window, dispatchTarget) ], cmds @ supersededCmds @ [ StartTimer (TimerId.Placement (PendingDeadline rid), pendingDeadlineMs) ], traces @ correctionTrace)
@@ -916,9 +933,12 @@ let private retryOrGiveUp (now: int64) (rid: RequestId) (pr: PendingRequest) (st
         // `DispatchSeq`は新しい`rid`専用の確認待ちなのでリセットする（v2.42）——古い`rid`の
         // `DispatchSeq`をそのまま引き継ぐと、まだ届いていない新しい`EffectCallReturned`より前の
         // 観測をMismatch判定に使ってしまう。`Baseline`（同じ目標への再試行なので）はそのまま引き継ぐ。
-        let retried = { pr with IssuedAt = now; Deadline = deadline; DispatchSeq = None }
         // `dispatchPlacements`と同じ補正（v2.119、`correctedDispatchTarget`の型直前のコメント参照）。
+        // `DispatchedInset`はこの再発行時点の信念で上書きする（v2.120）——前回発行時と信念が変わって
+        // いることもあるため、`pr`の古い値をそのまま引き継がない。
+        let usedInset = Map.tryFind pr.Window state.FrameInsets
         let dispatchTarget = correctedDispatchTarget pr.Window pr.TargetRect state.FrameInsets
+        let retried = { pr with IssuedAt = now; Deadline = deadline; DispatchSeq = None; DispatchedInset = usedInset }
         let correctionTrace =
             if dispatchTarget <> pr.TargetRect then [ FrameInsetApplied (newRid, pr.TargetRect, dispatchTarget) ] else []
         { state with
@@ -1055,8 +1075,18 @@ let onPendingDeadlineTimerFired
             let isMidDpiTransition =
                 Map.containsKey pr.Window state.DpiCrossing
                 && (Map.tryFind pr.Window state.DpiBehavior |> Option.map (fun b -> b.Value)) = Some RescalesItself
+            // `MinWidth`の過補正ガード（v2.120、Opusレビュー2-C対策）：この発行が`FrameInset`補正を
+            // 使っていたなら、観測幅の超過がその時使ったinsetの左右合計以下なら「補正誤差でしかない
+            // 可能性がある」としてMinWidthの証拠にしない——補正が過大だった（古い/最大化中/別モニター
+            // のinset等）場合に偽の最小幅がLayoutまで届くのを防ぐ（`PendingRequest.DispatchedInset`の
+            // 型直前のコメント参照）。
+            let widthExcess = observed.Width - pr.TargetRect.Width
+            let explainedByCorrection =
+                match pr.DispatchedInset with
+                | Some inset -> widthExcess <= inset.Left + inset.Right
+                | None -> false
             let minWidth' =
-                if observed.Width > pr.TargetRect.Width && not isMidDpiTransition then
+                if observed.Width > pr.TargetRect.Width && not isMidDpiTransition && not explainedByCorrection then
                     match Map.tryFind pr.Window state.Geometry |> Option.bind (fun g -> LatestWins.value g.Monitor) |> Option.bind dpiOf with
                     | Some dpi ->
                         let observedWidthDip = toDip dpi observed.Width
