@@ -279,7 +279,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         | NoMonitors -> None
         | Displays (current, visible) -> (current :: visible) |> List.tryFind (fun sc -> sc.Monitor.Id = m) |> Option.map (fun sc -> sc.Monitor.Dpi)
 
-    let placementState', placementEffects, placementTimerCmds, effectCallFailure =
+    let placementState', placementEffects, placementTimerCmds, effectCallFailure, placementTraces =
         match envelope.Input with
         | WindowObserved snapshot when windowsEvents |> List.exists (function WindowVanishedByReuse w -> w = snapshot.Id | _ -> false) ->
             // HWND再利用の検知時（v2.47/v2.48で発見）：Windowsが同じ観測をこのWindowIdの信念として
@@ -288,7 +288,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             // 信念が同じstep内で復活する（性質テスト#5で発見した実際のバグ）。Windows→Placementの処理
             // 順序（§7.1段①）は、Windowsが「この観測は別の実体のものだ」と判断した結果を後段が無視
             // できることを前提にしているので、ここで素通りさせない。
-            stateAfterWindows.Placement, [], [], None
+            stateAfterWindows.Placement, [], [], None, []
         | WindowObserved snapshot ->
             // `checkDpiCrossing`（v2.45）：`onWindowObserved`が今回の観測でMonitor信念を上書きする前の
             // 値を覚えておき、上書き後の新しい値と比較して「異なるDPIのモニターへ移った」かを判定する
@@ -296,28 +296,28 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             let oldMonitor = Map.tryFind snapshot.Id stateAfterWindows.Placement.Geometry |> Option.bind (fun g -> LatestWins.value g.Monitor)
             let s, e, t = Placement.onWindowObserved now snapshot stateAfterWindows.Placement
             let s = Placement.checkDpiCrossing now dpiOf snapshot.Id oldMonitor s
-            s, e, t, None
-        | MinimizedStateChanged (w, obs) -> Placement.onMinimizedStateChanged now w obs stateAfterWindows.Placement, [], [], None
-        | MoveSizeStarted w -> Placement.onMoveSizeStarted w stateAfterWindows.Placement, [], [], None
-        | MoveSizeEnded (w, _, _) -> Placement.onMoveSizeEnded w stateAfterWindows.Placement, [], [], None
+            s, e, t, None, []
+        | MinimizedStateChanged (w, obs) -> Placement.onMinimizedStateChanged now w obs stateAfterWindows.Placement, [], [], None, []
+        | MoveSizeStarted w -> Placement.onMoveSizeStarted w stateAfterWindows.Placement, [], [], None, []
+        | MoveSizeEnded (w, _, _) -> Placement.onMoveSizeEnded w stateAfterWindows.Placement, [], [], None, []
         | UserCommand (SetManagement (w, _)) | UserCommand (ToggleFloating w) ->
             // v2.83：`Movability`が`NotMovable`な窓へのユーザーの明示操作による1回だけの試し直し
             // （Placement.onUserCommandの型直前のコメント参照）。Windowsドメイン（段①、上記）が
             // 同じ入力で分類を直すのとは別に、Placementは自分の信念だけを直す（ADR-018）。
-            Placement.onUserCommand now w stateAfterWindows.Placement, [], [], None
+            Placement.onUserCommand now w stateAfterWindows.Placement, [], [], None, []
         | TimerElapsed (TimerId.Placement (IntegrityReprobe w)) ->
             let s, e, t = Placement.onIntegrityReprobeTimerFired now w stateAfterWindows.Placement
-            s, e, t, None
+            s, e, t, None, []
         | TimerElapsed (TimerId.Placement (PendingDeadline rid)) ->
-            let s, e, t = Placement.onPendingDeadlineTimerFired now rid dpiOf stateAfterWindows.Placement
-            s, e, t, None
+            let s, e, t, traces = Placement.onPendingDeadlineTimerFired now rid dpiOf stateAfterWindows.Placement
+            s, e, t, None, traces
         | TimerElapsed (TimerId.Placement (PresenceDeadline rid)) ->
             let s, t = Placement.onPresenceDeadlineTimerFired now rid stateAfterWindows.Placement
-            s, [], t, None
+            s, [], t, None, []
         | EffectCallReturned (rid, result, dispatchSeq) ->
-            let s, e, t, failureInfo = Placement.onEffectCallReturned now envelope.Sequence rid result dispatchSeq stateAfterWindows.Placement
-            s, e, t, failureInfo
-        | _ -> stateAfterWindows.Placement, [], [], None
+            let s, e, t, failureInfo, traces = Placement.onEffectCallReturned now envelope.Sequence rid result dispatchSeq stateAfterWindows.Placement
+            s, e, t, failureInfo, traces
+        | _ -> stateAfterWindows.Placement, [], [], None, []
 
     let stateAfterPlacement = { stateAfterWindows with Placement = placementState' }
 
@@ -930,4 +930,4 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         @ topologySettledTimerCmds
         @ reconcileTimerCmds
         @ gateRejectionTimerCmds
-      Trace = traces @ reconcileTraces }
+      Trace = traces @ placementTraces @ reconcileTraces }

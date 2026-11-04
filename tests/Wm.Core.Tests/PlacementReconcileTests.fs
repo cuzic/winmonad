@@ -275,7 +275,7 @@ let ``PendingDeadline満了は上限に達するまで同じTargetRectへSetRect
     let w = WindowId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid0 = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
-    let afterRetry1, effects1, timerCmds1 = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid0 noDpi afterReconcile
+    let afterRetry1, effects1, timerCmds1, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid0 noDpi afterReconcile
     Assert.Equal(1, Map.count afterRetry1.Pending)
     Assert.Equal(Some (Shown (Some workArea)), Map.tryFind w afterRetry1.Desired)
     Assert.Equal(Some 1, Map.tryFind w afterRetry1.RetryAttempts)
@@ -284,6 +284,22 @@ let ``PendingDeadline満了は上限に達するまで同じTargetRectへSetRect
     Assert.Equal<Effect list>([ SetRect (rid1, w, workArea) ], effects1)
     Assert.NotEmpty(timerCmds1) // 新しいPendingDeadlineを始動する
 
+/// v2.119：`dispatchPlacements`と同じ不可視リサイズ枠補正（v2.118）が`retryOrGiveUp`（Timeoutでの
+/// 再発行）にも効くことを確認する——Opus敵対的レビューの論点1-A「リトライ経路の漏れ」対策。
+[<Fact>]
+let ``PendingDeadline満了の再発行(retryOrGiveUp)もFrameInsetで補正し、FrameInsetAppliedを積む(v2.119)`` () =
+    let w = WindowId 1L
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid0 = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
+    // pad2py-pad-host実機（v2.112）で実測した不可視リサイズ枠：X+7/Width-14/Height-7/Y不変。
+    let inset: FrameInset = { Left = 7; Top = 0; Right = 7; Bottom = 7; Monitor = MonitorId 0L }
+    let seeded = { afterReconcile with FrameInsets = Map.add w inset afterReconcile.FrameInsets }
+    let afterRetry1, effects1, _, traces1 = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid0 noDpi seeded
+    let rid1 = afterRetry1.Pending |> Map.toSeq |> Seq.head |> fst
+    let expectedNativeTarget: PixelRect = { X = workArea.X - 7; Y = workArea.Y; Width = workArea.Width + 14; Height = workArea.Height + 7 }
+    Assert.Equal<Effect list>([ SetRect (rid1, w, expectedNativeTarget) ], effects1)
+    Assert.Equal<DecisionTrace list>([ FrameInsetApplied (rid1, workArea, expectedNativeTarget) ], traces1)
+
 [<Fact>]
 let ``PendingDeadline満了が上限回数続くと、最終的にPendingとDesiredの両方を取り消す(次のReconcileで最初から再試行させる)`` () =
     let w = WindowId 1L
@@ -291,7 +307,7 @@ let ``PendingDeadline満了が上限回数続くと、最終的にPendingとDesi
     let rid0 = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
     // pendingRetryMaxAttempts回（既定3回）Timeoutを発火させ続けると、最後は単発の諦めと同じ終端になる。
     let rec driveToGiveUp (attemptsLeft: int) (now: int64) (rid: RequestId) (state: PlacementState) : PlacementState =
-        let state', _, _ = onPendingDeadlineTimerFired now rid noDpi state
+        let state', _, _, _ = onPendingDeadlineTimerFired now rid noDpi state
         if attemptsLeft <= 1 then
             state'
         else
@@ -307,7 +323,7 @@ let ``新しい意図(Targetが変わったReconcile)はRetryの試行回数を�
     let w = WindowId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid0 = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
-    let afterRetry, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid0 noDpi afterReconcile
+    let afterRetry, _, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid0 noDpi afterReconcile
     Assert.Equal(Some 1, Map.tryFind w afterRetry.RetryAttempts)
 
     // Reconcileのやり直し（例：別のモニターへ移った、Layoutが変わった）で新しいTargetが計算される——
@@ -323,7 +339,7 @@ let ``古い発火(期限未到達)のPendingDeadlineは無視する`` () =
     let w = WindowId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
-    let stillPending, effects, timerCmds = onPendingDeadlineTimerFired 10L rid noDpi afterReconcile // Now=IssuedAt、まだdeadline未到達
+    let stillPending, effects, timerCmds, _ = onPendingDeadlineTimerFired 10L rid noDpi afterReconcile // Now=IssuedAt、まだdeadline未到達
     Assert.Equal(1, Map.count stillPending.Pending)
     Assert.Empty(effects)
     Assert.Empty(timerCmds)
@@ -335,7 +351,7 @@ let ``onTopologySettledは全PendingをCancelTimer付きで取り消し、RetryA
     let w1, w2 = WindowId 1L, WindowId 2L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w1 ]) (managementOf [ w1 ]) (aliveOf [ w1 ]) initial
     let rid1 = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
-    let afterRetry, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid1 noDpi afterReconcile
+    let afterRetry, _, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid1 noDpi afterReconcile
     Assert.Equal(Some 1, Map.tryFind w1 afterRetry.RetryAttempts)
 
     let afterSecondWindow, _, _, _ = reconcileWorkspace 20L registry (masterStackRef 0.5m) (ctxWith [ w1; w2 ]) (managementOf [ w1; w2 ]) (aliveOf [ w1; w2 ]) afterRetry
@@ -568,7 +584,7 @@ let ``Ok()はPendingをSatisfiedにしない(それは観測の一致だけ)が�
     let w = WindowId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let state', _, _, failureInfo = onEffectCallReturned 20L 2L rid (Ok ()) (Some 42L) afterReconcile
+    let state', _, _, failureInfo, _ = onEffectCallReturned 20L 2L rid (Ok ()) (Some 42L) afterReconcile
     Assert.Equal(None, failureInfo)
     match Map.tryFind rid state'.Pending with
     | Some pr ->
@@ -583,7 +599,7 @@ let ``ERROR_INVALID_WINDOW_HANDLEはTargetGoneに分類され、PendingとDesire
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let error: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 1400; ElapsedUs = 0L }
-    let state', _, cmds, failureInfo = onEffectCallReturned 20L 2L rid (Error error) None afterReconcile
+    let state', _, cmds, failureInfo, _ = onEffectCallReturned 20L 2L rid (Error error) None afterReconcile
     // Retryしない分類でも、まだ生きているridのPendingDeadlineはCancelTimerする（v2.30で塞いだ既存の
     // 取りこぼし——以前はこの関数がTimerCommandを返せなかった）。
     Assert.Equal<TimerCommand<TimerId> list>([ CancelTimer (TimerId.Placement (PendingDeadline rid)) ], cmds)
@@ -597,7 +613,7 @@ let ``ERROR_ACCESS_DENIEDはDenied OtherDenialに分類され、MovabilityをNot
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let error: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 5; ElapsedUs = 0L }
-    let state', _, _, failureInfo = onEffectCallReturned 20L 2L rid (Error error) None afterReconcile
+    let state', _, _, failureInfo, _ = onEffectCallReturned 20L 2L rid (Error error) None afterReconcile
     Assert.Empty(state'.Pending)
     Assert.Equal(Some (w, Denied OtherDenial), failureInfo)
     match Map.tryFind w state'.Movability with
@@ -610,7 +626,7 @@ let ``TargetHungと分類された場合、Movabilityは変えない(HealthのRe
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let error: NativeCallRecord = { Api = "SendMessageTimeout"; Space = Win32LastError; Code = 1460; ElapsedUs = 0L }
-    let state', _, _, failureInfo = onEffectCallReturned 20L 2L rid (Error error) None afterReconcile
+    let state', _, _, failureInfo, _ = onEffectCallReturned 20L 2L rid (Error error) None afterReconcile
     Assert.Empty(state'.Pending)
     Assert.Equal(Some (w, TargetHung), failureInfo)
     Assert.Equal(None, Map.tryFind w state'.Movability) // Movabilityはこの関数の対象外
@@ -618,7 +634,7 @@ let ``TargetHungと分類された場合、Movabilityは変えない(HealthのRe
 [<Fact>]
 let ``対応するPendingが無いRequestId(古い結果)は無害に無視する`` () =
     let error: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 1400; ElapsedUs = 0L }
-    let state', _, _, failureInfo = onEffectCallReturned 20L 2L (RequestId 999L) (Error error) None initial
+    let state', _, _, failureInfo, _ = onEffectCallReturned 20L 2L (RequestId 999L) (Error error) None initial
     Assert.Equal(initial, state')
     Assert.Equal(None, failureInfo)
 
@@ -628,7 +644,7 @@ let ``Transient(ハング判定前のERROR_TIMEOUT)は即座に再試行し、De
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid0 = pendingRidFor afterReconcile w
     let error: NativeCallRecord = { Api = "SendMessageTimeout"; Space = Win32LastError; Code = 1460; ElapsedUs = 500L } // >0なのでTransient
-    let afterRetry, effects, cmds, failureInfo = onEffectCallReturned 20L 2L rid0 (Error error) None afterReconcile
+    let afterRetry, effects, cmds, failureInfo, _ = onEffectCallReturned 20L 2L rid0 (Error error) None afterReconcile
     Assert.Equal(Some (w, Transient), failureInfo)
     Assert.Equal(1, Map.count afterRetry.Pending)
     let rid1 = pendingRidFor afterRetry w
@@ -647,7 +663,7 @@ let ``Transientが上限回数続くと、最終的にPendingとDesiredを取り
     let error: NativeCallRecord = { Api = "SendMessageTimeout"; Space = Win32LastError; Code = 1460; ElapsedUs = 500L }
     let rec driveToGiveUp (attemptsLeft: int) (state: PlacementState) : PlacementState * TimerCommand<TimerId> list =
         let rid = pendingRidFor state w
-        let state', _, cmds, _ = onEffectCallReturned 20L 2L rid (Error error) None state
+        let state', _, cmds, _, _ = onEffectCallReturned 20L 2L rid (Error error) None state
         if attemptsLeft <= 1 then state', cmds else driveToGiveUp (attemptsLeft - 1) state'
     let final, lastCmds = driveToGiveUp pendingRetryMaxAttempts afterReconcile
     Assert.Empty(final.Pending)
@@ -663,10 +679,10 @@ let ``本当に異なる矩形が発行後に観測されたら、PendingDeadlin
     let w = WindowId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let mismatchedRect = { workArea with X = workArea.X + 50 }
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w mismatchedRect 10L) afterDispatched
-    let afterDeadline, effects, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid noDpi afterObserved
+    let afterDeadline, effects, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid noDpi afterObserved
     Assert.Empty(afterDeadline.Pending)
     Assert.Empty(effects) // Retryしない(同じTargetへSetRectを再発行しない)
     Assert.Equal(Some (Shown (Some workArea)), Map.tryFind w afterDeadline.Desired) // Desiredは目標のまま残す
@@ -679,7 +695,7 @@ let ``DispatchSeqが未確認(EffectCallReturned Okがまだ届いていない)�
     let rid = pendingRidFor afterReconcile w
     let differentRect = { workArea with X = workArea.X + 50 }
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w differentRect 10L) afterReconcile
-    let afterDeadline, effects, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid noDpi afterObserved
+    let afterDeadline, effects, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid noDpi afterObserved
     Assert.Equal(1, Map.count afterDeadline.Pending)
     Assert.NotEmpty(effects)
 
@@ -688,10 +704,10 @@ let ``DispatchSeqより古い(発行前に取得された)観測はMismatch判�
     let w = WindowId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 10L) afterReconcile
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 10L) afterReconcile
     let staleRect = { workArea with X = workArea.X + 999 }
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w staleRect 5L) afterDispatched // 5 < DispatchSeq(10)
-    let afterDeadline, effects, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid noDpi afterObserved
+    let afterDeadline, effects, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid noDpi afterObserved
     Assert.Equal(1, Map.count afterDeadline.Pending)
     Assert.NotEmpty(effects)
 
@@ -705,9 +721,9 @@ let ``発行後も観測がBaselineのまま変わらなければMismatchにし�
     match Map.tryFind rid afterReconcile.Pending with
     | Some pr -> Assert.Equal(Some baselineRect, pr.Baseline)
     | None -> Assert.True(false, "expected a pending")
-    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w baselineRect 10L) afterDispatched // 発行後だが変化無し
-    let afterDeadline, effects, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid noDpi afterObserved
+    let afterDeadline, effects, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid noDpi afterObserved
     Assert.Equal(1, Map.count afterDeadline.Pending)
     Assert.NotEmpty(effects)
 
@@ -717,7 +733,7 @@ let ``supersedeされた旧Epochの目標が遅れて観測されても、新し
     let afterReconcile1, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid0 = pendingRidFor afterReconcile1 w
     let oldTarget = workArea
-    let afterDispatched0, _, _, _ = onEffectCallReturned 11L 2L rid0 (Ok ()) (Some 5L) afterReconcile1
+    let afterDispatched0, _, _, _, _ = onEffectCallReturned 11L 2L rid0 (Ok ()) (Some 5L) afterReconcile1
     let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
     let afterReconcile2, _, _, _ = reconcileWorkspace 15L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterDispatched0
     let rid1 = pendingRidFor afterReconcile2 w
@@ -725,10 +741,10 @@ let ``supersedeされた旧Epochの目標が遅れて観測されても、新し
     match Map.tryFind w afterReconcile2.InFlightTargets with
     | Some targets -> Assert.Contains((IntentEpoch 0L, oldTarget), targets)
     | None -> Assert.True(false, "expected the superseded target to be tracked as in-flight")
-    let afterDispatched1, _, _, _ = onEffectCallReturned 16L 2L rid1 (Ok ()) (Some 20L) afterReconcile2
+    let afterDispatched1, _, _, _, _ = onEffectCallReturned 16L 2L rid1 (Ok ()) (Some 20L) afterReconcile2
     // 旧rid0のSetRectが遅れて適用され、旧Targetがそのまま観測される(新rid1のDispatchSeq(20)より新しい)。
     let afterObserved, _, _ = onWindowObserved 30L (observedSnapshot w oldTarget 25L) afterDispatched1
-    let afterDeadline, effects, _ = onPendingDeadlineTimerFired (15L + pendingDeadlineMs) rid1 noDpi afterObserved
+    let afterDeadline, effects, _, _ = onPendingDeadlineTimerFired (15L + pendingDeadlineMs) rid1 noDpi afterObserved
     Assert.Equal(1, Map.count afterDeadline.Pending) // Mismatchではない(旧Epochの目標として除外)、Timeout/Retryのまま
     Assert.NotEmpty(effects)
 
@@ -778,11 +794,11 @@ let ``幅が目標より広い矩形が観測されると、DIP正規化してMi
     let m = MonitorId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let widerRect = { workArea with Width = 2000 } // 要求(workArea.Width=1920)より広い=アプリの最小幅制約
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w widerRect m 10L) afterDispatched
     let dpiOf (mid: MonitorId) = if mid = m then Some 192 else None // 200%
-    let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    let afterDeadline, _, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
     match Map.tryFind w afterDeadline.MinWidth with
     | Some { Value = v; Confidence = Inferred _ } -> Assert.Equal(2000 * 96 / 192, v) // DIPへ正規化(200%なので半分)
     | other -> Assert.True(false, sprintf "expected an Inferred MinWidth belief, got %A" other)
@@ -793,12 +809,12 @@ let ``幅が目標より広くない観測はMismatchとして終端してもMin
     let m = MonitorId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     // 幅は要求と同じだがX位置が違う：Mismatchにはなるが、幅は広がっていないのでMinWidthの証拠ではない。
     let shiftedRect = { workArea with X = workArea.X + 50 }
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w shiftedRect m 10L) afterDispatched
     let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
-    let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    let afterDeadline, _, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
     Assert.Empty(afterDeadline.Pending) // Mismatchとして終端はする
     Assert.Equal(None, Map.tryFind w afterDeadline.MinWidth) // だがMinWidthの証拠にはしない
 
@@ -808,10 +824,10 @@ let ``モニターのDPIが分からない場合は、幅が広い観測でもMi
     let m = MonitorId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let widerRect = { workArea with Width = 2000 }
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w widerRect m 10L) afterDispatched
-    let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid noDpi afterObserved // dpiOfが常にNone
+    let afterDeadline, _, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid noDpi afterObserved // dpiOfが常にNone
     Assert.Empty(afterDeadline.Pending)
     Assert.Equal(None, Map.tryFind w afterDeadline.MinWidth)
 
@@ -824,9 +840,9 @@ let ``同じ最小幅が繰り返し観測されると、値は変えず根拠(I
 
     let afterReconcile1, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid1 = pendingRidFor afterReconcile1 w
-    let afterDispatched1, _, _, _ = onEffectCallReturned 11L 2L rid1 (Ok ()) (Some 5L) afterReconcile1
+    let afterDispatched1, _, _, _, _ = onEffectCallReturned 11L 2L rid1 (Ok ()) (Some 5L) afterReconcile1
     let afterObserved1, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w widerRect m 10L) afterDispatched1
-    let afterDeadline1, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid1 dpiOf afterObserved1
+    let afterDeadline1, _, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid1 dpiOf afterObserved1
     let refsAfterFirst =
         match Map.tryFind w afterDeadline1.MinWidth with
         | Some { Confidence = Inferred refs } -> refs
@@ -848,9 +864,9 @@ let ``同じ最小幅が繰り返し観測されると、値は変えず根拠(I
     let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
     let afterReconcile2, _, _, _ = reconcileWorkspace 15L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterIntermediate
     let rid2 = pendingRidFor afterReconcile2 w
-    let afterDispatched2, _, _, _ = onEffectCallReturned 16L 2L rid2 (Ok ()) (Some 20L) afterReconcile2
+    let afterDispatched2, _, _, _, _ = onEffectCallReturned 16L 2L rid2 (Ok ()) (Some 20L) afterReconcile2
     let afterObserved2, _, _ = onWindowObserved 30L (observedSnapshotWithMonitor w widerRect m 25L) afterDispatched2
-    let afterDeadline2, _, _ = onPendingDeadlineTimerFired (15L + pendingDeadlineMs) rid2 dpiOf afterObserved2
+    let afterDeadline2, _, _, _ = onPendingDeadlineTimerFired (15L + pendingDeadlineMs) rid2 dpiOf afterObserved2
     match Map.tryFind w afterDeadline2.MinWidth with
     | Some { Value = v; Confidence = Inferred refs } ->
         Assert.Equal(2000, v) // 値は変わらない
@@ -863,11 +879,11 @@ let ``onWindowVanishedはMinWidthも消す(v2.43)`` () =
     let m = MonitorId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let widerRect = { workArea with Width = 2000 }
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w widerRect m 10L) afterDispatched
     let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
-    let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    let afterDeadline, _, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
     Assert.NotEmpty(Map.tryFind w afterDeadline.MinWidth |> Option.toList)
     let afterVanished, _ = onWindowVanished w afterDeadline
     Assert.Equal(None, Map.tryFind w afterVanished.MinWidth)
@@ -879,7 +895,7 @@ let ``DpiBehavior=RescalesItselfで2段目リサイズ待ち中(DpiCrossing未�
     let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     // DPIクロッシング待ち中（checkDpiCrossingの記録を直接構成する——`PlacementState`は公開レコード）、
     // かつこの窓はRescalesItselfだと分かっていることにする。
     let afterMarked =
@@ -889,7 +905,7 @@ let ``DpiBehavior=RescalesItselfで2段目リサイズ待ち中(DpiCrossing未�
     let widerRect = { workArea with Width = workArea.Width + 100 } // Targetより広い、かつDpiCrossingのbaseline(workArea)とも異なる
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w widerRect m 10L) afterMarked
     let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
-    let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    let afterDeadline, _, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
     Assert.Empty(afterDeadline.Pending) // Mismatchとしての終端・Pending解消は変わらない
     Assert.Equal(None, Map.tryFind w afterDeadline.MinWidth) // だがMinWidthの証拠にはしない(2段目待ち中)
 
@@ -900,7 +916,7 @@ let ``DpiBehavior=OsBitmapScaledならDpiCrossing未決着中でもMismatchをMi
     let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     // 除外はRescalesItselfの窓だけが対象(§4.5)——OsBitmapScaledなら2段目自己リサイズという概念自体が
     // 無いので、DpiCrossingが(何らかの理由で)残っていても除外しない。
     let afterMarked =
@@ -910,7 +926,7 @@ let ``DpiBehavior=OsBitmapScaledならDpiCrossing未決着中でもMismatchをMi
     let widerRect = { workArea with Width = workArea.Width + 100 }
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w widerRect m 10L) afterMarked
     let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
-    let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    let afterDeadline, _, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
     match Map.tryFind w afterDeadline.MinWidth with
     | Some { Confidence = Inferred _ } -> ()
     | other -> Assert.True(false, sprintf "expected an Inferred MinWidth belief, got %A" other)
@@ -950,13 +966,13 @@ let ``Dragging中の窓はPendingDeadline発火時にMismatch判定もRetryも�
     let m = MonitorId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     // ユーザーがドラッグ中に、要求とは異なる矩形が観測される(ユーザー自身の操作の結果)。
     let draggedRect = { workArea with X = workArea.X + 300; Width = 2000 } // 幅も要求より広い(MinWidthの証拠候補)
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w draggedRect m 10L) afterDispatched
     let afterDragStart = onMoveSizeStarted w afterObserved
     let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
-    let afterDeadline, effects, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterDragStart
+    let afterDeadline, effects, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterDragStart
     Assert.Empty(afterDeadline.Pending) // 終端はする(Reevaluateと同じ、戦わない)
     Assert.Empty(effects) // Retryしない
     Assert.Equal(None, Map.tryFind w afterDeadline.RetryAttempts)
@@ -970,12 +986,12 @@ let ``ドラッグ終了後は通常どおりMismatch判定に戻る(回帰確�
     let m = MonitorId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let afterDragEnded = onMoveSizeEnded w afterDispatched // Draggingに入っていなくても安全にno-op
     let widerRect = { workArea with Width = 2000 }
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w widerRect m 10L) afterDragEnded
     let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
-    let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    let afterDeadline, _, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
     match Map.tryFind w afterDeadline.MinWidth with
     | Some { Confidence = Inferred _ } -> ()
     | other -> Assert.True(false, sprintf "expected an Inferred MinWidth belief (normal Mismatch evidence capture), got %A" other)
@@ -988,13 +1004,13 @@ let ``最小化中の窓はPendingDeadline発火時にMismatch判定もRetryも�
     let m = MonitorId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     // ユーザーが最小化した直後、`-32000`付近の座標が観測される(CIスパイクS25、幅も要求より広い
     // ——MinWidthの証拠候補)。
     let minimizedRect = { X = -32000; Y = -32000; Width = 2000; Height = 2000 }
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotMinimized w minimizedRect m 10L) afterDispatched
     let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
-    let afterDeadline, effects, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    let afterDeadline, effects, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
     Assert.Empty(afterDeadline.Pending) // 終端はする(Reevaluateと同じ、戦わない)
     Assert.Empty(effects) // Retryしない
     Assert.Equal(None, Map.tryFind w afterDeadline.RetryAttempts)
@@ -1008,13 +1024,13 @@ let ``最大化中の窓はPendingDeadline発火時にMismatch判定もRetryも�
     let m = MonitorId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     // ユーザーが最大化すると、観測される矩形はモニターのWorkArea全体になる(TargetRectとは不一致、
     // 幅も要求より広い——MinWidthの証拠候補)。
     let maximizedRect = { workArea with Width = workArea.Width + 500 }
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotMaximizedWithMonitor w maximizedRect m 10L) afterDispatched
     let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
-    let afterDeadline, effects, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    let afterDeadline, effects, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
     Assert.Empty(afterDeadline.Pending) // 終端はする(Reevaluateと同じ、戦わない)
     Assert.Empty(effects) // Retryしない
     Assert.Equal(None, Map.tryFind w afterDeadline.RetryAttempts)
@@ -1032,11 +1048,11 @@ let ``最大化から復元した後は通常どおりMismatch判定に戻る(�
     let m = MonitorId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let widerRect = { workArea with Width = 2000 }
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w widerRect m 10L) afterDispatched
     let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
-    let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    let afterDeadline, _, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
     match Map.tryFind w afterDeadline.MinWidth with
     | Some { Confidence = Inferred _ } -> ()
     | other -> Assert.True(false, sprintf "expected an Inferred MinWidth belief (normal Mismatch evidence capture), got %A" other)
@@ -1047,11 +1063,11 @@ let ``最小化から復元した後は通常どおりMismatch判定に戻る(�
     let m = MonitorId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let widerRect = { workArea with Width = 2000 }
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w widerRect m 10L) afterDispatched
     let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
-    let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    let afterDeadline, _, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
     match Map.tryFind w afterDeadline.MinWidth with
     | Some { Confidence = Inferred _ } -> ()
     | other -> Assert.True(false, sprintf "expected an Inferred MinWidth belief (normal Mismatch evidence capture), got %A" other)
@@ -1076,10 +1092,10 @@ let ``Mismatch終端時は観測された矩形(Desiredではない)がAccepted�
     let w = WindowId 1L
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
-    let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let mismatchedRect = { workArea with X = workArea.X + 50 }
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w mismatchedRect 10L) afterDispatched
-    let afterDeadline, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid noDpi afterObserved
+    let afterDeadline, _, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid noDpi afterObserved
     Assert.Equal(Some mismatchedRect, Map.tryFind w afterDeadline.Accepted) // Desired(workArea)ではない
 
 [<Fact>]

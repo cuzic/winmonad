@@ -739,6 +739,12 @@ let onIntegrityReprobeTimerFired (now: int64) (w: WindowId) (state: PlacementSta
 /// リサイズ枠を適用した後の`VisibleFrameRect`が`desired`に一致するはず（実機で確認済み、
 /// architecture.md v2.112）。信念が無い窓（発見直後で観測が1回も無い等）は無補正のまま返す——
 /// 机上で既定値を仮定せず、実測が無ければ補正しない（§4.5の規律と同じ）。
+/// **既知の未対応（Opusレビュー論点1-F）**：`FrameInset.Monitor`は観測時のモニターを記録している
+/// だけで、ここではその窓の「発行先」モニターと一致するかを一切確認していない——異なるDPIの
+/// モニターへ移った直後の最初の発行には、古いDPIで測ったinsetがそのまま使われてしまう
+/// （`dispatchPlacements`/`retryOrGiveUp`はどちらも`dpiOf`を受け取らないため、今は確認する手段が
+/// 無い）。実測で確認できるまでは「別モニターでも同じinsetを試す」という楽観的な単純化のまま
+/// にする——§21「不可視リサイズ枠の補正方式」に記録済みの残課題。
 let private correctedDispatchTarget (w: WindowId) (desired: PixelRect) (insets: Map<WindowId, FrameInset>) : PixelRect =
     match Map.tryFind w insets with
     | None -> desired
@@ -762,8 +768,9 @@ let private correctedDispatchTarget (w: WindowId) (desired: PixelRect) (insets: 
 /// 「望ましい可視矩形」のままにせず「補正済みのネイティブ矩形」を直接運ぶため、`Wm.Cli.Replay`
 /// （`calibrate`/`classify`、v2.110/v2.111）がこのTraceを読まないと「望ましい可視矩形」を
 /// 取り戻せない（DecisionTrace.fsの`FrameInsetApplied`型直前のコメント参照）。
-/// **`retryOrGiveUp`側の同じ補正は未配線のまま**（既知のスコープ外、§21参照）——
-/// `onPendingDeadlineTimerFired`の3-タプルを4-タプルへ migrateする追加コストが要るため後回しにした。
+/// **v2.119で`retryOrGiveUp`にも同じ補正を配線した**（`onPendingDeadlineTimerFired`/
+/// `onEffectCallReturned`を3/4-タプルから4/5-タプルへ migrate、既存の呼び出し元
+/// 55箇所をsedで機械的に更新——v2.108の`reconcileWorkspace`3→4タプル移行と同じ手法）。
 let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: PlacementState) : PlacementState * Effect list * TimerCommand<TimerId> list * DecisionTrace list =
     ValidatedPlan.placements validated
     |> List.fold
@@ -895,14 +902,14 @@ let reconcileWorkspace
 /// `rid`自身の`PendingDeadline`タイマーの後始末（`CancelTimer`）は呼び出し側の責務——
 /// `onPendingDeadlineTimerFired`はタイマーが発火した直後で既に表から消えているため不要だが、
 /// `onEffectCallReturned`はタイマーがまだ生きている状態で呼ばれるため必要、という違いがあるため。
-let private retryOrGiveUp (now: int64) (rid: RequestId) (pr: PendingRequest) (state: PlacementState) : PlacementState * Effect list * TimerCommand<TimerId> list =
+let private retryOrGiveUp (now: int64) (rid: RequestId) (pr: PendingRequest) (state: PlacementState) : PlacementState * Effect list * TimerCommand<TimerId> list * DecisionTrace list =
     let attemptsSoFar = Map.tryFind pr.Window state.RetryAttempts |> Option.defaultValue 0
     if attemptsSoFar + 1 >= pendingRetryMaxAttempts then
         { state with
             Pending = Map.remove rid state.Pending
             Desired = Map.remove pr.Window state.Desired
             RetryAttempts = Map.remove pr.Window state.RetryAttempts },
-        [], []
+        [], [], []
     else
         let newRid = RequestId state.NextRequestId
         let deadline = now + pendingDeadlineMs
@@ -910,12 +917,17 @@ let private retryOrGiveUp (now: int64) (rid: RequestId) (pr: PendingRequest) (st
         // `DispatchSeq`をそのまま引き継ぐと、まだ届いていない新しい`EffectCallReturned`より前の
         // 観測をMismatch判定に使ってしまう。`Baseline`（同じ目標への再試行なので）はそのまま引き継ぐ。
         let retried = { pr with IssuedAt = now; Deadline = deadline; DispatchSeq = None }
+        // `dispatchPlacements`と同じ補正（v2.119、`correctedDispatchTarget`の型直前のコメント参照）。
+        let dispatchTarget = correctedDispatchTarget pr.Window pr.TargetRect state.FrameInsets
+        let correctionTrace =
+            if dispatchTarget <> pr.TargetRect then [ FrameInsetApplied (newRid, pr.TargetRect, dispatchTarget) ] else []
         { state with
             Pending = Map.add newRid retried (Map.remove rid state.Pending)
             NextRequestId = state.NextRequestId + 1L
             RetryAttempts = Map.add pr.Window (attemptsSoFar + 1) state.RetryAttempts },
-        [ SetRect (newRid, pr.Window, pr.TargetRect) ],
-        [ StartTimer (TimerId.Placement (PendingDeadline newRid), pendingDeadlineMs) ]
+        [ SetRect (newRid, pr.Window, dispatchTarget) ],
+        [ StartTimer (TimerId.Placement (PendingDeadline newRid), pendingDeadlineMs) ],
+        correctionTrace
 
 /// `Mismatch → Reevaluate`（§7.2、v2.42。Opus敵対的レビューで設計、ファイル冒頭コメント参照）：
 /// `PendingDeadline`満了時点で、発行後に取得された新鮮な観測が、発行前の状態（`Baseline`）とも、
@@ -993,7 +1005,7 @@ let onPendingDeadlineTimerFired
     (rid: RequestId)
     (dpiOf: MonitorId -> int option)
     (state: PlacementState)
-    : PlacementState * Effect list * TimerCommand<TimerId> list =
+    : PlacementState * Effect list * TimerCommand<TimerId> list * DecisionTrace list =
     let isMinimized (w: WindowId) : bool =
         Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.IsMinimized) |> Option.defaultValue false
     let isMaximized (w: WindowId) : bool =
@@ -1006,7 +1018,7 @@ let onPendingDeadlineTimerFired
         { state with
             Pending = Map.remove rid state.Pending
             RetryAttempts = Map.remove pr.Window state.RetryAttempts },
-        [], []
+        [], [], []
     | Some pr when awaitDeadline (Some pr.Deadline) now && isMinimized pr.Window ->
         // 「最小化」の除外（v2.73、Opusレビューの条件5、ファイル冒頭`tryMismatchObservation`の
         // コメント参照）：最小化中は観測される矩形が`-32000`付近へ移るだけで、ユーザー操作
@@ -1019,7 +1031,7 @@ let onPendingDeadlineTimerFired
         { state with
             Pending = Map.remove rid state.Pending
             RetryAttempts = Map.remove pr.Window state.RetryAttempts },
-        [], []
+        [], [], []
     | Some pr when awaitDeadline (Some pr.Deadline) now && isMaximized pr.Window ->
         // 「最大化」の除外（v2.77、条件5・6と同じ理由）：ユーザーが最大化すると観測される矩形は
         // モニターのWorkArea全体になり、TargetRectとは一致しないのが普通——これはアプリが要求を
@@ -1030,7 +1042,7 @@ let onPendingDeadlineTimerFired
         { state with
             Pending = Map.remove rid state.Pending
             RetryAttempts = Map.remove pr.Window state.RetryAttempts },
-        [], []
+        [], [], []
     | Some pr when awaitDeadline (Some pr.Deadline) now ->
         match tryMismatchObservation pr state with
         | Some (observed, valueSeq) ->
@@ -1062,9 +1074,9 @@ let onPendingDeadlineTimerFired
                 // ではなくこれを以後のドリフト検知の基準にすることで、Reevaluate済みの窓と無限に
                 // 戦わない（Opusレビュー§B-1）。
                 Accepted = Map.add pr.Window observed state.Accepted },
-            [], []
+            [], [], []
         | None -> retryOrGiveUp now rid pr state
-    | _ -> state, [], []
+    | _ -> state, [], [], []
 
 /// §7.2「GateRejected → Cancelled（Deadlineまで待たず同じstep内で即時に遷移する）」。
 /// `GatedEffect.gate`が返す拒否リストのうち、このstepでPlacementが発行したPending（`SetRect`）
@@ -1116,7 +1128,7 @@ let onEffectCallReturned
     (result: Result<unit, NativeCallRecord>)
     (dispatchSeq: int64 option)
     (state: PlacementState)
-    : PlacementState * Effect list * TimerCommand<TimerId> list * (WindowId * EffectFailure) option =
+    : PlacementState * Effect list * TimerCommand<TimerId> list * (WindowId * EffectFailure) option * DecisionTrace list =
     match result with
     | Ok () ->
         // `Mismatch → Reevaluate`（v2.42）：発行が実際に受け付けられた時点のSampleSequenceを記録する
@@ -1124,11 +1136,11 @@ let onEffectCallReturned
         // は変えない（§7.2「SetRectのネイティブAPI呼出が成功しても、目標矩形を観測するまではSatisfied
         // にしない」）。
         match Map.tryFind rid state.Pending with
-        | Some pr -> { state with Pending = Map.add rid { pr with DispatchSeq = dispatchSeq } state.Pending }, [], [], None
-        | None -> state, [], [], None
+        | Some pr -> { state with Pending = Map.add rid { pr with DispatchSeq = dispatchSeq } state.Pending }, [], [], None, []
+        | None -> state, [], [], None, []
     | Error record ->
         match Map.tryFind rid state.Pending with
-        | None -> state, [], [], None // 古い結果、またはこのPendingはすでに別の経路で終端済み
+        | None -> state, [], [], None, [] // 古い結果、またはこのPendingはすでに別の経路で終端済み
         | Some pr ->
             let failure = classify record
             // `rid`自身の`PendingDeadline`タイマーはまだ生きている（Timeoutより先にこの結果が届いた）
@@ -1137,8 +1149,8 @@ let onEffectCallReturned
             let cancelOldTimer = [ CancelTimer (TimerId.Placement (PendingDeadline rid)) ]
             match failure with
             | Transient ->
-                let state', effects, cmds = retryOrGiveUp now rid pr state
-                state', effects, cancelOldTimer @ cmds, Some (pr.Window, failure)
+                let state', effects, cmds, traces = retryOrGiveUp now rid pr state
+                state', effects, cancelOldTimer @ cmds, Some (pr.Window, failure), traces
             | _ ->
                 let cancelled =
                     { state with
@@ -1152,7 +1164,7 @@ let onEffectCallReturned
                             Movability =
                                 Map.add pr.Window { Value = NotMovable; Confidence = Inferred [ Outcome (evidenceSequence, rid) ]; LastRevisedAt = now } cancelled.Movability }
                     | _ -> cancelled
-                state', [], cancelOldTimer, Some (pr.Window, failure)
+                state', [], cancelOldTimer, Some (pr.Window, failure), []
 
 /// `DomainEvents.TopologySettled`（§7.3のScreenSettle→Grace。モニター構成が確定した）：既存の全Pendingは
 /// 古いモニター配置に基づく目標なので、観測を待たず即座に`Superseded`（Cancelled）にする（§7.2
