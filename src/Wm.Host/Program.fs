@@ -449,6 +449,17 @@ let main _argv =
                 let w = WindowId (hwnd.ToInt64())
                 submit4 now "wm-host-foreground" (ForegroundObserved (observation now (Ok (Some w)))) |> ignore)
 
+    // ラウンド8追加修正：ラウンド4と同じ理由で、実際のSetRectが動かした結果を`RawReobserved`で
+    // 再投入しないと`checkPendingSatisfied`が一度も一致を検出できず、`PendingDeadline`満了のたびに
+    // 同じ目標へリトライし続けてしまう（最初の診断ログで同じ窓へ3回連続で同じSetRectが発行されていた
+    // 実際の症状、`pendingRetryMaxAttempts=3`と一致）。自プロセスに絞った`EVENT_OBJECT_LOCATIONCHANGE`
+    // を購読し、実際に動いた窓を再観測してCoreへ返す。
+    let locationHook4 =
+        hookLocationChangeForProcess (uint32 (Process.GetCurrentProcess().Id)) (fun _ hwnd ->
+            if hwnd = testFormA.Handle || hwnd = testFormB.Handle then
+                let now = liveNow ()
+                submit4 now "wm-host-locationchange" (RawReobserved (observeWindow now monitorHandles titleMatcher hwnd) |> normalize |> List.exactlyOne) |> ignore)
+
     let hotkeyIdFocusNext = 1
     let hotkeyIdSwapWithMaster = 2
     let registeredFocusNext = RegisterHotKey(hotkeyForm.Handle, hotkeyIdFocusNext, MOD_CONTROL ||| MOD_SHIFT, uint32 VK_J)
@@ -498,6 +509,7 @@ let main _argv =
     UnregisterHotKey(hotkeyForm.Handle, hotkeyIdFocusNext) |> ignore
     UnregisterHotKey(hotkeyForm.Handle, hotkeyIdSwapWithMaster) |> ignore
     foregroundHook.Unhook ()
+    locationHook4.Unhook ()
     keepDispatching4 <- false
     effectApplyThread4.Join(2000) |> ignore
 
