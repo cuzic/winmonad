@@ -48,6 +48,7 @@ open Wm.Contracts.Identifiers
 open Wm.Contracts.ErrorTypes
 open Wm.Contracts.CoreCommand
 open Wm.Contracts.GatedEffect
+open Wm.Contracts.JournalTypes
 open Wm.Core.WmState
 open Wm.Policy.PolicyEvaluator
 open Wm.Runtime.Reducer
@@ -195,7 +196,15 @@ let main _argv =
     // 段6：ラウンド3。隔離された別のReducer・自分で作ったテスト窓だけを対象に、実際にEffectを
     // OSへ発行する（型直前のコメント参照）。
     printfn "\n--- Round 3: real Effect dispatch against an isolated test window ---"
-    let reducer3 = Reducer(RuntimePolicy.defaults, "phase-b-round3", "wm-host-round3", "no-policy-artifact", None)
+    // ラウンド6：reducer3にも実際にJournalを持たせる（round1/2のreducerは既にjournalPathを持つが、
+    // round3/4のreducer3は`None`のままだった）。`Wm.Runtime.Reducer.Submit`は`EffectCallReturned`な
+    // 入力だけ`Kind = EffectCallReturnedKind`で書き、他は`InputReceived`（型直前のコメント参照、v2.82）
+    // ——これを読み返すだけでOS発行結果(`EffectCallReturnedKind`)と観測結果(`InputReceived`の
+    // `WindowObserved`)がJournal上で区別して追跡できることを実機で確認する（architecture.md §18
+    // Phase B Gate「実機の1件の不具合を入力→判断→Effect→実観測として調査できる」の直接の検証）。
+    let journalPath3 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round3-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    printfn "Round 3+4+6 journal: %s" journalPath3
+    let reducer3 = Reducer(RuntimePolicy.defaults, "phase-b-round3", "wm-host-round3", "no-policy-artifact", Some journalPath3)
     let effectQueue = ConcurrentQueue<GatedEffect>()
     let resultQueue = ConcurrentQueue<RequestId * Result<unit, NativeCallRecord>>()
     let mutable keepDispatching = true
@@ -303,6 +312,20 @@ let main _argv =
     | None -> printfn "Core's classification for the test window: (not found in Windows.Records)"
     printfn "Core's remaining Pending requests just before unhooking LOCATIONCHANGE: %d" pendingBeforeUnhook
     printfn "Core's remaining Pending requests (final): %d" (Map.count reducer3.State.Placement.Pending)
+
+    // ラウンド6：Journalを読み返し、OS発行結果(`EffectCallReturnedKind`)と観測結果
+    // (`InputReceived`のうち`WindowObserved`)が実際に区別して記録されていることを確認する。
+    let journalEntries = Wm.Journal.JournalWriter.readAll journalPath3 |> List.ofSeq
+    printfn "\nRound 6: journal entries written=%d" journalEntries.Length
+    journalEntries
+    |> List.countBy (fun e -> e.Kind)
+    |> List.iter (fun (kind, n) -> printfn "  Kind=%A count=%d" kind n)
+    journalEntries
+    |> List.filter (fun e -> e.Kind = EffectCallReturnedKind)
+    |> List.iter (fun e -> printfn "  [seq=%d] EffectCallReturnedKind: %A" e.Sequence e.Payload)
+    journalEntries
+    |> List.filter (fun e -> match e.Payload with InputPayload (WindowObserved _) -> true | _ -> false)
+    |> List.iter (fun e -> printfn "  [seq=%d] InputReceived(WindowObserved)" e.Sequence)
 
     testForm3.Close()
 
