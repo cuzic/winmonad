@@ -843,6 +843,49 @@ let private tryMismatchObservation (pr: PendingRequest) (state: PlacementState) 
                 if observed <> pr.TargetRect && not matchesBaseline && not matchesInFlight then Some (observed, valueSeq) else None
             | _ -> None
 
+/// 不可視リサイズ枠（§4.2「座標系契約」/§13、v2.112でpad2py-pad-host実機から実測）の信念
+/// （v2.114、Round 2スライス1）。`NativeRect`が`VisibleFrameRect`より各辺どれだけ外側に広いかを
+/// 辺ごとに独立して保持する——対称とは仮定しない。`AtDpi`は観測時のモニターDPI（Opusレビュー論点
+/// 1-F：insetはDPIで変わるため、別DPIのモニターへ移った窓の発行にはそのまま使えない、`Placement`
+/// 側で発行先モニターのDPIと比較する責務は未配線のまま——このスライスは信念の型と修正規則だけ）。
+/// **この型・`reviseFrameInset`はまだ`PlacementState`/`onWindowObserved`/`dispatchPlacements`へ
+/// 配線していない**（Opus敵対的レビュー`/tmp/opus-review-frame-inset.md`で見つかった4つの高リスク
+/// 論点——リトライ経路の漏れ、`SetRect`契約の変更によるWm.Cli破壊、Mismatch→Reevaluateの自己修復
+/// 不能、MinWidthへの偽の証拠混入——は、信念の修正規則だけでは解決しない。配線はRound 2の残り
+/// スライス（`SetRect`にinsetを別フィールドとして載せる契約変更、MinWidthガード）で行う）。
+type FrameInset = { Left: int; Top: int; Right: int; Bottom: int; AtDpi: int }
+
+/// 算出したinsetが暴走していないかの範囲チェック（Opusレビュー1-D/1-G：DPI非対応プロセスでの
+/// スケール誤差混入、分断された読み取りでの異常値を最後の安全網として弾く）。`k`は実測（7px@96dpi）の
+/// 数倍の余裕を持たせた暫定値——実機チューニング待ち（§21）。
+let private frameInsetMaxPx (dpi: int) : int = 16 * dpi / 96
+
+let private frameInsetInRange (dpi: int) (inset: FrameInset) : bool =
+    let maxPx = frameInsetMaxPx dpi
+    let inRange v = v >= 0 && v <= maxPx
+    inRange inset.Left && inRange inset.Top && inRange inset.Right && inRange inset.Bottom
+
+/// 1回の観測から`FrameInset`の証拠を採用するか判定する純粋関数（まだ信念Mapへの配線は無い、
+/// 型直前のコメント参照）。採用しない条件（Opusレビュー1-B/1-C/1-D、全てAND）：
+/// - 最大化中・最小化中の観測（1-B：最大化中は枠が約8pxへ変わり、復元後の本来値とずれる）
+/// - 全辺0（生成直後は`NativeRect`=`VisibleFrameRect`になるという§4.2自身の既知の注意点——これを
+///   「既知のinset=0」として確定させると、Mismatch→Reevaluate後は`Desired`が変わらず再発行されない
+///   ため本当の値が来ても二度と直らない。真に枠が無い窓は結局無補正のままで実害が無いので、
+///   0の証拠を採用しないことにデメリットは無い——1-C対策）
+/// - 範囲外（1-D：分断された読み取り・DPI非対応プロセスでの暴走を弾く最後の安全網）
+let reviseFrameInset (dpi: int) (isMaximized: bool) (isMinimized: bool) (native: PixelRect) (visible: PixelRect) : FrameInset option =
+    if isMaximized || isMinimized then
+        None
+    else
+        let candidate =
+            { Left = visible.X - native.X
+              Top = visible.Y - native.Y
+              Right = (native.X + native.Width) - (visible.X + visible.Width)
+              Bottom = (native.Y + native.Height) - (visible.Y + visible.Height)
+              AtDpi = dpi }
+        let isZero = candidate.Left = 0 && candidate.Top = 0 && candidate.Right = 0 && candidate.Bottom = 0
+        if isZero || not (frameInsetInRange dpi candidate) then None else Some candidate
+
 /// §4.5「最小幅」（Accumulating）：`SetRect`で幅`r`を要求して幅`o > r`が観測された（`Mismatch`）ことを
 /// 証拠に、`o`を物理ピクセルからDIPへ正規化した値（`o × 96 / dpi`）を`Inferred`の最小幅とする
 /// （`MinWidth`の型直前のコメント参照）。より小さい幅が観測されたら値を下げる——最新の証拠をそのまま
