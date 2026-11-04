@@ -59,6 +59,12 @@
 /// 窓のいるWorkspaceを隠す/戻すと、Topology→Placementの既存の経路（v2.31以来）が
 /// `SetPresence(shown=false/true)`を発行する——これを実際の`ShowWindowAsync(SW_MINIMIZE/SW_RESTORE)`
 /// へ変換し、`IsIconic`で実窓が本当に最小化・復元されたかを確認する。
+///
+/// ラウンド12：ラウンド9（検知のみ）とラウンド11（`SetPresence`実装）を組み合わせ、§8.4の
+/// 「直前に隠した窓」の実際の復旧まで通す。Effect適用スレッドが`SetPresence(shown=false)`を
+/// 実際に適用するたびに、監視コンポーネント自身がHWND一覧を追跡する（GlazeWMのwm-watcherと同じ）。
+/// ウォッチドッグが発動したら、Reducerを一切経由せずこの一覧の窓へ直接`ShowWindowAsync(SW_RESTORE)`
+/// を呼ぶ——Coreへは一度も「戻して」と言わずに、復旧経路だけで実際に窓が戻ることを確認する。
 module Wm.Host.Program
 
 open System
@@ -787,6 +793,133 @@ let main _argv =
     printfn "Round 11 summary: IsIconic before-hide=%b after-SwitchWorkspace-hide=%b after-SwitchWorkspace-restore=%b" minimizedBeforeHide minimizedAfterHide minimizedAfterShow
     printfn "SetPresence actually minimized the real window on hide, and restored it on show: %b"
         (not minimizedBeforeHide && minimizedAfterHide && not minimizedAfterShow)
+
+    // 段12：ラウンド12。§8.4の安全停止を、ラウンド9の検知だけでなく実際の復旧動作まで通す。
+    // 「直前に隠した窓」のHWND一覧は、Effect適用スレッドが`SetPresence(shown=false)`を実際に適用
+    // するたびに監視コンポーネント自身が追跡する（GlazeWMのwm-watcherと同じ、8.4本文参照）。
+    // ウォッチドッグが発動したら、Reducerを一切経由せず（復旧操作はGatedEffectを経由しない例外経路、
+    // 8.4の明文）、この一覧にある窓だけへ直接`ShowWindowAsync(SW_RESTORE)`を呼び、
+    // `SafetyRecoveryAction`を専用Journalへ記録する。隠した後、Coreへは一切「戻して」と言わずに
+    // ウォッチドッグの復旧だけで実際に復元されることを実機で確認する。
+    printfn "\n--- Round 12: §8.4 safety-stop recovery (watcher restores last-hidden windows, bypassing Core) ---"
+    let watchdog2JournalPath = Path.Combine(Path.GetTempPath(), sprintf "wm-watchdog2-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    let reducer7 = Reducer(RuntimePolicy.defaults, "phase-b-round12", "wm-host-round12", "no-policy-artifact", None)
+    let effectQueue7 = ConcurrentQueue<GatedEffect>()
+    let resultQueue7 = ConcurrentQueue<RequestId * Result<unit, NativeCallRecord>>()
+    let mutable keepDispatching7 = true
+    let lastHiddenHwnds = Collections.Concurrent.ConcurrentDictionary<IntPtr, unit>()
+    let effectApplyThread7 =
+        Thread(fun () ->
+            while keepDispatching7 do
+                match effectQueue7.TryDequeue() with
+                | true, gated ->
+                    let effect = GatedEffect.effect gated
+                    match Wm.Windows.EffectDispatch.apply effect with
+                    | Some result ->
+                        match effect with
+                        | SetPresence (rid, WindowId raw, shown) ->
+                            (match result with
+                             | Ok () ->
+                                 let hwnd = IntPtr raw
+                                 if shown then lastHiddenHwnds.TryRemove(hwnd) |> ignore
+                                 else lastHiddenHwnds.[hwnd] <- ()
+                             | Error _ -> ())
+                            resultQueue7.Enqueue(rid, result)
+                        | _ -> ()
+                    | None -> ()
+                | false, _ -> Thread.Sleep(1))
+    effectApplyThread7.IsBackground <- true
+    effectApplyThread7.Name <- "wm-effect-apply-round12"
+    effectApplyThread7.Start()
+
+    let enqueueEffects7 (effects: GatedEffect list) = for g in effects do effectQueue7.Enqueue(g)
+    let submit7 (now: int64) (source: string) (input: InputEvent) =
+        let sr = reducer7.Submit now source input
+        enqueueEffects7 sr.Effects
+        sr
+    let advance7 () =
+        match reducer7.AdvanceToNextTimer() with
+        | Some sr -> enqueueEffects7 sr.Effects; true
+        | None -> false
+    let drainResults7 (now: int64) =
+        let mutable more = true
+        while more do
+            match resultQueue7.TryDequeue() with
+            | true, (rid, result) -> submit7 now "wm-host-effect-thread" (EffectCallReturned (rid, result, None)) |> ignore
+            | false, _ -> more <- false
+    let pump7 (ms: int) =
+        let deadline = liveNow () + int64 ms
+        while liveNow () < deadline do
+            Application.DoEvents()
+            drainResults7 (liveNow ())
+            while reducer7.Timers.NextDeadline |> Option.exists (fun d -> d <= liveNow ()) do
+                advance7 () |> ignore
+            Thread.Sleep(1)
+
+    use testForm7 = new Form(Text = "wm-host-round12-test-window", Width = 300, Height = 200)
+    testForm7.Show()
+    pump7 300
+    let hwnd7 = testForm7.Handle
+
+    submit7 (liveNow ()) "wm-host" (MonitorTopologyObserved monitors) |> ignore
+    pump7 300
+    submit7 (liveNow ()) "wm-host" (RawFirstSeen (observeWindow (liveNow ()) monitorHandles titleMatcher hwnd7) |> normalize |> List.exactlyOne) |> ignore
+    pump7 500
+
+    submit7 (liveNow ()) "wm-host" (UserCommand (SwitchWorkspace (WorkspaceId 1))) |> ignore
+    pump7 500
+    let minimizedAfterHide7 = IsIconic(hwnd7)
+    let trackedAfterHide7 = lastHiddenHwnds.ContainsKey(hwnd7)
+    printfn "Round 12: minimized after hide=%b tracked by watcher=%b" minimizedAfterHide7 trackedAfterHide7
+
+    let mutable lastHeartbeat2 = Environment.TickCount64
+    let mutable watchdog2Triggered = false
+    let heartbeatTimeoutMs2 = 500L
+    let watchdog2Thread =
+        Thread(fun () ->
+            while not watchdog2Triggered do
+                Thread.Sleep(50)
+                let gap = Environment.TickCount64 - lastHeartbeat2
+                if gap > heartbeatTimeoutMs2 then
+                    watchdog2Triggered <- true
+                    for KeyValue(hwnd, _) in lastHiddenHwnds do
+                        ShowWindowAsync(hwnd, SW_RESTORE) |> ignore
+                        lastHiddenHwnds.TryRemove(hwnd) |> ignore
+                        let entry: JournalEntry =
+                            { SchemaVersion = 1
+                              SessionId = "wm-watchdog"
+                              Sequence = 0L
+                              MonotonicTicks = Environment.TickCount64
+                              WallTimeUtc = DateTimeOffset.UtcNow
+                              CorrelationId = None
+                              CausationId = None
+                              PolicyArtifactHash = "no-policy-artifact"
+                              CoreBuildId = "wm-watchdog"
+                              Kind = SafetyRecoveryAction
+                              Payload = SafetyRecoveryActionPayload (sprintf "restored hwnd=%A after heartbeat gap %dms" hwnd gap) }
+                        Wm.Journal.JournalWriter.appendEntry watchdog2JournalPath entry
+                    printfn "  [round12 watchdog] triggered: restored last-hidden window(s) directly, bypassing Core")
+    watchdog2Thread.IsBackground <- true
+    watchdog2Thread.Name <- "wm-safety-watchdog-round12"
+    watchdog2Thread.Start()
+
+    printfn "Simulating a main-loop heartbeat gap (not the real thing) for 700ms -- Core is never told to restore anything..."
+    Thread.Sleep(700)
+    lastHeartbeat2 <- Environment.TickCount64
+    Thread.Sleep(300) // ウォッチドッグの復旧(ShowWindowAsync)が実際に反映されるまでの余裕
+
+    let minimizedAfterRecovery = IsIconic(hwnd7)
+    let trackedAfterRecovery = lastHiddenHwnds.ContainsKey(hwnd7)
+
+    keepDispatching7 <- false
+    effectApplyThread7.Join(2000) |> ignore
+    testForm7.Close()
+
+    let watchdog2Entries = Wm.Journal.JournalWriter.readAll watchdog2JournalPath |> List.ofSeq
+    printfn "Round 12 summary: watchdog2Triggered=%b minimizedAfterRecovery=%b (expected false) trackedAfterRecovery=%b (expected false) journalEntries=%d"
+        watchdog2Triggered minimizedAfterRecovery trackedAfterRecovery watchdog2Entries.Length
+    printfn "Watchdog restored the last-hidden window on its own, without Core ever being told to: %b"
+        (watchdog2Triggered && not minimizedAfterRecovery && not trackedAfterRecovery)
 
     printfn "\nDone."
     0
