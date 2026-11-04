@@ -30,6 +30,12 @@
 /// 「`RawFirstSeen`の再利用は意味的に不整合」という指摘への対応）としてCoreへ投入する。Core側
 /// （`Placement.checkPendingSatisfied`）は元々どの`WindowObserved`でもPending一致判定を行うので
 /// Coreの変更は不要——実機で閉じていなかったのはこの再観測の配線だけだった。
+///
+/// ラウンド5：`WindowSnapshot.AppIdentity.Exe`（実行ファイルのフルパス）と`TitleMatches`
+/// （採用中PolicyのTitleContainsパターンに対する一致ビット列、R4-8：生タイトル文字列自体は運ばない）
+/// を実際に問い合わせるようにした。これが無いと実アンビエント窓（ラウンド1/2が観測する69前後の
+/// 実窓）を`TitleContains`/`AppIs`規則で安全に絞り込めず、ラウンド3/4の隔離デモを実管理へ統合する
+/// 道が開かない（タスクリスト見直しで自己選定）。
 module Wm.Host.Program
 
 open System
@@ -43,6 +49,7 @@ open Wm.Contracts.ErrorTypes
 open Wm.Contracts.CoreCommand
 open Wm.Contracts.GatedEffect
 open Wm.Core.WmState
+open Wm.Policy.PolicyEvaluator
 open Wm.Runtime.Reducer
 open Wm.Normalization.WindowEventNormalizer
 open Wm.Windows.Native
@@ -77,6 +84,12 @@ let main _argv =
 
     let reducer = Reducer(RuntimePolicy.defaults, "phase-b-round12", "wm-host-round12", "no-policy-artifact", Some journalPath)
 
+    // ラウンド5：`AppIdentity.Exe`/`TitleMatches`を実際に問い合わせる（型直前のコメント参照）。
+    // `RuntimePolicy.defaults.PatternSet`は`PolicyIR.defaults`（ルール無し）から組んだものなので、
+    // 現時点では常に`Matches = Set.empty`になるが、将来WindowRulesにTitleContainsが増えても
+    // Shell側の配線はこのラウンドで完成する。
+    let titleMatcher = computeTitleMatchVector RuntimePolicy.defaults.PatternSet
+
     // 段1：実モニターを列挙し、MonitorTopologyObservedを投入してTopologyを確定させる。
     let monitorHandles = enumerateMonitorHandles ()
     let monitors = enumerateMonitors monitorHandles
@@ -90,7 +103,7 @@ let main _argv =
     printfn "Timers fired while settling Topology: %d" settledAfterTopology
 
     // 段2：実トップレベル窓を列挙し、RawFirstSeen→normalize→Reducer.Submitで1回だけ投入する。
-    let windows = enumerateTopLevelWindows 1L monitorHandles
+    let windows = enumerateTopLevelWindows 1L monitorHandles titleMatcher
     printfn "\nTop-level windows observed: %d" windows.Length
 
     let windowSubmissionResults =
@@ -119,7 +132,7 @@ let main _argv =
         let now = liveNow ()
         let w = WindowId (hwnd.ToInt64())
         let raw =
-            if eventType = EVENT_OBJECT_CREATE then Some (RawFirstSeen (observeWindow now monitorHandles hwnd))
+            if eventType = EVENT_OBJECT_CREATE then Some (RawFirstSeen (observeWindow now monitorHandles titleMatcher hwnd))
             elif eventType = EVENT_OBJECT_DESTROY then Some (RawDestroyed w)
             elif eventType = EVENT_OBJECT_SHOW || eventType = EVENT_OBJECT_HIDE then
                 Some (RawVisibility (w, observation now (queryVisible hwnd)))
@@ -133,7 +146,7 @@ let main _argv =
             elif eventType = EVENT_SYSTEM_MOVESIZESTART then
                 Some (RawMoveSizeStart w)
             elif eventType = EVENT_SYSTEM_MOVESIZEEND then
-                let snapshot = observeWindow now monitorHandles hwnd
+                let snapshot = observeWindow now monitorHandles titleMatcher hwnd
                 match snapshot.VisibleFrameRect, snapshot.Monitor with
                 | Some rectObs, Some monObs -> Some (RawMoveSizeEnd (w, rectObs, monObs))
                 | _ -> None
@@ -258,7 +271,7 @@ let main _argv =
     let handleLocationChange (_eventType: uint32) (hwnd: IntPtr) =
         if hwnd = testHWnd then
             let now = liveNow ()
-            let snapshot = observeWindow now monitorHandles hwnd
+            let snapshot = observeWindow now monitorHandles titleMatcher hwnd
             for input in normalize (RawReobserved snapshot) do
                 reobserveCount <- reobserveCount + 1
                 printfn "  [round4 t=%dms] reobserved via LOCATIONCHANGE: %A" (now - liveBaseNow) input
@@ -269,7 +282,7 @@ let main _argv =
     submit3 (liveNow ()) "wm-host" (MonitorTopologyObserved monitors) |> ignore
     pump3 500
 
-    submit3 (liveNow ()) "wm-host" (RawFirstSeen (observeWindow (liveNow ()) monitorHandles testHWnd) |> normalize |> List.exactlyOne) |> ignore
+    submit3 (liveNow ()) "wm-host" (RawFirstSeen (observeWindow (liveNow ()) monitorHandles titleMatcher testHWnd) |> normalize |> List.exactlyOne) |> ignore
     pump3 1500 // 分類・Reconcile・実際のSetWindowPos・LOCATIONCHANGEによる再観測に十分な余裕を取る
 
     let pendingBeforeUnhook = Map.count reducer3.State.Placement.Pending

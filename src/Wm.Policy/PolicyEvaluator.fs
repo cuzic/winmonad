@@ -49,6 +49,19 @@ let buildTitlePatternSet (policy: PolicyIR) : TitlePatternSet =
       PatternSetHash = hash
       IndexOf = patterns |> List.mapi (fun i s -> s, i) |> Map.ofList }
 
+/// Phase B ラウンド5：実Shellが取得した生タイトル文字列を、実際に`TitleMatchVector`へ変換する
+/// 純粋関数（これまでSimulation/本番のどちらでも実装が無く、`evaluateWindowPredicate`は常に
+/// 誰かが既に組み立てた`TitleMatchVector`を読むだけだった）。`Patterns`に現れた順のインデックスで
+/// `Matches`を作る——`buildTitlePatternSet`の`IndexOf`と添字が一致する契約（型直前のコメント参照）。
+let computeTitleMatchVector (patternSet: TitlePatternSet) (rawTitle: string) : TitleMatchVector =
+    let matches =
+        patternSet.Patterns
+        |> List.indexed
+        |> List.filter (fun (_, p) -> rawTitle.Contains(p, System.StringComparison.Ordinal))
+        |> List.map fst
+        |> Set.ofList
+    { PatternSetHash = patternSet.PatternSetHash; Matches = matches }
+
 let private notTruth (t: Truth) : Truth =
     match t with
     | Believed b -> Believed { b with Value = not b.Value }

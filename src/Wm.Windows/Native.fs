@@ -90,6 +90,28 @@ extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow)
 [<DllImport("user32.dll")>]
 extern bool IsHungAppWindow(IntPtr hwnd)
 
+// Phase B ラウンド5：`AppIdentity.Exe`（実行ファイルのフルパス）と、`TitleMatches`の元になる
+// 生タイトル文字列（R4-8：生の文字列自体はWindowSnapshotへ一切載せない、呼び出し側で即座に
+// TitleMatchVectorへ変換してから捨てる）を取得するためのAPI。
+[<DllImport("user32.dll")>]
+extern uint32 GetWindowThreadProcessId(IntPtr hWnd, uint32& lpdwProcessId)
+
+[<DllImport("kernel32.dll", SetLastError = true)>]
+extern IntPtr OpenProcess(uint32 dwDesiredAccess, bool bInheritHandle, uint32 dwProcessId)
+
+[<DllImport("kernel32.dll")>]
+extern bool CloseHandle(IntPtr hObject)
+
+/// `PROCESS_QUERY_INFORMATION`では同一ユーザーでも上位整合性プロセスの取得に失敗する
+/// （architecture.md §21、F24で実機確認済み）。`PROCESS_QUERY_LIMITED_INFORMATION`は必須。
+[<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
+extern bool QueryFullProcessImageNameW(IntPtr hProcess, uint32 dwFlags, System.Text.StringBuilder lpExeName, uint32& lpdwSize)
+
+[<DllImport("user32.dll", CharSet = CharSet.Unicode)>]
+extern int GetWindowTextW(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount)
+
+let PROCESS_QUERY_LIMITED_INFORMATION = 0x1000u
+
 let DWMWA_EXTENDED_FRAME_BOUNDS = 9
 let DWMWA_CLOAKED = 14
 let MDT_EFFECTIVE_DPI = 0
@@ -99,7 +121,7 @@ let SWP_NOZORDER = 0x0004u
 let SWP_ASYNCWINDOWPOS = 0x4000u
 let SW_RESTORE = 9
 
-let private elapsedUsOf (sw: Stopwatch) : int64 =
+let elapsedUsOf (sw: Stopwatch) : int64 =
     max 1L (sw.ElapsedTicks * 1_000_000L / Stopwatch.Frequency) // R2-22：0を入れない
 
 /// §8.1の`callBool`パターンの最小版：BOOLを返すだけの読み取り専用呼出を`Result`へ包む

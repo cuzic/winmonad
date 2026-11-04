@@ -81,6 +81,21 @@ let ``TitleContainsはPatternSetHashが食い違うとUnknownになる(Policy切
     let view = mkView defaultIdentity unformed (believed vector) unformed unformed
     Assert.True(match evaluateWindowPredicate patternSetWithFoo view (TitleContains "foo") with Unformed _ -> true | _ -> false)
 
+/// Phase B ラウンド5：`computeTitleMatchVector`（実Shellが取得した生タイトル文字列から実際に
+/// `TitleMatchVector`を組み立てる関数）が、`evaluateWindowPredicate`と実際に噛み合うことを
+/// 確認する——往復（生タイトル→Vector→評価）を初めて1つのテストで通す。
+[<Fact>]
+let ``computeTitleMatchVectorで組み立てたVectorはTitleContainsの評価と一致する`` () =
+    let vector = computeTitleMatchVector patternSetWithFoo "My foo Editor - file.txt"
+    let view = mkView defaultIdentity unformed (believed vector) unformed unformed
+    Assert.True(match evaluateWindowPredicate patternSetWithFoo view (TitleContains "foo") with Believed b -> b.Value | _ -> false)
+
+[<Fact>]
+let ``computeTitleMatchVectorはパターンを含まないタイトルではMatchesを立てない`` () =
+    let vector = computeTitleMatchVector patternSetWithFoo "Unrelated Window"
+    let view = mkView defaultIdentity unformed (believed vector) unformed unformed
+    Assert.True(match evaluateWindowPredicate patternSetWithFoo view (TitleContains "foo") with Believed b -> not b.Value | _ -> false)
+
 [<Fact>]
 let ``Notは確定した結果を反転し、Unknownはそのまま伝搬する`` () =
     Assert.True(match evaluateWindowPredicate emptyPatternSet emptyView (Not AnyWindow) with Believed b -> not b.Value | _ -> false)

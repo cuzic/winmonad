@@ -3,15 +3,21 @@
 /// `WindowSnapshot`を組み立てる。`Wm.Core`には一切依存しない（§17の依存方向）。
 ///
 /// このラウンドで意図的に対象外にしたこと（計画の「このラウンドで対象外にしたこと」参照、
-/// いずれも将来のラウンドへ切り出す）：`Process`/`AppIdentity`（Policy分類にはExe名が要るが、
-/// このラウンドの目的は「パイプが通ること」の確認であり分類の充実度ではない）、`Owner`/
-/// `IsDialog`/`MinWidthHint`/`TargetIntegrity`/`Responsiveness`/`Presence`/`DpiAwareness`/
-/// `TitleMatches`。`MonitorId`/`WindowId`はこの1回の実行内でだけ一意（HWND/HMONITORの値そのもの、
+/// いずれも将来のラウンドへ切り出す）：`Process`（`ProcessKey`はPid+CreationTimeの組が必要——
+/// HWND再利用検知(Sticky規則、v2.47)に使われるため、CreationTime取得の実機確認が要る別の課題
+/// として持ち越す）、`AppIdentity`のUWP系3フィールド(`HostExe`/`Aumid`/`CoreWindowExe`、
+/// `ApplicationFrameHost`経由のUWP/WinUI識別には未文書化COM相当の調査が要る、Phase 0の
+/// 既知の難所）、`Owner`/`IsDialog`/`MinWidthHint`/`TargetIntegrity`/`Responsiveness`/`Presence`/
+/// `DpiAwareness`。`MonitorId`/`WindowId`はこの1回の実行内でだけ一意（HWND/HMONITORの値そのもの、
 /// またはモニターは列挙順の連番）——再接続をまたいだ安定キー付与（`StableKey`、§4.1）は
 /// 次のラウンドへ持ち越す。
+/// **Phase B ラウンド5で`AppIdentity.Exe`と`TitleMatches`を実装した**（タスクリスト見直しで
+/// 自己選定：これが無いと実アンビエント窓をPolicyルールで安全に絞り込めず、ラウンド3/4の
+/// 隔離デモを実管理へ統合できないため）。
 module Wm.Windows.RealObservation
 
 open System
+open System.Diagnostics
 open System.Runtime.InteropServices
 open Wm.Contracts.Identifiers
 open Wm.Contracts.ErrorTypes
@@ -95,6 +101,40 @@ let queryCloak (hWnd: IntPtr) : Result<CloakState, NativeCallRecord> =
     else
         Error { Api = "DwmGetWindowAttribute"; Space = HResult; Code = hr; ElapsedUs = 1L }
 
+/// `GetWindowThreadProcessId`→`OpenProcess`(`PROCESS_QUERY_LIMITED_INFORMATION`)→
+/// `QueryFullProcessImageNameW`で実行ファイルのフルパスを取得する。UWP/WinUIは`ApplicationFrameHost`
+/// 自身のパスが返るだけで実アプリ本体のパスにはならない（ファイル冒頭「対象外」参照、`HostExe`の
+/// 位置づけと同じ区別——このラウンドでは`Exe`に素直に格納するだけで、UWPを見分ける判断は加えない）。
+let private queryExePath (hWnd: IntPtr) : Result<string, NativeCallRecord> =
+    let sw = Stopwatch.StartNew()
+    let mutable pid = 0u
+    GetWindowThreadProcessId(hWnd, &pid) |> ignore
+    let hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+    if hProcess = IntPtr.Zero then
+        sw.Stop()
+        Error { Api = "OpenProcess"; Space = Win32LastError; Code = Marshal.GetLastWin32Error(); ElapsedUs = elapsedUsOf sw }
+    else
+        try
+            let sb = Text.StringBuilder(1024)
+            let mutable size = uint32 sb.Capacity
+            if QueryFullProcessImageNameW(hProcess, 0u, sb, &size) then
+                sw.Stop()
+                Ok (sb.ToString())
+            else
+                sw.Stop()
+                Error { Api = "QueryFullProcessImageNameW"; Space = Win32LastError; Code = Marshal.GetLastWin32Error(); ElapsedUs = elapsedUsOf sw }
+        finally
+            CloseHandle(hProcess) |> ignore
+
+/// 生のタイトル文字列（R4-8：`WindowSnapshot`へ一切載せない。呼び出し側(`attachTitleMatches`)が
+/// 即座に`TitleMatchVector`へ変換してから捨てる、一時的な戻り値専用）。`GetWindowTextW`の戻り値0は
+/// 「タイトルが空」という正当な結果であり得る（オーナー窓等）ので、`queryVisible`等と同じ理由で
+/// 常に`Ok`（失敗シグナルとして扱わない）。
+let queryRawTitleForPolicyMatching (hWnd: IntPtr) : Result<string, NativeCallRecord> =
+    let sb = Text.StringBuilder(512)
+    GetWindowTextW(hWnd, sb, sb.Capacity) |> ignore
+    Ok (sb.ToString())
+
 let queryMonitor (monitorHandles: IntPtr list) (hWnd: IntPtr) : Result<MonitorId, NativeCallRecord> =
     let hMonitor = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST)
     match monitorIdOf monitorHandles hMonitor with
@@ -102,14 +142,19 @@ let queryMonitor (monitorHandles: IntPtr list) (hWnd: IntPtr) : Result<MonitorId
     | None -> Error { Api = "MonitorFromWindow"; Space = BoolFalseNoCode; Code = 0; ElapsedUs = 1L }
 
 /// 1件のHWNDについて、ラウンド1が問い合わせる属性一式(`IsVisible`/`NativeRect`/`VisibleFrameRect`/
-/// `IsMinimized`/`IsMaximized`/`Cloak`/`Monitor`)を全て問い合わせ、`WindowSnapshot`を組み立てる。
-/// `enumerateTopLevelWindows`（全体列挙）と、ラウンド2の`EVENT_OBJECT_CREATE`時の`RawFirstSeen`の
-/// 両方がこの同じ関数を使う。`monitorHandles`は`enumerateMonitorHandles`の結果をそのまま渡す。
-let observeWindow (now: int64) (monitorHandles: IntPtr list) (hWnd: IntPtr) : WindowSnapshot =
+/// `IsMinimized`/`IsMaximized`/`Cloak`/`Monitor`)に加え、ラウンド5で`AppIdentity.Exe`と
+/// `TitleMatches`を問い合わせ、`WindowSnapshot`を組み立てる。`enumerateTopLevelWindows`（全体列挙）と、
+/// ラウンド2の`EVENT_OBJECT_CREATE`時の`RawFirstSeen`の両方がこの同じ関数を使う。`monitorHandles`は
+/// `enumerateMonitorHandles`の結果をそのまま渡す。`titleMatcher`は呼び出し側（Wm.Host）が
+/// `Wm.Policy.PolicyEvaluator.computeTitleMatchVector`等から組み立てて渡すクロージャ——`Wm.Windows`は
+/// `Wm.Policy`に依存できない（§17の依存方向）ため、関数そのものではなく「生タイトル文字列→
+/// `TitleMatchVector`」という値だけを受け取ることで依存方向を保つ（R4-8：生タイトル文字列自体は
+/// ここで変換に使うだけで、`WindowSnapshot`には一切載せない）。
+let observeWindow (now: int64) (monitorHandles: IntPtr list) (titleMatcher: string -> TitleMatchVector) (hWnd: IntPtr) : WindowSnapshot =
     let w = WindowId (hWnd.ToInt64())
     { Id = w
       Process = None
-      AppIdentity = { Exe = None; HostExe = None; Aumid = None; CoreWindowExe = None }
+      AppIdentity = { Exe = Some (obs now (queryExePath hWnd)); HostExe = None; Aumid = None; CoreWindowExe = None }
       Owner = None
       IsDialog = None
       NativeRect = Some (obs now (queryNativeRect hWnd))
@@ -124,7 +169,7 @@ let observeWindow (now: int64) (monitorHandles: IntPtr list) (hWnd: IntPtr) : Wi
       Responsiveness = None
       Presence = None
       DpiAwareness = None
-      TitleMatches = None }
+      TitleMatches = Some (obs now (queryRawTitleForPolicyMatching hWnd |> Result.map titleMatcher)) }
 
 /// `Observation<'T>`を1件だけ組み立てる薄いヘルパー（ラウンド2の個別イベント再問合せ用、
 /// `RawVisibility`/`RawMinimized`/`RawCloak`が運ぶ値を直接作れる）。
@@ -134,8 +179,8 @@ let observation (now: int64) (value: Result<'T, NativeCallRecord>) : Observation
 /// `WindowId`はHWNDの値そのもの（この1回の実行内でだけ意味を持つ、再起動後は不変ではない）。
 /// `monitorHandles`は`enumerateMonitorHandles`の結果をそのまま渡す（`enumerateMonitors`が割り当てた
 /// `MonitorId`と同じ列挙順を共有するため）。
-let enumerateTopLevelWindows (now: int64) (monitorHandles: IntPtr list) : WindowSnapshot list =
+let enumerateTopLevelWindows (now: int64) (monitorHandles: IntPtr list) (titleMatcher: string -> TitleMatchVector) : WindowSnapshot list =
     let hwnds = ResizeArray<IntPtr>()
     let cb = EnumChildProc(fun hWnd _ -> hwnds.Add(hWnd) |> ignore; true)
     EnumWindows(cb, IntPtr.Zero) |> ignore
-    hwnds |> Seq.map (observeWindow now monitorHandles) |> List.ofSeq
+    hwnds |> Seq.map (observeWindow now monitorHandles titleMatcher) |> List.ofSeq
