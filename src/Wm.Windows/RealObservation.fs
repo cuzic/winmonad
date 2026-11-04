@@ -74,15 +74,18 @@ let private queryVisibleFrameRect (hWnd: IntPtr) : Result<PixelRect, NativeCallR
     if hr = 0 (* S_OK *) then Ok (rectOf r)
     else Error { Api = "DwmGetWindowAttribute"; Space = HResult; Code = hr; ElapsedUs = 1L }
 
-/// `Ok true`/`Ok false`のResultで返す（`callBoolRead`はBOOLの成否自体しか運ばないため）。
-let queryVisible (hWnd: IntPtr) : Result<bool, NativeCallRecord> =
-    callBoolRead "IsWindowVisible" (fun () -> IsWindowVisible(hWnd)) |> Result.map (fun () -> true)
+// v2.92で修正した実機CIでの実際のバグ：`IsWindowVisible`/`IsIconic`/`IsZoomed`は
+// `SetLastError = true`を宣言していない（`Native.fs`参照）、そしてBOOLの戻り値自体が答えそのもの
+// （`false`は「非表示/非最小化/非最大化」という正当な結果であり、失敗ではない）。`callBoolRead`
+// （`GetWindowRect`のような「成否シグナルとしてのBOOL」専用）をこれらへ誤って適用すると、答えが
+// `false`になる度に無関係・陳腐化した`GetLastWin32Error()`を"Error"として運んでしまい、
+// `false`という信念を一度も観測できなくなる（実機CIのログで実際に踏んだ：非表示窓が常に
+// `Error Code=0`になり、`Ok false`が一度も出なかった）。これらは成否を問わず常に`Ok`で返す。
+let queryVisible (hWnd: IntPtr) : Result<bool, NativeCallRecord> = Ok (IsWindowVisible(hWnd))
 
-let queryMinimized (hWnd: IntPtr) : Result<bool, NativeCallRecord> =
-    callBoolRead "IsIconic" (fun () -> IsIconic(hWnd)) |> Result.map (fun () -> true)
+let queryMinimized (hWnd: IntPtr) : Result<bool, NativeCallRecord> = Ok (IsIconic(hWnd))
 
-let private queryMaximized (hWnd: IntPtr) : Result<bool, NativeCallRecord> =
-    callBoolRead "IsZoomed" (fun () -> IsZoomed(hWnd)) |> Result.map (fun () -> true)
+let private queryMaximized (hWnd: IntPtr) : Result<bool, NativeCallRecord> = Ok (IsZoomed(hWnd))
 
 let queryCloak (hWnd: IntPtr) : Result<CloakState, NativeCallRecord> =
     let mutable cloakVal = 0

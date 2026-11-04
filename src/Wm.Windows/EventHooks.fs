@@ -31,8 +31,12 @@ let EVENT_OBJECT_HIDE = 0x8003u
 let EVENT_OBJECT_CLOAKED = 0x8017u
 let EVENT_OBJECT_UNCLOAKED = 0x8018u
 
-/// 登録した全フックをまとめて外すためのハンドル。
-type HookSet = { Unhook: unit -> unit }
+/// 登録した全フックをまとめて外すためのハンドル。`KeepAlive`は、ネイティブ側へ渡した
+/// `WinEventProc`デリゲート自身をGCされないよう保持するためだけに存在する——呼び出し元が
+/// `HookSet`を`Unhook`を呼ぶまで生き続けさせれば、このフィールド経由でデリゲートも生き続ける
+/// （実機CI実機で実際に踏んだ不具合：`hookEvents`のローカル変数だけに積んでいた当初の実装は
+/// 関数の戻り後にGCされ、"A callback was made on a garbage collected delegate"で異常終了した）。
+type HookSet = { Unhook: unit -> unit; KeepAlive: obj }
 
 /// `onEvent eventType hwnd`を、トップレベル窓自身への通知(`idObject = OBJID_WINDOW`)だけに絞って呼ぶ。
 /// 子要素(ボタン等)やキャレット等の通知は無視する——spikes/Phase0CiSpikes/Program.fsの全スパイクも
@@ -40,13 +44,13 @@ type HookSet = { Unhook: unit -> unit }
 /// `SetWinEventHook`は1呼出につき連続した[eventMin, eventMax]区間しか登録できないため、
 /// 対象イベントの集合を連続区間へグルーピングして複数回呼ぶ。
 let hookEvents (onEvent: uint32 -> IntPtr -> unit) : HookSet =
-    let delegates = ResizeArray<WinEventProc>() // GCされないよう参照を保持する
+    let delegates = ResizeArray<WinEventProc>()
     let handles = ResizeArray<IntPtr>()
 
     let hook (eventMin: uint32) (eventMax: uint32) =
         let proc = WinEventProc(fun _hWinEventHook eventType hwnd idObject _idChild _idEventThread _dwmsEventTime ->
             if idObject = OBJID_WINDOW then onEvent eventType hwnd)
-        delegates.Add(proc) // ネイティブ側に渡すデリゲートはGC対象外にしておく必要がある
+        delegates.Add(proc)
         let h = SetWinEventHook(eventMin, eventMax, IntPtr.Zero, proc, 0u, 0u, WINEVENT_OUTOFCONTEXT)
         handles.Add(h)
 
@@ -56,4 +60,5 @@ let hookEvents (onEvent: uint32 -> IntPtr -> unit) : HookSet =
     hook EVENT_SYSTEM_FOREGROUND EVENT_SYSTEM_FOREGROUND
     hook EVENT_SYSTEM_MOVESIZESTART EVENT_SYSTEM_MOVESIZEEND
 
-    { Unhook = fun () -> for h in handles do UnhookWinEvent(h) |> ignore }
+    { Unhook = fun () -> for h in handles do UnhookWinEvent(h) |> ignore
+      KeepAlive = box delegates }
