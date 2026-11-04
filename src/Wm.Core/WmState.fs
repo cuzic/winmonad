@@ -193,6 +193,17 @@ let private applyWindowsEvent (state: WmState) (ev: DomainEvent) : WmState =
     | WindowUnmanaged w -> unmanageWindow w state
     | _ -> state
 
+/// v2.89（コード品質の簡素化ラウンド、survey-next-goal-29の指摘）：`Placement.allocateRequestId`で
+/// 採番し、更新後の`Placement`を`WmState`へ差し戻し、`mkEffect`が組み立てた1件のEffectを返す——
+/// `step`内の`MoveFocusedToWorkspace`/`SwitchWorkspace`（既にvisible）/`SwitchSettle`（開始時の
+/// 再フォアグラウンド）/`FocusNext`・`FocusPrevious`/`CloseFocused`/`SwitchSettle`タイマー発火時の
+/// 再要求、計6箇所で機械的に重複していた「採番→Placementを差し戻す→1件のEffectを返す」という
+/// 同一の配線を1つに集約する。挙動は変えない（各呼び出し元は今までと全く同じ値を計算していた）ので、
+/// 既存のテスト（6箇所全てを個別にカバーしている）がそのまま回帰を検出する。
+let private allocateAndEmit (mkEffect: RequestId -> Effect) (state: WmState) : WmState * Effect list =
+    let rid, placementSt' = Placement.allocateRequestId state.Placement
+    { state with Placement = placementSt' }, [ mkEffect rid ]
+
 /// Topology段（§7.1の段②）、Focusの観測反映（段①相当）、Windows/Placementの信念反映・分類（段①⑤相当）、
 /// Health/FocusのTimerElapsedディスパッチ、窓の消滅クリーンアップ、focusedの変化を見たHistory/zipperの
 /// Focus更新（段⑥相当）を配線する。他ドメインが実装されるたびに該当する段を追加する
@@ -338,9 +349,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
                 let workspaces' = WorkspaceSet.moveToWorkspace w dest stateAfterMovability.Workspaces
                 match (WorkspaceSet.stateOf srcWs workspaces').Stack with
                 | Some neighborZipper ->
-                    let rid, placement' = Placement.allocateRequestId stateAfterMovability.Placement
-                    { stateAfterMovability with Workspaces = workspaces'; Placement = placement' },
-                    [ RequestForeground (rid, neighborZipper.Focus) ]
+                    allocateAndEmit (fun rid -> RequestForeground (rid, neighborZipper.Focus)) { stateAfterMovability with Workspaces = workspaces' }
                 | None -> { stateAfterMovability with Workspaces = workspaces' }, []
             | _ -> stateAfterMovability, []
         | _ -> stateAfterMovability, []
@@ -404,8 +413,8 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
                     // 既にcurrentなWorkspace内の窓へ戻るだけ。`showWorkspace`はこの場合[]を返す
                     // （Topologyのview自体が変わらない）ので、下のCurrentChanged/WorkspaceShown(UserView)
                     // 経由のswitchForegroundEffectsは発生しない——ここで直接RequestForegroundする。
-                    let rid, placementSt' = Placement.allocateRequestId stateAfterMovability.Placement
-                    topologyState', topologyEvents, { stateAfterMovability with Placement = placementSt' }, [ RequestForeground (rid, w) ]
+                    let state', effects = allocateAndEmit (fun rid -> RequestForeground (rid, w)) stateAfterMovability
+                    topologyState', topologyEvents, state', effects
                 else
                     let topologyState'', viewEvents = Topology.showWorkspace ws topologyState'
                     topologyState'', topologyEvents @ viewEvents, stateAfterMovability, []
@@ -524,8 +533,8 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
                 match focusTarget with
                 | None -> s, effects, cmds @ settleCmds
                 | Some w ->
-                    let rid, placementSt' = Placement.allocateRequestId s.Placement
-                    { s with Placement = placementSt' }, effects @ [ RequestForeground (rid, w) ], cmds @ settleCmds)
+                    let s', newEffects = allocateAndEmit (fun rid -> RequestForeground (rid, w)) s
+                    s', effects @ newEffects, cmds @ settleCmds)
             (stateAfterMovability, [], [])
 
     // `UserCommand FocusNext`/`FocusPrevious`（§4.4「アクティブなWorkspaceのzipperを回す」、v2.33）：
@@ -546,8 +555,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
                 // 窓が1つしかない等で回転してもFocusが変わらない場合は、無意味なRequestForegroundを
                 // 発行しない（既にフォアグラウンドのはずの窓へ再要求しても害は無いはずだが、
                 // 変化が無い入力には何もしないのがこのstepの他の反応と一貫する）。
-                let rid, placementSt' = Placement.allocateRequestId stateAfterMovability.Placement
-                { stateAfterMovability with Workspaces = workspaces'; Placement = placementSt' }, [ RequestForeground (rid, z.Focus) ]
+                allocateAndEmit (fun rid -> RequestForeground (rid, z.Focus)) { stateAfterMovability with Workspaces = workspaces' }
             | _ -> { stateAfterMovability with Workspaces = workspaces' }, []
         | _ -> stateAfterMovability, []
 
@@ -565,8 +573,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
     let stateAfterMovability, closeFocusedEffects =
         match envelope.Input, focused stateAfterMovability with
         | UserCommand CloseFocused, ManagedWindow w ->
-            let rid, placementSt' = Placement.allocateRequestId stateAfterMovability.Placement
-            { stateAfterMovability with Placement = placementSt' }, [ RequestClose (rid, w) ]
+            allocateAndEmit (fun rid -> RequestClose (rid, w)) stateAfterMovability
         | _ -> stateAfterMovability, []
 
     // `UserCommand PromoteToMaster`/`SwapWithMaster`（§4.4「コマンドの意味」、v2.35）：`focused`が
@@ -634,8 +641,8 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             let focusAfterTimer, reRequestTarget, cmds = Focus.onSwitchSettleTimerFired now stateAfterMovability.Focus
             match reRequestTarget with
             | Some w when focused stateAfterMovability <> ManagedWindow w ->
-                let rid, placementSt' = Placement.allocateRequestId stateAfterMovability.Placement
-                { stateAfterMovability with Placement = placementSt' }, focusAfterTimer, cmds, [ RequestForeground (rid, w) ]
+                let state', effects = allocateAndEmit (fun rid -> RequestForeground (rid, w)) stateAfterMovability
+                state', focusAfterTimer, cmds, effects
             | _ -> stateAfterMovability, focusAfterTimer, cmds, []
         | _ -> stateAfterMovability, stateAfterMovability.Focus, [], []
 
