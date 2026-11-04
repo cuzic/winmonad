@@ -356,6 +356,8 @@ let main _argv =
     let effectQueue4 = ConcurrentQueue<GatedEffect>()
     let resultQueue4 = ConcurrentQueue<RequestId * Result<unit, NativeCallRecord>>()
     let mutable keepDispatching4 = true
+    let mutable dispatchedCount4 = 0
+    let mutable skippedCount4 = 0
 
     let effectApplyThread4 =
         Thread(fun () ->
@@ -365,16 +367,18 @@ let main _argv =
                     let effect = GatedEffect.effect gated
                     match Wm.Windows.EffectDispatch.apply effect with
                     | Some result ->
+                        printfn "  [round7/8 dispatch] %A -> %A" effect result
                         let ridOpt =
                             match effect with
                             | SetRect (rid, _, _) -> Some rid
                             | RequestForeground (rid, _) -> Some rid
                             | RestoreBeforeMove (rid, _) -> Some rid
                             | _ -> None
+                        Interlocked.Increment(&dispatchedCount4) |> ignore
                         match ridOpt with
                         | Some rid -> resultQueue4.Enqueue(rid, result)
                         | None -> ()
-                    | None -> ()
+                    | None -> Interlocked.Increment(&skippedCount4) |> ignore
                 | false, _ -> Thread.Sleep(1))
     effectApplyThread4.IsBackground <- true
     effectApplyThread4.Name <- "wm-effect-apply-round7"
@@ -494,8 +498,10 @@ let main _argv =
     match focusNextTarget with
     | Some (WindowId raw) -> printfn "Real foreground matches FocusNext's RequestForeground target: %b" (IntPtr raw = realForeground)
     | None -> printfn "FocusNext produced no RequestForeground effect (no observable target to compare)"
-    printfn "Round 8 summary: testFormA rect before=%A after=%A" beforeSwapA afterSwapA
-    printfn "Round 8 summary: testFormB rect before=%A after=%A" beforeSwapB afterSwapB
+    let fmtRect (r: RECT) = sprintf "{X=%d;Y=%d;R=%d;B=%d}" r.Left r.Top r.Right r.Bottom
+    printfn "Round 7+8 dispatch totals: dispatched=%d skipped(no handler)=%d" dispatchedCount4 skippedCount4
+    printfn "Round 8 summary: testFormA rect before=%s after=%s" (fmtRect beforeSwapA) (fmtRect afterSwapA)
+    printfn "Round 8 summary: testFormB rect before=%s after=%s" (fmtRect beforeSwapB) (fmtRect afterSwapB)
     printfn "SwapWithMaster actually swapped the two windows' real on-screen rects: %b"
         (beforeSwapA.Left = afterSwapB.Left && beforeSwapA.Top = afterSwapB.Top
          && beforeSwapB.Left = afterSwapA.Left && beforeSwapB.Top = afterSwapA.Top

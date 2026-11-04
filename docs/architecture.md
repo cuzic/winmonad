@@ -11,7 +11,11 @@ Version: 2.99（**Phase B ラウンド8**：ラウンド7の2枚のテスト窓�
 同じ形の公開版）で実際の`EVENT_SYSTEM_FOREGROUND`を購読し、ラウンド7のFocusNextが実際に変えた
 OSフォアグラウンドをCoreへ`ForegroundObserved`として中継する経路を追加——これでCore内部の
 `Focus.Foreground`も実際に閉じる（ラウンド7はOS側だけ、ラウンド8でCore側まで）。検証は
-`GetWindowRect`で両窓の実矩形がSwapWithMaster前後で実際に入れ替わったかを直接確認する）／
+`GetWindowRect`で両窓の実矩形がSwapWithMaster前後で実際に入れ替わったかを直接確認する。
+**実機で実際に`false`（入れ替わっていない）が出て、`realForegroundHwnd`もFocusNextの対象と
+食い違った**——`%A`でのRECT表示が型名しか出さずフィールドが読めない状態のまま原因調査に入って
+いたため、まずフィールドを明示的に表示するよう修正し、`Effect`ごとの実際のdispatch結果ログと
+dispatched/skipped集計も追加した。原因はこの時点では未確定で、次の実機ログで初めて特定する）／
 2.98（**Phase B ラウンド7**：Phase 0のF11で`RegisterHotKey`が`Alt+J`等を実機で確保できる
 ことは確認済みだったが、「実際にそのキーを押させてWM_HOTKEYが配送され、Coreの`UserCommand`まで
 届き、Effectとして実際のOSへ反映される」という往復は未検証のまま残っていた。今回、隔離された
