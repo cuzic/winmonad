@@ -229,11 +229,13 @@ type DesiredPresence =
 /// （既存の呼び出し元60箇所以上を移行する必要が出るため、v2.117ではこれを避けた）ので、ここでは
 /// DPIそのものではなくモニターIdだけを記録し、実際のDPI比較・範囲チェックは消費側（`dispatchPlacements`、
 /// 未配線）で`dpiOf`が使える時点に遅らせる——ここでは粗い絶対値の安全網だけを置く（下記）。
-/// **この型・`reviseFrameInset`はまだ`PlacementState`/`dispatchPlacements`への配線は無い**
-/// （Opus敵対的レビュー`/tmp/opus-review-frame-inset.md`で見つかった4つの高リスク論点——リトライ
-/// 経路の漏れ、`SetRect`契約の変更によるWm.Cli破壊、Mismatch→Reevaluateの自己修復不能、MinWidthへの
-/// 偽の証拠混入——は、信念の修正規則とPlacementStateへのキャッシュだけでは解決しない。配線は
-/// Round 2の残りスライスで行う）。
+/// `PlacementState.FrameInsets`（v2.117）経由で`dispatchPlacements`/`retryOrGiveUp`（v2.118/119、
+/// `correctedDispatchTarget`の型直前のコメント参照）と`onPendingDeadlineTimerFired`の自己修復
+/// （v2.121、`PendingRequest.InsetHealed`の型直前のコメント参照）に配線済み。Opus敵対的レビュー
+/// `/tmp/opus-review-frame-inset.md`が見つけた4つの高リスク論点（リトライ経路の漏れ、`SetRect`契約の
+/// 変更によるWm.Cli破壊、Mismatch→Reevaluateの自己修復不能、MinWidthへの偽の証拠混入）は全て対処した。
+/// 唯一の既知の未対応は論点1-F（`Monitor`フィールドを発行先モニターと比較していない、
+/// `correctedDispatchTarget`の型直前のコメント参照）。
 type FrameInset = { Left: int; Top: int; Right: int; Bottom: int; Monitor: MonitorId }
 
 /// 算出したinsetが暴走していないかの粗い安全網（Opusレビュー1-D/1-G：分断された読み取り・DPI非対応
@@ -283,7 +285,14 @@ type PendingRequest =
       /// Mismatchと判定した観測の幅超過が、この時使ったinsetの左右合計で説明できる範囲なら
       /// （＝過大補正の誤差でしかない可能性がある）、`reviseMinWidth`の証拠として採用しない
       /// （`onPendingDeadlineTimerFired`のMinWidth判定箇所参照）。
-      DispatchedInset: FrameInset option }
+      DispatchedInset: FrameInset option
+      /// この`Epoch`について`FrameInset`自己修復（v2.121、`onPendingDeadlineTimerFired`の型直前の
+      /// コメント参照）を既に1回行ったか。打ち止め規則（Opus敵対的レビュー
+      /// `opus-review-frameinset-selfheal.md`論点2）：1つのEpochにつき1回まで——`dispatchPlacements`が
+      /// 新しいEpochを作るときは常に`false`から始まる（新しい意図には改めて1回試す価値がある）。
+      /// `retryOrGiveUp`は同じEpochのTimeout再試行なので`{ pr with ... }`でそのまま引き継ぐ
+      /// （リセットしない）。`RetryAttempts`（Timeout専用の別予算）とは共有しない。
+      InsetHealed: bool }
 
 /// `PendingRequest`と同じ考え方（§7.2「待ちをデータで表す」）を`SetPresence`へ適用した最小形
 /// （v2.41新設、ファイル冒頭「`SetPresence`の観測による確認」参照）。`Epoch`/`Retry`は持たない——
@@ -361,8 +370,9 @@ type PlacementState =
       DriftCorrections: Map<WindowId, int64 list>
       /// 窓ごとの最後に採用された`FrameInset`（v2.117、`FrameInset`/`reviseFrameInset`の型直前の
       /// コメント参照）。`Map`に無い＝まだ証拠が無い、または不採用（他のAccumulating信念と同じ規約）。
-      /// まだ`dispatchPlacements`での消費は配線していない——`onWindowObserved`が観測のたびに
-      /// 更新するだけ。
+      /// `onWindowObserved`が観測のたびに更新し、`dispatchPlacements`/`retryOrGiveUp`（発行時の補正、
+      /// v2.118/119）と`onPendingDeadlineTimerFired`（発行後に信念が変わった場合の自己修復、v2.121）の
+      /// 両方が消費する。
       FrameInsets: Map<WindowId, FrameInset> }
 
 /// `MoveCause.Unattributed`の振動の打ち止め閾値（v2.70。実機測定が無いため暫定値、Opusレビュー§Q2）。
@@ -752,14 +762,22 @@ let onIntegrityReprobeTimerFired (now: int64) (w: WindowId) (state: PlacementSta
 /// （`dispatchPlacements`/`retryOrGiveUp`はどちらも`dpiOf`を受け取らないため、今は確認する手段が
 /// 無い）。実測で確認できるまでは「別モニターでも同じinsetを試す」という楽観的な単純化のまま
 /// にする——§21「不可視リサイズ枠の補正方式」に記録済みの残課題。
+/// 「望ましい可視矩形」を`inset`分だけ外側へ広げ、SetRectへ渡すネイティブ矩形にする純粋変換。
+/// `correctedDispatchTarget`（発行時、insetは`Map`から引く）と`onPendingDeadlineTimerFired`の
+/// `FrameInset`自己修復（発行後、insetは`pr.DispatchedInset`/今の信念そのもの）の両方が同じ変換を
+/// 使う（v2.121、Opus敵対的レビュー`opus-review-frameinset-selfheal.md`論点1-1：自己修復の契機は
+/// 「今のinsetで観測を広げ直すと、実際に発行したネイティブ矩形とちょうど一致する」という、この関数
+/// そのものを使った決定的な述語で書く）。
+let private expandByInset (visible: PixelRect) (inset: FrameInset) : PixelRect =
+    { X = visible.X - inset.Left
+      Y = visible.Y - inset.Top
+      Width = visible.Width + inset.Left + inset.Right
+      Height = visible.Height + inset.Top + inset.Bottom }
+
 let private correctedDispatchTarget (w: WindowId) (desired: PixelRect) (insets: Map<WindowId, FrameInset>) : PixelRect =
     match Map.tryFind w insets with
     | None -> desired
-    | Some inset ->
-        { X = desired.X - inset.Left
-          Y = desired.Y - inset.Top
-          Width = desired.Width + inset.Left + inset.Right
-          Height = desired.Height + inset.Top + inset.Bottom }
+    | Some inset -> expandByInset desired inset
 
 /// `ValidatedPlan`の各配置について、`Desired`と異なる場合だけ`SetRect`を発行し新しいPendingを作る
 /// （§7.3「未完了の同一Targetへの重複要求を発行しない」）。既存のPendingが同じ窓を指していれば、
@@ -837,7 +855,8 @@ let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: P
                       Deadline = deadline
                       DispatchSeq = None
                       Baseline = baseline
-                      DispatchedInset = usedInset }
+                      DispatchedInset = usedInset
+                      InsetHealed = false }
                 let st' =
                     { st with
                         Desired = Map.add p.Window (Shown (Some p.Target)) st.Desired
@@ -1075,36 +1094,90 @@ let onPendingDeadlineTimerFired
             let isMidDpiTransition =
                 Map.containsKey pr.Window state.DpiCrossing
                 && (Map.tryFind pr.Window state.DpiBehavior |> Option.map (fun b -> b.Value)) = Some RescalesItself
-            // `MinWidth`の過補正ガード（v2.120、Opusレビュー2-C対策）：この発行が`FrameInset`補正を
-            // 使っていたなら、観測幅の超過がその時使ったinsetの左右合計以下なら「補正誤差でしかない
-            // 可能性がある」としてMinWidthの証拠にしない——補正が過大だった（古い/最大化中/別モニター
-            // のinset等）場合に偽の最小幅がLayoutまで届くのを防ぐ（`PendingRequest.DispatchedInset`の
-            // 型直前のコメント参照）。
-            let widthExcess = observed.Width - pr.TargetRect.Width
-            let explainedByCorrection =
-                match pr.DispatchedInset with
-                | Some inset -> widthExcess <= inset.Left + inset.Right
-                | None -> false
-            let minWidth' =
-                if observed.Width > pr.TargetRect.Width && not isMidDpiTransition && not explainedByCorrection then
-                    match Map.tryFind pr.Window state.Geometry |> Option.bind (fun g -> LatestWins.value g.Monitor) |> Option.bind dpiOf with
-                    | Some dpi ->
-                        let observedWidthDip = toDip dpi observed.Width
-                        let evidence = Outcome (valueSeq, rid)
-                        Map.add pr.Window (reviseMinWidth now evidence observedWidthDip (Map.tryFind pr.Window state.MinWidth)) state.MinWidth
-                    | None -> state.MinWidth
+            // `FrameInset`自己修復（v2.121、Opus敵対的レビュー`opus-review-frameinset-selfheal.md`
+            // 論点1-C対策）：発行時に使ったinset（`pr.DispatchedInset`、無ければ無補正）と今の信念
+            // （`state.FrameInsets`）が異なり、かつ「今の信念で`observed`を広げ直すと、実際に発行した
+            // ネイティブ矩形とちょうど一致する」（＝アプリは頼んだネイティブ矩形をそのまま受け入れた、
+            // ずれたのはこちらの変換だけ——アプリ側の制約（最小幅・自己再配置等）とは排他的）なら、
+            // 通常のReevaluate（`Accepted`書き込み・MinWidth証拠採用）をせず、同じ`TargetRect`/`Epoch`を
+            // 今のinsetで再発行する。`Baseline`は引き継ぐ（更新すると、この再発行をアプリが無視した
+            // 場合に「観測=Baseline」で無反応扱いになり、3-Bの無限ループへ落ちる）。1つのEpochにつき
+            // 1回まで（`pr.InsetHealed`、`PendingRequest`の型直前のコメント参照）——inset自体がDPI丸め等
+            // で揺れ続けるアプリと無限に戦わないための打ち止め。CIスパイクS26/S27（Opusレビューが
+            // 懸念した「DWMがまだ合成していない」ケース）は、自作WinForms窓では発生しないと実測で
+            // 確認済み（inset=0ではなく正しい値が`EVENT_OBJECT_CREATE`/`SW_RESTORE`直後から既に読める）
+            // ——それでも発行時点のinset信念が無い/古いケース（モニター間移動直後、分断された読み取り
+            // 等）はあるため、この自己修復自体は引き続き必要。
+            let frameInsetHeal =
+                if isMidDpiTransition || pr.InsetHealed then
+                    None
                 else
-                    state.MinWidth
-            { state with
-                Pending = Map.remove rid state.Pending
-                RetryAttempts = Map.remove pr.Window state.RetryAttempts
-                MinWidth = minWidth'
-                // `Accepted`（v2.70、型直前のコメント参照）：Reevaluate後、観測された（Mismatchの）
-                // 矩形を「今の意図について受け入れた」ものとして記録する——`Desired`（要求した目標）
-                // ではなくこれを以後のドリフト検知の基準にすることで、Reevaluate済みの窓と無限に
-                // 戦わない（Opusレビュー§B-1）。
-                Accepted = Map.add pr.Window observed state.Accepted },
-            [], [], []
+                    match Map.tryFind pr.Window state.FrameInsets with
+                    | None -> None
+                    | Some cur ->
+                        let differs =
+                            match pr.DispatchedInset with
+                            | None -> true
+                            | Some prev -> prev.Left <> cur.Left || prev.Top <> cur.Top || prev.Right <> cur.Right || prev.Bottom <> cur.Bottom
+                        if not differs then
+                            None
+                        else
+                            let actuallyDispatched =
+                                match pr.DispatchedInset with
+                                | Some prev -> expandByInset pr.TargetRect prev
+                                | None -> pr.TargetRect
+                            if expandByInset observed cur = actuallyDispatched then Some cur else None
+            match frameInsetHeal with
+            | Some cur ->
+                let newRid = RequestId state.NextRequestId
+                let deadline = now + pendingDeadlineMs
+                let dispatchTarget = expandByInset pr.TargetRect cur
+                let healed =
+                    { pr with
+                        IssuedAt = now
+                        Deadline = deadline
+                        DispatchSeq = None
+                        DispatchedInset = Some cur
+                        InsetHealed = true }
+                let correctionTrace =
+                    if dispatchTarget <> pr.TargetRect then [ FrameInsetApplied (newRid, pr.TargetRect, dispatchTarget) ] else []
+                { state with
+                    Pending = Map.add newRid healed (Map.remove rid state.Pending)
+                    NextRequestId = state.NextRequestId + 1L },
+                [ SetRect (newRid, pr.Window, dispatchTarget) ],
+                [ StartTimer (TimerId.Placement (PendingDeadline newRid), pendingDeadlineMs) ],
+                correctionTrace
+            | None ->
+                // `MinWidth`の過補正ガード（v2.120、Opusレビュー2-C対策）：この発行が`FrameInset`補正を
+                // 使っていたなら、観測幅の超過がその時使ったinsetの左右合計以下なら「補正誤差でしかない
+                // 可能性がある」としてMinWidthの証拠にしない——補正が過大だった（古い/最大化中/別モニター
+                // のinset等）場合に偽の最小幅がLayoutまで届くのを防ぐ（`PendingRequest.DispatchedInset`の
+                // 型直前のコメント参照）。
+                let widthExcess = observed.Width - pr.TargetRect.Width
+                let explainedByCorrection =
+                    match pr.DispatchedInset with
+                    | Some inset -> widthExcess <= inset.Left + inset.Right
+                    | None -> false
+                let minWidth' =
+                    if observed.Width > pr.TargetRect.Width && not isMidDpiTransition && not explainedByCorrection then
+                        match Map.tryFind pr.Window state.Geometry |> Option.bind (fun g -> LatestWins.value g.Monitor) |> Option.bind dpiOf with
+                        | Some dpi ->
+                            let observedWidthDip = toDip dpi observed.Width
+                            let evidence = Outcome (valueSeq, rid)
+                            Map.add pr.Window (reviseMinWidth now evidence observedWidthDip (Map.tryFind pr.Window state.MinWidth)) state.MinWidth
+                        | None -> state.MinWidth
+                    else
+                        state.MinWidth
+                { state with
+                    Pending = Map.remove rid state.Pending
+                    RetryAttempts = Map.remove pr.Window state.RetryAttempts
+                    MinWidth = minWidth'
+                    // `Accepted`（v2.70、型直前のコメント参照）：Reevaluate後、観測された（Mismatchの）
+                    // 矩形を「今の意図について受け入れた」ものとして記録する——`Desired`（要求した目標）
+                    // ではなくこれを以後のドリフト検知の基準にすることで、Reevaluate済みの窓と無限に
+                    // 戦わない（Opusレビュー§B-1）。
+                    Accepted = Map.add pr.Window observed state.Accepted },
+                [], [], []
         | None -> retryOrGiveUp now rid pr state
     | _ -> state, [], [], []
 

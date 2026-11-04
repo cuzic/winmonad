@@ -926,6 +926,122 @@ let ``FrameInset補正済みの発行でも、幅超過がinsetの左右合計�
     | Some { Value = v; Confidence = Inferred _ } -> Assert.Equal(workArea.Width + 100, v)
     | other -> Assert.True(false, sprintf "expected an Inferred MinWidth belief, got %A" other)
 
+// ===== FrameInset自己修復（v2.121、Opus敵対的レビューopus-review-frameinset-selfheal.md論点1-C対策） =====
+
+/// `observedSnapshotWithMonitor`に、`NativeRect`も付け加えたもの。`onWindowObserved`の`FrameInsets`
+/// 更新（`reviseFrameInset`、v2.117）はNativeRect/VisibleFrameRectが両方Okの観測だけを見るため、
+/// 自己修復の契機（inset学習）を試験するにはこの対が要る。
+let private observedPairSnapshotWithMonitor (w: WindowId) (native: PixelRect) (visible: PixelRect) (monitor: MonitorId) (sequence: int64) : WindowSnapshot =
+    { observedSnapshotWithMonitor w visible monitor sequence with
+        NativeRect = Some { Value = Ok native; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" } }
+
+[<Fact>]
+let ``新規窓への無補正の最初の発行後にinsetが学習されると、PendingDeadline時に自己修復として今のinsetで再発行する(v2.121)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let inset: FrameInset = { Left = 7; Top = 0; Right = 7; Bottom = 7; Monitor = m }
+    // FrameInsets信念がまだ無いので、最初の発行は無補正(DispatchedInset=None、発行先=TargetRectそのまま)。
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    Assert.Equal(None, Map.tryFind rid afterReconcile.Pending |> Option.bind (fun pr -> pr.DispatchedInset))
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    // 実機(S26/S27)のとおりアプリは頼んだネイティブ矩形(=補正無しのworkArea)をそのまま受け入れたが、
+    // 可視矩形はDWMの不可視リサイズ枠だけずれる——同じ観測がinsetそのものも学習させる。
+    let nativeObserved = workArea
+    let visibleObserved =
+        { X = workArea.X + inset.Left
+          Y = workArea.Y + inset.Top
+          Width = workArea.Width - inset.Left - inset.Right
+          Height = workArea.Height - inset.Top - inset.Bottom }
+    let afterObserved, _, _ = onWindowObserved 20L (observedPairSnapshotWithMonitor w nativeObserved visibleObserved m 10L) afterDispatched
+    Assert.Equal(Some inset, Map.tryFind w afterObserved.FrameInsets)
+    Assert.Equal(1, Map.count afterObserved.Pending) // 可視矩形はTargetRectと一致しないのでまだPending
+    let afterDeadline, effects, timerCmds, traces = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid noDpi afterObserved
+    // 通常のReevaluateはしない(Acceptedを書かない、MinWidthの証拠も採らない)。
+    Assert.Equal(None, Map.tryFind w afterDeadline.Accepted)
+    Assert.Equal(None, Map.tryFind w afterDeadline.MinWidth)
+    Assert.Equal(1, Map.count afterDeadline.Pending) // 旧ridは消え、新しいridが1件
+    let newRid = pendingRidFor afterDeadline w
+    Assert.NotEqual(rid, newRid)
+    match Map.tryFind newRid afterDeadline.Pending with
+    | Some pr' ->
+        Assert.Equal(workArea, pr'.TargetRect) // 望ましい可視矩形は変わらない
+        Assert.Equal(Some inset, pr'.DispatchedInset)
+        Assert.True(pr'.InsetHealed)
+        Assert.Equal(None, pr'.Baseline) // Baselineは引き継ぐ(旧prのBaseline=None)、observedへ更新しない
+    | None -> Assert.True(false, "expected a new Pending for the healed re-dispatch")
+    let expectedDispatchTarget =
+        { X = workArea.X - inset.Left
+          Y = workArea.Y - inset.Top
+          Width = workArea.Width + inset.Left + inset.Right
+          Height = workArea.Height + inset.Top + inset.Bottom }
+    Assert.Equal<Effect list>([ SetRect (newRid, w, expectedDispatchTarget) ], effects)
+    Assert.NotEmpty(timerCmds) // 新ridのPendingDeadlineを再始動する
+    match traces with
+    | [ FrameInsetApplied (tracedRid, desired, dispatched) ] ->
+        Assert.Equal(newRid, tracedRid)
+        Assert.Equal(workArea, desired)
+        Assert.Equal(expectedDispatchTarget, dispatched)
+    | other -> Assert.True(false, sprintf "expected exactly one FrameInsetApplied trace, got %A" other)
+
+[<Fact>]
+let ``FrameInset自己修復は1つのEpochにつき1回まで、2回目はinsetがさらに変わっても通常のReevaluateに落ちる(v2.121)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let inset1: FrameInset = { Left = 7; Top = 0; Right = 7; Bottom = 7; Monitor = m }
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    let visibleObserved1 =
+        { X = workArea.X + inset1.Left
+          Y = workArea.Y + inset1.Top
+          Width = workArea.Width - inset1.Left - inset1.Right
+          Height = workArea.Height - inset1.Top - inset1.Bottom }
+    let afterObserved, _, _ = onWindowObserved 20L (observedPairSnapshotWithMonitor w workArea visibleObserved1 m 10L) afterDispatched
+    let afterHeal, healEffects, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid noDpi afterObserved
+    Assert.NotEmpty(healEffects) // 1回目は自己修復として再発行する(前のテストで検査済み)
+    let newRid = pendingRidFor afterHeal w
+    match Map.tryFind newRid afterHeal.Pending with
+    | Some pr' -> Assert.True(pr'.InsetHealed)
+    | None -> Assert.True(false, "expected the healed Pending to remain")
+    // insetがさらに変わったことにする(DPI丸めの揺れ等を想定)——InsetHealedが立っているので、
+    // 等式が成立するとしても2回目は自己修復せず、通常のMismatch終端(Accepted更新)に落ちる。
+    let inset2: FrameInset = { Left = 8; Top = 0; Right = 8; Bottom = 7; Monitor = m }
+    let stateWithChangedInset = { afterHeal with FrameInsets = Map.ofList [ w, inset2 ] }
+    // 1回目の自己修復の再発行は`now`=10L+pendingDeadlineMsの時点で行われた(IssuedAt/Deadlineもその
+    // 基準)ので、2回目のPendingDeadline発火時刻もそこから数える。
+    let healedIssuedAt = 10L + pendingDeadlineMs
+    let afterDispatched2, _, _, _, _ = onEffectCallReturned (healedIssuedAt + 1L) 3L newRid (Ok ()) (Some (healedIssuedAt + 5L)) stateWithChangedInset
+    let mismatchRect = { workArea with X = workArea.X + 50 } // inset差とは無関係な、通常のMismatch
+    let afterObserved2, _, _ = onWindowObserved (healedIssuedAt + 10L) (observedSnapshotWithMonitor w mismatchRect m (healedIssuedAt + 10L)) afterDispatched2
+    let afterDeadline2, effects2, _, _ = onPendingDeadlineTimerFired (healedIssuedAt + pendingDeadlineMs) newRid noDpi afterObserved2
+    Assert.Empty(effects2) // 2回目は再発行しない(Opusレビュー論点2の打ち止め：1 Epochにつき1回)
+    Assert.Empty(afterDeadline2.Pending)
+    Assert.Equal(Some mismatchRect, Map.tryFind w afterDeadline2.Accepted) // 通常のReevaluateに落ちる
+
+[<Fact>]
+let ``inset差では説明できないMismatch(アプリ自身の制約等)は自己修復せず、通常のMinWidth経路に落ちる(v2.121)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let inset: FrameInset = { Left = 7; Top = 0; Right = 7; Bottom = 7; Monitor = m }
+    let seeded = { initial with FrameInsets = Map.ofList [ w, inset ] } // 発行時点で既にinsetが分かっている
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) seeded
+    let rid = pendingRidFor afterReconcile w
+    Assert.Equal(Some inset, Map.tryFind rid afterReconcile.Pending |> Option.bind (fun pr -> pr.DispatchedInset))
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    // insetは発行時のままだが、観測された幅がinsetの左右合計を大きく超えて広い
+    // (v2.120の既存テストと同じ、アプリ自身の最小幅制約を想定)——inset差では説明できない。
+    let muchWiderRect = { workArea with Width = workArea.Width + 100 }
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w muchWiderRect m 10L) afterDispatched
+    let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
+    let afterDeadline, effects, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterObserved
+    Assert.Empty(effects) // 自己修復は発火しない(insetは変わっていないので述語が最初から不成立)
+    Assert.Empty(afterDeadline.Pending)
+    Assert.Equal(Some muchWiderRect, Map.tryFind w afterDeadline.Accepted) // 通常のReevaluate
+    match Map.tryFind w afterDeadline.MinWidth with
+    | Some { Value = v; Confidence = Inferred _ } -> Assert.Equal(workArea.Width + 100, v) // MinWidthの証拠は採る
+    | other -> Assert.True(false, sprintf "expected an Inferred MinWidth belief, got %A" other)
+
 [<Fact>]
 let ``DpiBehavior=RescalesItselfで2段目リサイズ待ち中(DpiCrossing未決着)のMismatchはMinWidthの証拠にしない(v2.45)`` () =
     let w = WindowId 1L
@@ -1226,7 +1342,8 @@ let ``checkUnattributedDriftはPendingが残っている窓には作用しない
           Deadline = 30L + pendingDeadlineMs
           DispatchSeq = None
           Baseline = None
-          DispatchedInset = None }
+          DispatchedInset = None
+          InsetHealed = false }
     let afterMoved = { afterMoved0 with Pending = Map.ofList [ RequestId 999L, artificialPending ] }
     let afterDrift, corrected, _ = checkUnattributedDrift 30L isTiledTrue (fun _ -> Some m0) alwaysStable w afterMoved
     Assert.False(corrected)
