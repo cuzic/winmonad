@@ -119,6 +119,17 @@ let private printClassification (label: string) (reducer: Reducer) =
 
 [<EntryPoint>]
 let main _argv =
+    // DPI awareness宣言（v2.116、Opus敵対的レビュー`opus-review-frame-inset.md`論点1-G「Wm.Hostに
+    // DPI awarenessの宣言が見当たらない」対策）：Per-Monitor V2を宣言しないプロセス（既定のUnaware）
+    // では、`GetWindowRect`/`SetWindowPos`/`GetMonitorInfo`は仮想化された論理座標を返すが、
+    // `DwmGetWindowAttribute(DWMWA_EXTENDED_FRAME_BOUNDS)`は常に物理座標を返す——両者の差が
+    // v2.112で実測した「不可視リサイズ枠のinset」ではなく「スケール誤差＋inset」になり、将来の
+    // 補正実装が100%以外のモニターで暴走する。今までの実機検証（pad2py-pad-host・GitHub Actions
+    // windows-latest）がどちらも100%DPIだったため、この宣言漏れ自体は症状を出していなかった
+    // （Opusレビューの推測どおり）。どの窓も生成・問い合わせされる前、エントリポイントの最初で
+    // 呼ぶ必要がある。
+    Application.SetHighDpiMode(HighDpiMode.PerMonitorV2) |> ignore
+
     let journalPath = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round1-%s.ndjson" (Guid.NewGuid().ToString("N")))
     printfn "Phase B round 1+2: real-Windows observation slice"
     printfn "Journal: %s" journalPath
