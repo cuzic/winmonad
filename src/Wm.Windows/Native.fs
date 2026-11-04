@@ -139,6 +139,18 @@ let VK_LSHIFT = 0xA0uy
 let VK_J = 0x4Auy
 let VK_K = 0x4Buy
 
+// Phase B ラウンド10：`RequestClose`（§8.4「窓を破壊・終了するEffectを提供しない」、WM_CLOSEによる
+// 丁寧な要求——アプリは`WM_CLOSE`を無視・キャンセルできる）。`PostMessage`はキューへ投函するだけで
+// 応答を待たない（`SendMessage`と違いハングした対象でも呼び出し側を止めない、7.1のADR-012と同じ
+// 考え方）。`SetLastError=true`のBOOL成否シグナルなので`callBool`で包める。
+[<DllImport("user32.dll", SetLastError = true)>]
+extern bool PostMessage(IntPtr hWnd, uint32 Msg, UIntPtr wParam, IntPtr lParam)
+
+[<DllImport("user32.dll")>]
+extern bool IsWindow(IntPtr hWnd)
+
+let WM_CLOSE = 0x0010u
+
 let DWMWA_EXTENDED_FRAME_BOUNDS = 9
 let DWMWA_CLOAKED = 14
 let MDT_EFFECTIVE_DPI = 0

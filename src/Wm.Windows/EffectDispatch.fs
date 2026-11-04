@@ -4,9 +4,13 @@
 /// 実際の`probe`/`dispatch`で埋める——Core/Simulation側が共有する同じ手順を、ここでも素通りさせず
 /// 使う（§7.1「Shellと同じEffect実行手順を共有する」）。このラウンドで実際に発行するのは`SetRect`/
 /// `RequestForeground`/`RestoreBeforeMove`の3種だけ（計画の「このラウンドで対象外にしたこと」参照、
-/// `Reprobe`/`SetPresence`/`RequestClose`/`ForgetWindow`/`ObserveAll`は`None`を返す——
+/// `Reprobe`/`SetPresence`/`ForgetWindow`/`ObserveAll`は`None`を返す——
 /// `Wm.Simulation.VirtualWorld`がまだ実装していないEffect種別を`[]`で返すのと同じ「まだ無い
 /// 消費者向けに作り込まない」判断）。
+/// **Phase B ラウンド10で`RequestClose`を追加した**：§8.4「窓を破壊・終了するEffectを提供しない」の
+/// 唯一の例外（`WM_CLOSE`による丁寧な要求、アプリは無視・キャンセルできる）であり、`SetPresence`の
+/// ような未決の設計判断（§21「ワークスペースの実装方式」）に依存しないため、他のEffectより先に
+/// 実装できた。
 module Wm.Windows.EffectDispatch
 
 open System
@@ -42,14 +46,23 @@ let private dispatchRestoreBeforeMove (w: WindowId) : unit -> Result<unit, Nativ
         let hWnd = IntPtr raw
         callBoolNoCode "ShowWindowAsync" (fun () -> ShowWindowAsync(hWnd, SW_RESTORE))
 
+/// `PostMessage(WM_CLOSE)`はキューへ投函するだけで応答を待たない——ハングした対象でも呼び出し側を
+/// 止めない（7.1のADR-012と同じ考え方、`SendMessage`ではなく`PostMessage`を選ぶ理由）。
+let private dispatchRequestClose (w: WindowId) : unit -> Result<unit, NativeCallRecord> =
+    fun () ->
+        let (WindowId raw) = w
+        let hWnd = IntPtr raw
+        callBool "PostMessage" (fun () -> PostMessage(hWnd, WM_CLOSE, UIntPtr.Zero, IntPtr.Zero))
+
 /// 1件のEffectについて、対象窓と実際の`dispatch`クロージャを返す。このラウンドで対応しない
-/// Effect種別（`Reprobe`/`SetPresence`/`RequestClose`/`ForgetWindow`/`ObserveAll`/`ApplyBatch`）は
+/// Effect種別（`Reprobe`/`SetPresence`/`ForgetWindow`/`ObserveAll`/`ApplyBatch`）は
 /// `None`——呼び出し側はこれを「ログに残すだけで実際には発行しない」と解釈する。
 let toDispatch (effect: Effect) : (WindowId * (unit -> Result<unit, NativeCallRecord>)) option =
     match effect with
     | SetRect (_, w, rect) -> Some (w, dispatchSetRect w rect)
     | RequestForeground (_, w) -> Some (w, dispatchRequestForeground w)
     | RestoreBeforeMove (_, w) -> Some (w, dispatchRestoreBeforeMove w)
+    | RequestClose (_, w) -> Some (w, dispatchRequestClose w)
     | _ -> None
 
 /// `executeEffectProtocol`（既存、Wm.Contracts.ErrorTypes）を実際の`probe`/`dispatch`で呼ぶ。

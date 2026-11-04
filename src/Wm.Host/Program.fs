@@ -49,6 +49,10 @@
 /// 直接`SafetyRecoveryAction`を記録する（8.4の明文「復旧操作はGatedEffectを経由しない例外経路」）。
 /// 表示復元・画面内移動・HWND一覧の追跡は、Shellがまだ`SetPresence(shown=false)`を一度も発行して
 /// いないため対象が無く、別ラウンドへ持ち越す。
+///
+/// ラウンド10：§8.4「窓を破壊・終了するEffectを提供しない」の唯一の例外`RequestClose`
+/// （`WM_CLOSE`による丁寧な要求）を実際に発行する。`SetPresence`のような§21の未決の設計判断
+/// （ワークスペースの非表示方式）に依存しないため、他のEffectより先に実装できた。
 module Wm.Host.Program
 
 open System
@@ -620,6 +624,82 @@ let main _argv =
     printfn "Round 9 summary: watchdogTriggered=%b journalEntries=%d" watchdogTriggered watchdogEntries.Length
     for e in watchdogEntries do
         printfn "  %A: %A" e.Kind e.Payload
+
+    // 段10：ラウンド10。§8.4「窓を破壊・終了するEffectを提供しない」の唯一の例外である`RequestClose`
+    // （WM_CLOSEによる丁寧な要求）を実際にOSへ発行する。自分で作った使い捨てテスト窓だけを対象にする
+    // （ラウンド3/4と同じ安全上の理由）。`focused`前提（`UserCommand CloseFocused`の型直前のコメント
+    // 参照）はこのラウンドでは一度だけの明示的な`ForegroundObserved`投入で満たす——単発の確認なので
+    // ラウンド7/8のような実時間のEVENT_SYSTEM_FOREGROUND中継は不要。
+    printfn "\n--- Round 10: real RequestClose (WM_CLOSE) dispatch against a self-owned test window ---"
+    let reducer5 = Reducer(RuntimePolicy.defaults, "phase-b-round10", "wm-host-round10", "no-policy-artifact", None)
+    let effectQueue5 = ConcurrentQueue<GatedEffect>()
+    let resultQueue5 = ConcurrentQueue<RequestId * Result<unit, NativeCallRecord>>()
+    let mutable keepDispatching5 = true
+    let effectApplyThread5 =
+        Thread(fun () ->
+            while keepDispatching5 do
+                match effectQueue5.TryDequeue() with
+                | true, gated ->
+                    let effect = GatedEffect.effect gated
+                    match Wm.Windows.EffectDispatch.apply effect with
+                    | Some result ->
+                        let ridOpt = match effect with RequestClose (rid, _) -> Some rid | _ -> None
+                        match ridOpt with
+                        | Some rid -> resultQueue5.Enqueue(rid, result)
+                        | None -> ()
+                    | None -> ()
+                | false, _ -> Thread.Sleep(1))
+    effectApplyThread5.IsBackground <- true
+    effectApplyThread5.Name <- "wm-effect-apply-round10"
+    effectApplyThread5.Start()
+
+    let enqueueEffects5 (effects: GatedEffect list) = for g in effects do effectQueue5.Enqueue(g)
+    let submit5 (now: int64) (source: string) (input: InputEvent) =
+        let sr = reducer5.Submit now source input
+        enqueueEffects5 sr.Effects
+        sr
+    let advance5 () =
+        match reducer5.AdvanceToNextTimer() with
+        | Some sr -> enqueueEffects5 sr.Effects; true
+        | None -> false
+    let drainResults5 (now: int64) =
+        let mutable more = true
+        while more do
+            match resultQueue5.TryDequeue() with
+            | true, (rid, result) -> submit5 now "wm-host-effect-thread" (EffectCallReturned (rid, result, None)) |> ignore
+            | false, _ -> more <- false
+    let pump5 (ms: int) =
+        let deadline = liveNow () + int64 ms
+        while liveNow () < deadline do
+            Application.DoEvents()
+            drainResults5 (liveNow ())
+            while reducer5.Timers.NextDeadline |> Option.exists (fun d -> d <= liveNow ()) do
+                advance5 () |> ignore
+            Thread.Sleep(1)
+
+    use testForm5 = new Form(Text = "wm-host-round10-test-window", Width = 300, Height = 200)
+    testForm5.Show()
+    pump5 300
+    let hwnd5 = testForm5.Handle // クローズ後に`.Handle`へアクセスし直すとObjectDisposedExceptionになるため先に控える
+    let w5 = WindowId (hwnd5.ToInt64())
+
+    submit5 (liveNow ()) "wm-host" (MonitorTopologyObserved monitors) |> ignore
+    pump5 300
+    submit5 (liveNow ()) "wm-host" (RawFirstSeen (observeWindow (liveNow ()) monitorHandles titleMatcher hwnd5) |> normalize |> List.exactlyOne) |> ignore
+    pump5 500
+    submit5 (liveNow ()) "wm-host" (ForegroundObserved (observation (liveNow ()) (Ok (Some w5)))) |> ignore
+    pump5 300
+
+    submit5 (liveNow ()) "wm-host" (UserCommand CloseFocused) |> ignore
+    pump5 500
+
+    keepDispatching5 <- false
+    effectApplyThread5.Join(2000) |> ignore
+
+    // Coreとは無関係に、実際にそのHWNDが本当に消えたかを直接問い合わせて確認する（ラウンド3/4/6/7/8と
+    // 同じ、Core状態への依存だけに頼らない二重確認）。
+    let stillExists = IsWindow(hwnd5)
+    printfn "Round 10 summary: real window still exists after RequestClose dispatch: %b (expected false)" stillExists
 
     printfn "\nDone."
     0
