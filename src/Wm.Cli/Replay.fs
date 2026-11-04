@@ -82,17 +82,47 @@ let simulateFromJournal (behaviorOf: WindowId -> WindowBehavior) (entries: Journ
         for t in sr.Trace do
             sb.AppendLine(sprintf "  -> DecisionTrace: %A" t) |> ignore
 
-    // `settle`は収束するまでEffect→観測の往復を繰り返すが、仮想タイマー（`PendingDeadline`等、
-    // Reconcileが新しいEffectを発行する契機になる）は自分では進めない。タイマーが尽きるまで
-    // `AdvanceToNextTimer`→`settle`を交互に回す（固定点まで、Reducer自身の`maxSettleSteps`相当の
-    // 上限は`AdvanceToNextTimer`がタイマー表を使い切った時点で自然に止まる）。
+    // `settle`は収束するまでEffect→観測の往復を繰り返すが、2つの独立した仮想時計
+    // ——Reducerの`Timers`（`PendingDeadline`等）と`VirtualWorld.Scheduled`（`DelayedByMs`等が
+    // 積む未発火の観測、`advanceClock`で進める）——は自分では進めない（ScenarioRunner.fs冒頭コメント・
+    // VirtualWorld.fs冒頭コメントが明示的に「シナリオ側の責務」としている）。ここが`simulateFromJournal`
+    // 自身の責務：どちらの時計が次に早く発火するかを比べ、早い方だけを1つ進めてから再度`settle`する、
+    // を両方尽きるまで繰り返す。
+    //
+    // 当初の実装は`Reducer.Timers`側だけを進めていて`advanceClock`を一度も呼んでいなかった——
+    // `DelayedByMs`/`SelfRepositionAfterMs`の遅延観測が永遠に発火しないバグで、`calibrate`の
+    // 候補グリッドを実際に試すまで（`Immediate`だけを使う既存の`simulate`では症状が出ない経路だった
+    // ため）発覚しなかった。`PendingDeadline`のリトライ上限（既定3回）が偶然どちらの経路でも
+    // 最終的にPendingを空にしてしまうため、既存の決定論性テストだけでは検出できなかった
+    // （CalibrateTests.fsのミューテーションテストで実際に確認済み）。
     let settleFully (now: int64) (initialEffects: GatedEffect list) =
         world <- settle now reducer world initialEffects
         let mutable more = true
         while more do
-            match reducer.AdvanceToNextTimer() with
-            | Some sr -> world <- settle now reducer world sr.Effects
-            | None -> more <- false
+            let nextScheduled = world.Scheduled |> List.map (fun s -> s.FireAtMs) |> List.sort |> List.tryHead
+            let nextTimerDeadline = reducer.Timers.NextDeadline
+            let scheduledFiresFirst =
+                match nextScheduled, nextTimerDeadline with
+                | Some schedAt, Some timerAt -> schedAt <= timerAt
+                | Some _, None -> true
+                | None, _ -> false
+            if nextScheduled.IsNone && nextTimerDeadline.IsNone then
+                more <- false
+            elif scheduledFiresFirst then
+                let schedAt = nextScheduled.Value
+                let world', events = advanceClock schedAt world
+                let effects = events |> List.collect (fun ev -> (reducer.Submit schedAt "virtual-world-clock" ev).Effects)
+                for ev in events do
+                    sb.AppendLine(sprintf "  -> (virtual-clock@%dms) Observed: %A" schedAt ev) |> ignore
+                world <- settle schedAt reducer world' effects
+            else
+                let timerAt = nextTimerDeadline.Value
+                match reducer.AdvanceToNextTimer() with
+                | Some sr ->
+                    for t in sr.Trace do
+                        sb.AppendLine(sprintf "  -> (timer@%dms) DecisionTrace: %A" timerAt t) |> ignore
+                    world <- settle timerAt reducer world sr.Effects
+                | None -> more <- false
 
     let bestRect (snapshot: WindowSnapshot) : PixelRect =
         let ok (o: Observation<PixelRect> option) = o |> Option.bind (fun ob -> match ob.Value with Ok r -> Some r | Error _ -> None)
@@ -154,3 +184,78 @@ let diffLines (expected: string) (actual: string) : (int * string option * strin
         let e = if i < expectedLines.Length then Some expectedLines.[i] else None
         let a = if i < actualLines.Length then Some actualLines.[i] else None
         if e <> a then yield (i + 1, e, a) ]
+
+/// architecture.md §12.3「実測モデルの育成」・外部フレームワーク構想§10.3 Model Calibrationの
+/// 最小実装：「シミュレーターを実機検証の結果でどんどん精度を上げていくサイクル」という直接の
+/// 要望に応える核。
+///
+/// 当初は`simulateFromJournal`の出力テキストを候補ごとに作り、実機の`golden-save`出力（`formatReplay`
+/// 形式）と`diffLines`で比較する案で実装したが、実際に試して2つの問題を発見し（本書の規律：
+/// 「ground truth from testing, not assumption」）、この数値直接比較の案へ置き換えた：
+/// (1) 2つの関数はそもそも異なるテキスト形式（`formatReplay`は実機の生Journalエントリを逐次ログ、
+///     `simulateFromJournal`はbootstrap/exogenousだけを選択的にログ）なので、行diffは形式の違いで
+///     即座に全行ズレてしまい、意味のある比較にならない。
+/// (2) `settleFully`が両方の仮想時計を尽くすまで回す以上、最終収束状態（分類・Pending件数）は
+///     遅延の長さに関わらず同じになりがちで、行diffという「一致/不一致」の二値指標では「どの程度
+///     近いか」という連続値（遅延ms）を順位付けできない。
+/// 正しい指標は「実測の遅延（ms）」そのものを実機Journalから直接抽出し、候補`WindowBehavior`の
+/// 遅延値とどれが一番近いかを数値で比べること——`measuredLatenciesMs`がこの抽出を行う。
+let candidateBehaviors : WindowBehavior list =
+    [ Immediate
+      DelayedByMs 50L
+      DelayedByMs 100L
+      DelayedByMs 200L
+      DelayedByMs 500L
+      DelayedByMs 1000L ]
+
+/// 実機Journalを素の`Reducer`へ通し（`formatReplay`と同じ駆動だが、テキスト整形はしない）、
+/// 窓ごとに「直近発行された`SetRect`の発行tickと目標矩形」を追跡し、その後その窓について
+/// 目標どおりの矩形を運ぶ`WindowObserved`が実際に届いたtickとの差分（ms、Journalの
+/// `MonotonicTicks`はms単位、architecture.md §9参照）を返す——Coreが実際に発行したEffectと、
+/// それに対する実機の応答という、Journalに記録された「本当に起きたこと」だけから導く実測値
+/// （机上の仮定を含まない）。同じ窓に新しい`SetRect`が発行されたら前回分（未達のまま）は捨て、
+/// 最後に発行された`SetRect`への応答だけを測る——Retryで新しい`RequestId`が発行された場合も、
+/// Simulationの`DelayedByMs`が「1回の発行→1回の遅延応答」を模すのと対応する単位になる。
+let measuredLatenciesMs (entries: JournalEntry list) : (WindowId * int64) list =
+    let reducer = Reducer(RuntimePolicy.defaults, "calibrate-measure", "wm-cli", "no-policy-artifact", None)
+    let mutable pendingByWindow : Map<WindowId, int64 * PixelRect> = Map.empty
+    let mutable measured : (WindowId * int64) list = []
+    for entry in entries do
+        match entry.Payload with
+        | InputPayload input ->
+            let sr = reducer.Submit entry.MonotonicTicks "calibrate-measure" input
+            for g in sr.Effects do
+                match GatedEffect.effect g with
+                | SetRect (_, w, rect) -> pendingByWindow <- Map.add w (entry.MonotonicTicks, rect) pendingByWindow
+                | _ -> ()
+            match input with
+            | WindowObserved snapshot ->
+                match Map.tryFind snapshot.Id pendingByWindow, snapshot.VisibleFrameRect with
+                | Some (issuedAt, target), Some obs ->
+                    match obs.Value with
+                    | Ok rect when rect = target ->
+                        measured <- (snapshot.Id, entry.MonotonicTicks - issuedAt) :: measured
+                        pendingByWindow <- Map.remove snapshot.Id pendingByWindow
+                    | _ -> ()
+                | _ -> ()
+            | _ -> ()
+        | _ -> ()
+    List.rev measured
+
+/// 実測遅延（`measuredLatenciesMs`）に数値的に最も近い候補`WindowBehavior`を窓ごとに選ぶ
+/// （`Immediate`からの距離は実測値そのもの、`DelayedByMs d`からの距離は`|d - 実測値|`）。
+/// 複数回観測された窓は最後の実測値を使う（直近の振る舞いを優先）。
+let calibrate (entries: JournalEntry list) : (WindowId * WindowBehavior * int64) list =
+    measuredLatenciesMs entries
+    |> List.fold (fun acc (w, latencyMs) -> Map.add w latencyMs acc) Map.empty
+    |> Map.toList
+    |> List.map (fun (w, latencyMs) ->
+        let bestFit =
+            candidateBehaviors
+            |> List.minBy (fun b ->
+                match b with
+                | Immediate -> abs latencyMs
+                | DelayedByMs d -> abs (d - latencyMs)
+                | _ -> Int64.MaxValue)
+        w, bestFit, latencyMs)
+    |> List.sortBy (fun (WindowId id, _, _) -> id)

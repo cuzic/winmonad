@@ -115,3 +115,24 @@ let ``simulateFromJournalは実機のEffectCallReturned/TimerElapsedを再生せ
         | None -> failwith "reference window was not classified"
     finally
         if IO.File.Exists path then IO.File.Delete path
+
+[<Fact>]
+let ``simulateFromJournalはDelayedByMsのScheduled観測をVirtualWorldの仮想時計(advanceClock)で実際に発火させる`` () =
+    // 初期実装は`VirtualWorld.Scheduled`（`DelayedByMs`が積む未発火の観測）を一度も`advanceClock`で
+    // 進めておらず、遅延観測が永遠に発火しないバグがあった——`Final Placement.Pending`が偶然
+    // どちらの経路でも0に収束してしまうため、最終状態だけを見る検査では検出できなかった
+    // （ミューテーションテストで実際に確認: このテストの核心である"virtual-clock@"ログを取り除くと
+    // 符合する箇所が無くなり、Assert.Containsが落ちる）。`Immediate`は観測が`settle`内で即座に
+    // 返るためこのログ行を一切出さないので、両者の出力が一致しないことも併せて確認する。
+    let w = WindowId 1L
+    let path = buildJournal w { X = 0; Y = 0; Width = 300; Height = 200 }
+    try
+        let entries = Wm.Journal.JournalWriter.readAll path |> List.ofSeq
+        let delayed = simulateFromJournal (fun _ -> DelayedByMs 100L) entries
+        let immediate = simulateFromJournal (fun _ -> Immediate) entries
+
+        Assert.Contains("virtual-clock@", delayed)
+        Assert.DoesNotContain("virtual-clock@", immediate)
+        Assert.NotEqual<string>(immediate, delayed)
+    finally
+        if IO.File.Exists path then IO.File.Delete path

@@ -16,6 +16,14 @@
 /// 適用する——「本当に起きたこと」ではなく「単純なSimulationモデルだったら何が起きていたか」を
 /// 再構成する。`golden-save`で保存した実機の結果と`diffLines`で比較すれば、モデルの仮定が現実と
 /// 食い違う箇所を直接指し示せる。
+///
+/// `calibrate`（v2.110で追加）：「Simulatorを実機検証の結果でどんどん精度を上げていくサイクルを
+/// 構築したい」という直接の要望に応える核。実機Journal1本から、窓ごとに「SetRectの発行から
+/// 目標どおりの矩形が観測されるまでの実測遅延(ms)」を直接測り、候補`WindowBehavior`のうち数値的に
+/// 最も近いものを報告する——Model Calibration（§10.3/§12.3）の最小実装。当初は`simulateFromJournal`
+/// の出力をgoldenへ行diffする案で作ったが、実際に試して「形式が違う上に最終収束状態は遅延量に
+/// 関わらずほぼ同じになる」ため意味のある順位付けにならないと判明し（`Replay.fs`の`calibrate`
+/// 直前のコメント参照）、実測tickの数値比較へ置き換えた。
 module Wm.Cli.Program
 
 open System
@@ -77,6 +85,19 @@ let private simulate (journalPath: string) (goldenPath: string option) : int =
                 printfn "    simulated     : %s" (actualLine |> Option.defaultValue "<missing>")
             1
 
+let private calibrate (journalPath: string) : int =
+    let entries = loadEntries journalPath
+    let fits = Wm.Cli.Replay.calibrate entries
+    match fits with
+    | [] ->
+        printfn "No measurable SetRect round-trip found in %s (no window had a dispatched SetRect answered by a matching WindowObserved)." journalPath
+        1
+    | _ ->
+        printfn "Calibration from %s (%d window(s) with a measurable SetRect round-trip):" journalPath fits.Length
+        for (w, bestFit, measuredMs) in fits do
+            printfn "  %A: measured latency=%dms -> best-fit candidate=%A" w measuredMs bestFit
+        0
+
 let private usage () =
     eprintfn "Usage:"
     eprintfn "  wm-cli explain <journal-file.ndjson>"
@@ -92,6 +113,10 @@ let private usage () =
     eprintfn "      (Immediate/ideal window behavior) instead of replaying the recorded real"
     eprintfn "      Effect results. Without a golden file, prints the simulated result; with one,"
     eprintfn "      diffs against it to reveal where the real world diverged from the simple model."
+    eprintfn "  wm-cli calibrate <journal-file.ndjson>"
+    eprintfn "      Measures, per window, how many ms really elapsed between Core dispatching a SetRect"
+    eprintfn "      and a matching WindowObserved arriving, then reports the candidate WindowBehavior"
+    eprintfn "      (Immediate/DelayedByMs) whose delay is numerically closest to that measured latency."
     1
 
 let private requireFile (label: string) (path: string) : bool =
@@ -110,5 +135,6 @@ let main argv =
     | [| "simulate"; journalPath |] -> if requireFile "journal" journalPath then simulate journalPath None else 1
     | [| "simulate"; journalPath; goldenPath |] ->
         if requireFile "journal" journalPath && requireFile "golden" goldenPath then simulate journalPath (Some goldenPath) else 1
+    | [| "calibrate"; journalPath |] -> if requireFile "journal" journalPath then calibrate journalPath else 1
     | [| path |] -> if requireFile "journal" path then explain path else 1 // 後方互換：v2.105時点の既定動作
     | _ -> usage ()
