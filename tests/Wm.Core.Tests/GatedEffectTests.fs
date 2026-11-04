@@ -193,6 +193,29 @@ let ``MissingRestoreBeforeMove: 別バッチのRestoreBeforeMoveは数えない�
         | _ -> Assert.True(false, "expected the first ApplyBatch to pass through")
     | _ -> Assert.True(false, "expected exactly the first batch to pass")
 
+[<Fact>]
+let ``MissingRestoreBeforeMove: トップレベル(ApplyBatchの外)でも直前のRestoreBeforeMoveがあれば通る(v2.88)`` () =
+    let input = { cleanInput with NeedsRestore = Set.singleton w }
+    let ok, rejected = GatedEffect.gate input [ RestoreBeforeMove (rid, w); SetRect (RequestId 2L, w, rect) ]
+    Assert.Empty(rejected)
+    Assert.Equal(2, List.length ok)
+
+/// round2レビューN-4：旧実装は`restoreSeen`をリスト全体で単調に増やし続けていたため、ある窓への
+/// `RestoreBeforeMove`が通過した後、全く無関係な別のEffectを挟んで同じ窓へ発行された（直前に
+/// `RestoreBeforeMove`を伴わない）`SetRect`まで誤って素通りさせる余地があった。`NeedsRestore`が
+/// 常に空だった当時(v2.19時点)は顕在化しなかったが、v2.74で実際に populated されるようになった後も
+/// 見直されていなかった既知のギャップ。`gate`の型直前のコメント参照。
+[<Fact>]
+let ``MissingRestoreBeforeMove: 離れた(直前でない)RestoreBeforeMoveは数えない(round2レビューN-4、v2.88)`` () =
+    let input = { cleanInput with NeedsRestore = Set.singleton w }
+    let ok, rejected =
+        GatedEffect.gate input
+            [ RestoreBeforeMove (rid, w)
+              ObserveAll
+              SetRect (RequestId 2L, w, rect) ]
+    Assert.Equal<(RequestId option * GateRejection) list>([ Some (RequestId 2L), MissingRestoreBeforeMove w ], rejected)
+    Assert.Equal<Effect list>([ RestoreBeforeMove (rid, w); ObserveAll ], ok |> List.map GatedEffect.effect)
+
 // ===== ApplyBatchの構造的な扱い =====
 
 [<Fact>]

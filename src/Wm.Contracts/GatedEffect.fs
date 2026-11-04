@@ -153,8 +153,10 @@ module GatedEffect =
           (RHiddenByWm, CloseKind), true ]
         |> Map.ofList
 
-    /// §6.2「拒否理由ごとの適用範囲」の表に従って1つのEffectを検査する。restoreSeenは同一ApplyBatch内で
-    /// 先行するRestoreBeforeMoveの対象集合（バッチをまたいでは共有しない、Opusレビュー2-7）。
+    /// §6.2「拒否理由ごとの適用範囲」の表に従って1つのEffectを検査する。restoreSeenは直前に通過した
+    /// Effectが`RestoreBeforeMove w`だった場合の`{w}`、それ以外は空集合（バッチをまたいでは共有しない、
+    /// Opusレビュー2-7。「直前」の意味論はv2.88のround2レビューN-4対応で狭めた、`gate`の型直前の
+    /// コメント参照）。
     let private checkOne (input: GateInput) (restoreSeen: Set<WindowId>) (e: Effect) : GateRejection option =
         match effectKindOf e, targetOf e with
         | None, _ -> None // ApplyBatch/ObserveAllはここでは検査しない（呼び出し元が子を展開する）
@@ -191,26 +193,36 @@ module GatedEffect =
     /// 子を再帰的に展開して検査し、通過した子だけを含む新しいApplyBatchとして再構成する
     /// （全員拒否された場合は空のApplyBatchを出さない、Opusレビュー2-11）。
     /// 各ApplyBatchの`restoreSeen`は空集合から始まり、親の並びや他のバッチとは共有しない（Opusレビュー2-7）。
+    /// **v2.88（round2レビューN-4）**：`lastRestore`は「直前に通過したEffectが`RestoreBeforeMove w`
+    /// だった場合のその`w`」だけを1件覚える（それより前の、または別の窓への`RestoreBeforeMove`は
+    /// 一切数えない）。`Placement.dispatchPlacements`は`RestoreBeforeMove w`の直後に必ず同じ`w`への
+    /// `SetRect`を発行するので（型直前のコメント参照）、この狭い意味論でも今日の唯一の発行元には
+    /// 影響しない。旧実装は`Set<WindowId>`をリスト全体で単調に増やし続けていたため、ある窓への
+    /// `RestoreBeforeMove`が通過した後、全く無関係な別のタイミングで同じ窓へ発行された
+    /// （直前にRestoreBeforeMoveを伴わない）`SetRect`まで誤って素通りさせてしまう余地があった
+    /// （round2レビューが`NeedsRestore`が常に空だった当時「今は顕在化しない」と指摘した既知のギャップ。
+    /// v2.74で`NeedsRestore`が実際に populated されるようになった後も見直されていなかった）。
     let internal gate (input: GateInput) (effects: Effect list) : GatedEffect list * (RequestId option * GateRejection) list =
-        let rec go (restoreSeen: Set<WindowId>) (es: Effect list) : Effect list * (RequestId option * GateRejection) list =
+        let rec go (lastRestore: WindowId option) (es: Effect list) : Effect list * (RequestId option * GateRejection) list =
+            let restoreSeen = match lastRestore with Some w -> Set.singleton w | None -> Set.empty
             match es with
             | [] -> [], []
             | ApplyBatch (bid, children) :: rest ->
-                let childOk, childRej = go Set.empty children
-                let restOk, restRej = go restoreSeen rest
+                let childOk, childRej = go None children
+                let restOk, restRej = go None rest
                 (if List.isEmpty childOk then restOk else ApplyBatch (bid, childOk) :: restOk), childRej @ restRej
             | e :: rest ->
                 match checkOne input restoreSeen e with
                 | Some rej ->
-                    let restOk, restRej = go restoreSeen rest
+                    let restOk, restRej = go None rest
                     restOk, (requestIdOf e, rej) :: restRej
                 | None ->
-                    let restoreSeen' =
+                    let lastRestore' =
                         match e with
-                        | RestoreBeforeMove (_, w) -> Set.add w restoreSeen
-                        | _ -> restoreSeen
-                    let restOk, restRej = go restoreSeen' rest
+                        | RestoreBeforeMove (_, w) -> Some w
+                        | _ -> None
+                    let restOk, restRej = go lastRestore' rest
                     e :: restOk, restRej
 
-        let ok, rej = go Set.empty effects
+        let ok, rej = go None effects
         ok |> List.map GatedEffect, rej
