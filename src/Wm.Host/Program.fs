@@ -454,10 +454,13 @@ let main _argv =
     // 同じ目標へリトライし続けてしまう（最初の診断ログで同じ窓へ3回連続で同じSetRectが発行されていた
     // 実際の症状、`pendingRetryMaxAttempts=3`と一致）。自プロセスに絞った`EVENT_OBJECT_LOCATIONCHANGE`
     // を購読し、実際に動いた窓を再観測してCoreへ返す。
+    let mutable locationReobserveCount4 = 0
     let locationHook4 =
         hookLocationChangeForProcess (uint32 (Process.GetCurrentProcess().Id)) (fun _ hwnd ->
             if hwnd = testFormA.Handle || hwnd = testFormB.Handle then
                 let now = liveNow ()
+                locationReobserveCount4 <- locationReobserveCount4 + 1
+                printfn "  [round7/8 reobserve] LOCATIONCHANGE hwnd=%A" hwnd
                 submit4 now "wm-host-locationchange" (RawReobserved (observeWindow now monitorHandles titleMatcher hwnd) |> normalize |> List.exactlyOne) |> ignore)
 
     let hotkeyIdFocusNext = 1
@@ -482,6 +485,10 @@ let main _argv =
     printfn "Round 7+8 diagnostic: windowA(%A) workspace=%A, windowB(%A) workspace=%A" wA wsOfA wB wsOfB
     for ws in [ wsOfA; wsOfB ] |> List.choose id |> List.distinct do
         printfn "  Workspace %A stack=%A" ws (Wm.Core.Workspaces.WorkspaceSet.stateOf ws reducer4.State.Workspaces).Stack
+    printfn "  classification A=%A B=%A" (Map.tryFind wA reducer4.State.Windows.Records |> Option.map (fun r -> r.Classification)) (Map.tryFind wB reducer4.State.Windows.Records |> Option.map (fun r -> r.Classification))
+    printfn "  Desired A=%A B=%A" (Map.tryFind wA reducer4.State.Placement.Desired) (Map.tryFind wB reducer4.State.Placement.Desired)
+    printfn "  Pending=%A" (reducer4.State.Placement.Pending |> Map.toList)
+    printfn "  reobserved(LOCATIONCHANGE) so far=%d" locationReobserveCount4
 
     let pressChord (modifiers: byte list) (key: byte) =
         // VK_MENU(Alt)は絶対に押さない——型直前のコメント参照、実際のCI実機ハングの既知の罠。
