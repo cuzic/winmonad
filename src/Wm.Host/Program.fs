@@ -43,6 +43,12 @@
 /// （WmState.fs型直前のコメント参照）、実際の`EVENT_SYSTEM_FOREGROUND`も購読してラウンド7の
 /// FocusNextが変えた実フォアグラウンドをCoreへ中継し、`Focus.Foreground`を実際に満たす。
 /// 検証は`GetWindowRect`で両窓の実矩形がSwapWithMaster前後で実際に入れ替わったかを直接確認する。
+///
+/// ラウンド9：§8.4「安全停止」のうちハング検知だけを切り出す。別スレッドがメインループの心拍を
+/// 監視し、一定時間途絶えたら発動——発動したらReducerを一切経由せず、専用のJournalファイルへ
+/// 直接`SafetyRecoveryAction`を記録する（8.4の明文「復旧操作はGatedEffectを経由しない例外経路」）。
+/// 表示復元・画面内移動・HWND一覧の追跡は、Shellがまだ`SetPresence(shown=false)`を一度も発行して
+/// いないため対象が無く、別ラウンドへ持ち越す。
 module Wm.Host.Program
 
 open System
@@ -564,6 +570,56 @@ let main _argv =
     testFormA.Close()
     testFormB.Close()
     hotkeyForm.Close()
+
+    // 段9：ラウンド9。§8.4「安全停止」の制御経路のうち、最も先に要るハング検知だけを切り出す
+    // （本番の復旧対象であるHWND一覧の追跡・表示復元・画面内移動・TaskbarCreated再登録は、
+    // 現時点のShellがまだSetPresence(shown=false)を一度も発行していないため対象が無く、
+    // 別ラウンドへ持ち越す）。別スレッド（型直前の8.4本文は「できれば別プロセス」と書くが、
+    // 初期版としてまずスレッドで分離する）がメインループの心拍（ハートビート）を監視し、
+    // 一定時間途絶えたら発動する。発動したら、8.4の明文の要求「復旧操作はGatedEffectを経由しない
+    // 例外経路」に従い、Reducerを一切経由せず専用のJournalファイルへ直接`SafetyRecoveryAction`を
+    // 記録する——Reducerがハングしていても、この経路だけは独立して動くことを実機で確認する。
+    // 本物のハングを起こすのは危険すぎるため、心拍の更新を計画的に一定時間止めるだけで検知経路を
+    // 検証する（実際にメインスレッドをブロックさせるのではなく、擬似的に心拍だけを止める）。
+    printfn "\n--- Round 9: safety-stop watchdog heartbeat detection (independent control path, §8.4) ---"
+    let watchdogJournalPath = Path.Combine(Path.GetTempPath(), sprintf "wm-watchdog-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    let mutable lastHeartbeat = Environment.TickCount64
+    let mutable watchdogTriggered = false
+    let heartbeatTimeoutMs = 500L
+    let watchdogThread =
+        Thread(fun () ->
+            while not watchdogTriggered do
+                Thread.Sleep(50)
+                let gap = Environment.TickCount64 - lastHeartbeat
+                if gap > heartbeatTimeoutMs then
+                    watchdogTriggered <- true
+                    let entry: JournalEntry =
+                        { SchemaVersion = 1
+                          SessionId = "wm-watchdog"
+                          Sequence = 0L
+                          MonotonicTicks = Environment.TickCount64
+                          WallTimeUtc = DateTimeOffset.UtcNow
+                          CorrelationId = None
+                          CausationId = None
+                          PolicyArtifactHash = "no-policy-artifact"
+                          CoreBuildId = "wm-watchdog"
+                          Kind = SafetyRecoveryAction
+                          Payload = SafetyRecoveryActionPayload (sprintf "heartbeat gap %dms exceeded %dms threshold -- main loop presumed hung" gap heartbeatTimeoutMs) }
+                    Wm.Journal.JournalWriter.appendEntry watchdogJournalPath entry
+                    printfn "  [round9 watchdog] triggered: heartbeat gap=%dms > threshold=%dms" gap heartbeatTimeoutMs)
+    watchdogThread.IsBackground <- true
+    watchdogThread.Name <- "wm-safety-watchdog"
+    watchdogThread.Start()
+
+    printfn "Simulating a main-loop heartbeat gap (not the real thing -- see comment above) for 700ms..."
+    Thread.Sleep(700)
+    lastHeartbeat <- Environment.TickCount64 // 心拍を復帰させてウォッチドッグを止める
+    Thread.Sleep(200) // ウォッチドッグがこの間に発火・記録を終えたことを確認する余裕
+
+    let watchdogEntries = Wm.Journal.JournalWriter.readAll watchdogJournalPath |> List.ofSeq
+    printfn "Round 9 summary: watchdogTriggered=%b journalEntries=%d" watchdogTriggered watchdogEntries.Length
+    for e in watchdogEntries do
+        printfn "  %A: %A" e.Kind e.Payload
 
     printfn "\nDone."
     0
