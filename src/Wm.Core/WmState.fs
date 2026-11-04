@@ -799,7 +799,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         // 引き金にする——劣化した窓を外した残りのTiled構成でLayoutを計算し直す必要がある。
         || driftDegraded
 
-    let reconcileOneScreen (placementSt: PlacementState, effects, cmds) (screen: Screen) =
+    let reconcileOneScreen (placementSt: PlacementState, effects, cmds, reconcileTr) (screen: Screen) =
         let wsState = WorkspaceSet.stateOf screen.Workspace next.Workspaces
         let stackList = wsState.Stack |> Option.map Zipper.toList |> Option.defaultValue []
         let tiledIds = stackList |> List.filter (fun w -> not (Set.contains w wsState.Floating))
@@ -841,16 +841,16 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         // 再計算する」経路）がこの窓を除いて自動的に計算し直す——生死以外の理由で除外する窓も、
         // 既存の「このstepでは対象から外す」機構に相乗りできる（新しい特別扱いの分岐は不要）。
         let aliveForScreen = Set.intersect aliveWindows windowsInThisWorkspace |> fun s -> Set.difference s placementSt.Dragging
-        let st', e', t' = Placement.reconcileWorkspace now runtimePolicy.LayoutRegistry layoutRef ctx managementForScreen aliveForScreen placementSt
-        st', effects @ e', cmds @ t'
+        let st', e', t', tr' = Placement.reconcileWorkspace now runtimePolicy.LayoutRegistry layoutRef ctx managementForScreen aliveForScreen placementSt
+        st', effects @ e', cmds @ t', reconcileTr @ tr'
 
-    let placementAfterReconcile, reconcileEffects, reconcileTimerCmds =
+    let placementAfterReconcile, reconcileEffects, reconcileTimerCmds, reconcileTraces =
         if not shouldReconcile then
-            next.Placement, [], []
+            next.Placement, [], [], []
         else
             match Topology.displays next.Topology with
-            | Displays (current, visible) -> (current :: visible) |> List.fold reconcileOneScreen (next.Placement, [], [])
-            | NoMonitors -> next.Placement, [], [] // モニター0台。Layout計算もEffect発行も行わない（§4.4）
+            | Displays (current, visible) -> (current :: visible) |> List.fold reconcileOneScreen (next.Placement, [], [], [])
+            | NoMonitors -> next.Placement, [], [], [] // モニター0台。Layout計算もEffect発行も行わない（§4.4）
 
     let next = { next with Placement = placementAfterReconcile }
 
@@ -930,4 +930,4 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         @ topologySettledTimerCmds
         @ reconcileTimerCmds
         @ gateRejectionTimerCmds
-      Trace = traces }
+      Trace = traces @ reconcileTraces }

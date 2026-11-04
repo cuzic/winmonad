@@ -11,6 +11,7 @@ open Wm.Contracts.SharedVocabulary
 open Wm.Contracts.Timers
 open Wm.Contracts.CoreCommand
 open Wm.Layouts.LayoutRegistry
+open Wm.Core.DecisionTrace
 open Wm.Core.Placement
 
 let private workArea: PixelRect = { X = 0; Y = 0; Width = 1920; Height = 1080 }
@@ -40,7 +41,7 @@ let private noDpi (_: MonitorId) : int option = None
 let ``Monocleで1窓をReconcileすると、SetRectがWorkArea全体を指し、Pendingが1件作られる`` () =
     let w = WindowId 1L
     let ctx = ctxWith [ w ]
-    let state', effects, timerCmds = reconcileWorkspace 10L registry monocleRef ctx (managementOf [ w ]) (aliveOf [ w ]) initial
+    let state', effects, timerCmds, _ = reconcileWorkspace 10L registry monocleRef ctx (managementOf [ w ]) (aliveOf [ w ]) initial
     Assert.Equal<Effect list>([ SetRect (RequestId 0L, w, workArea) ], effects)
     Assert.Equal(1, Map.count state'.Pending)
     Assert.NotEmpty(timerCmds)
@@ -60,15 +61,15 @@ let ``allocateRequestIdは呼ぶたびに異なるRequestIdを返し、dispatchP
 
     let w = WindowId 1L
     let ctx = ctxWith [ w ]
-    let _, effects, _ = reconcileWorkspace 10L registry monocleRef ctx (managementOf [ w ]) (aliveOf [ w ]) stateAfterAlloc2
+    let _, effects, _, _ = reconcileWorkspace 10L registry monocleRef ctx (managementOf [ w ]) (aliveOf [ w ]) stateAfterAlloc2
     Assert.Equal<Effect list>([ SetRect (RequestId 2L, w, workArea) ], effects)
 
 [<Fact>]
 let ``Desiredと同じ結果ならSetRectを再発行しない(§7.3重複要求の禁止)`` () =
     let w = WindowId 1L
     let ctx = ctxWith [ w ]
-    let state1, _, _ = reconcileWorkspace 10L registry monocleRef ctx (managementOf [ w ]) (aliveOf [ w ]) initial
-    let state2, effects2, _ = reconcileWorkspace 20L registry monocleRef ctx (managementOf [ w ]) (aliveOf [ w ]) state1
+    let state1, _, _, _ = reconcileWorkspace 10L registry monocleRef ctx (managementOf [ w ]) (aliveOf [ w ]) initial
+    let state2, effects2, _, _ = reconcileWorkspace 20L registry monocleRef ctx (managementOf [ w ]) (aliveOf [ w ]) state1
     Assert.Empty(effects2)
     Assert.Equal<Map<RequestId, PendingRequest>>(state1.Pending, state2.Pending)
 
@@ -76,10 +77,10 @@ let ``Desiredと同じ結果ならSetRectを再発行しない(§7.3重複要求
 let ``目標が変わったら新しいPendingを発行し、同じ窓宛ての古いPendingを失効させる(Superseded)`` () =
     let w1 = WindowId 1L
     let w2 = WindowId 2L
-    let state1, effects1, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w1 ]) (managementOf [ w1 ]) (aliveOf [ w1 ]) initial
+    let state1, effects1, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w1 ]) (managementOf [ w1 ]) (aliveOf [ w1 ]) initial
     Assert.Equal<Effect list>([ SetRect (RequestId 0L, w1, workArea) ], effects1)
     // 2窓目が増えた→MasterStackに切り替えてw1の目標が変わる(全画面→左半分)。
-    let state2, effects2, _ =
+    let state2, effects2, _, _ =
         reconcileWorkspace 20L registry (masterStackRef 0.5m) (ctxWith [ w1; w2 ]) (managementOf [ w1; w2 ]) (aliveOf [ w1; w2 ]) state1
     // w1の新しいPendingだけが残り(古いものは置き換わっている)、w2のPendingも追加される。
     Assert.Equal(2, Map.count state2.Pending)
@@ -88,24 +89,57 @@ let ``目標が変わったら新しいPendingを発行し、同じ窓宛ての�
     Assert.NotEqual<Effect list>([], effects2)
 
 [<Fact>]
-let ``死亡/未管理の窓だけの違反はRelayoutWithoutで再計算され、結局何も発行しない`` () =
+let ``死亡/未管理の窓だけの違反はRelayoutWithoutで再計算され、結局何も発行しない(かつDecisionTraceも残さない)`` () =
     // TiledWindowsにある窓がAlive/Managementに無い(死亡/未管理)→UnmanagedOrDeadWindowはdecideのremovable
     // (RelayoutWithout)対象なので、その窓を除いて再計算される。残りが無ければ結局は何も発行しない。
+    // v2.108：再計算が最終的に成功した場合は、1回目の拒否自体をノイズとしてDecisionTraceに残さない
+    // （無害だった拒否まで記録すると、Reconcileするたびに毎回Traceが出るようになってしまう）。
     let w = WindowId 1L
     let ctx = ctxWith [ w ]
-    let state', effects, _ = reconcileWorkspace 10L registry monocleRef ctx Map.empty Set.empty initial
+    let state', effects, _, traces = reconcileWorkspace 10L registry monocleRef ctx Map.empty Set.empty initial
     Assert.Empty(effects)
     Assert.Empty(state'.Pending)
+    Assert.Empty(traces)
 
 [<Fact>]
-let ``MissingPlacement(構造的な違反)はRejectWholePlanとして何も発行しない(再計算しても直らない)`` () =
+let ``MissingPlacement(構造的な違反)はRejectWholePlanとして何も発行せず、DecisionTraceにPlanRejectedを残す`` () =
     // w2はManagement/Aliveでは管理下のTiledだが、ctx.TiledWindowsに含まれない(WorkspacesとWindowsの
     // 不整合を模す)。MissingPlacementはdecideのremovable対象外なのでRejectWholePlanになる。
+    // v2.108：この「既知のギャップ、Explain未実装」だった経路をDecisionTraceへ記録するようになった。
     let w1, w2 = WindowId 1L, WindowId 2L
     let ctx = ctxWith [ w1 ]
-    let state', effects, _ = reconcileWorkspace 10L registry monocleRef ctx (managementOf [ w1; w2 ]) (aliveOf [ w1; w2 ]) initial
+    let state', effects, _, traces = reconcileWorkspace 10L registry monocleRef ctx (managementOf [ w1; w2 ]) (aliveOf [ w1; w2 ]) initial
     Assert.Empty(effects)
     Assert.Empty(state'.Pending)
+    match traces with
+    | [ Wm.Core.DecisionTrace.PlanRejected (layoutId, errors) ] ->
+        Assert.Equal(monocleRef.Id, layoutId)
+        Assert.Contains(Wm.Layouts.PlanValidator.MissingPlacement w2, errors)
+    | other -> failwithf "expected exactly one PlanRejected trace, got %A" other
+
+[<Fact>]
+let ``未登録のLayoutIdを参照するとDecisionTraceにLayoutNotRegisteredを残し、何も発行しない`` () =
+    let w = WindowId 1L
+    let ctx = ctxWith [ w ]
+    let unregistered: LayoutRef = { Id = LayoutId "no-such-layout"; ApiVersion = 1; Args = NoArgs }
+    let state', effects, _, traces = reconcileWorkspace 10L registry unregistered ctx (managementOf [ w ]) (aliveOf [ w ]) initial
+    Assert.Empty(effects)
+    Assert.Empty(state'.Pending)
+    Assert.Equal<DecisionTrace list>([ Wm.Core.DecisionTrace.LayoutNotRegistered (unregistered.Id, unregistered.ApiVersion) ], traces)
+
+[<Fact>]
+let ``Layout関数自体が失敗(InvalidInput)するとDecisionTraceにLayoutInvocationFailedを残し、何も発行しない`` () =
+    // MasterRatioは(0,1)の範囲外だとMasterStack.calculate自身がError(InvalidInput)を返す（既存の
+    // ratioOfの契約、Layout関数の失敗であり、PlanValidatorの検証失敗とは別の経路）。
+    let w = WindowId 1L
+    let ctx = ctxWith [ w ]
+    let invalidRatioRef = masterStackRef 1.5m
+    let state', effects, _, traces = reconcileWorkspace 10L registry invalidRatioRef ctx (managementOf [ w ]) (aliveOf [ w ]) initial
+    Assert.Empty(effects)
+    Assert.Empty(state'.Pending)
+    match traces with
+    | [ Wm.Core.DecisionTrace.LayoutInvocationFailed (layoutId, InvalidInput _) ] -> Assert.Equal(invalidRatioRef.Id, layoutId)
+    | other -> failwithf "expected exactly one LayoutInvocationFailed(InvalidInput) trace, got %A" other
 
 // ===== Satisfied（§7.2） =====
 
@@ -160,7 +194,7 @@ let private observedSnapshotMaximizedWithMonitor (w: WindowId) (rect: PixelRect)
 let ``最大化中のTiled窓への新しいSetRectは、同じ直前にRestoreBeforeMoveを別RequestIdで発行する(v2.74)`` () =
     let w = WindowId 1L
     let afterDiscovered, _, _ = onWindowObserved 5L (observedSnapshotMaximized w workArea 1L) initial
-    let state', effects, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterDiscovered
+    let state', effects, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterDiscovered
     match effects with
     | [ RestoreBeforeMove (restoreRid, restoreWindow); SetRect (setRid, setWindow, rect) ] ->
         Assert.Equal(w, restoreWindow)
@@ -174,7 +208,7 @@ let ``最大化中のTiled窓への新しいSetRectは、同じ直前にRestoreB
 [<Fact>]
 let ``最大化していないTiled窓への新しいSetRectはRestoreBeforeMoveを伴わない(回帰確認、v2.74)`` () =
     let w = WindowId 1L
-    let state', effects, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let state', effects, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     Assert.Equal<Effect list>([ SetRect (RequestId 0L, w, workArea) ], effects)
     Assert.Equal(1, Map.count state'.Pending)
 
@@ -186,7 +220,7 @@ let ``最大化状態が観測で解消された後の新しいSetRectはRestore
     let restoredSnapshot = { observedSnapshot w1 workArea 2L with IsMaximized = Some { Value = Ok false; SampleSequence = 2L; MonotonicTime = 6L; Source = "test" } }
     let afterRestored, _, _ = onWindowObserved 6L restoredSnapshot afterDiscovered
     // w2が増えてLayoutの目標が変わる(全画面→MasterStackの左半分)ので、w1への新しいSetRectが出る。
-    let state', effects, _ =
+    let state', effects, _, _ =
         reconcileWorkspace 10L registry (masterStackRef 0.5m) (ctxWith [ w1; w2 ]) (managementOf [ w1; w2 ]) (aliveOf [ w1; w2 ]) afterRestored
     let w1Effects = effects |> List.filter (function RestoreBeforeMove (_, w) -> w = w1 | SetRect (_, w, _) -> w = w1 | _ -> false)
     match w1Effects with
@@ -198,15 +232,15 @@ let ``最大化状態が観測で解消された後の新しいSetRectはRestore
 let ``Desiredと同じ結果ならSetRectを再発行せず、最大化中でもRestoreBeforeMoveも出さない(§7.3重複要求の禁止、v2.74)`` () =
     let w = WindowId 1L
     let afterDiscovered, _, _ = onWindowObserved 5L (observedSnapshotMaximized w workArea 1L) initial
-    let state1, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterDiscovered
-    let state2, effects2, _ = reconcileWorkspace 20L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) state1
+    let state1, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterDiscovered
+    let state2, effects2, _, _ = reconcileWorkspace 20L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) state1
     Assert.Empty(effects2)
     Assert.Equal<Map<RequestId, PendingRequest>>(state1.Pending, state2.Pending)
 
 [<Fact>]
 let ``観測された矩形がPendingのTargetRectと一致すればSatisfiedになりPendingが消える`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     Assert.Equal(1, Map.count afterReconcile.Pending)
     let afterObserved, _, timerCmds = onWindowObserved 20L (observedSnapshot w workArea 1L) afterReconcile
     Assert.Empty(afterObserved.Pending)
@@ -220,7 +254,7 @@ let ``Satisfiedになった瞬間、Movabilityの確度はInferred[]からConfir
     match Map.tryFind w afterDiscovered.Movability with
     | Some { Value = Movable; Confidence = Inferred [] } -> ()
     | other -> Assert.True(false, sprintf "expected the discovery default, got %A" other)
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterDiscovered
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterDiscovered
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w workArea 1L) afterReconcile
     match Map.tryFind w afterObserved.Movability with
     | Some { Value = Movable; Confidence = Confirmed } -> ()
@@ -229,7 +263,7 @@ let ``Satisfiedになった瞬間、Movabilityの確度はInferred[]からConfir
 [<Fact>]
 let ``観測された矩形がTargetRectと一致しなければPendingは残る(Mismatchはこのラウンドでは静観)`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let mismatchedRect = { workArea with Width = 100 }
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w mismatchedRect 1L) afterReconcile
     Assert.Equal(1, Map.count afterObserved.Pending)
@@ -239,7 +273,7 @@ let ``観測された矩形がTargetRectと一致しなければPendingは残る
 [<Fact>]
 let ``PendingDeadline満了は上限に達するまで同じTargetRectへSetRectを再発行し、Desiredは取り消さない`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid0 = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
     let afterRetry1, effects1, timerCmds1 = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid0 noDpi afterReconcile
     Assert.Equal(1, Map.count afterRetry1.Pending)
@@ -253,7 +287,7 @@ let ``PendingDeadline満了は上限に達するまで同じTargetRectへSetRect
 [<Fact>]
 let ``PendingDeadline満了が上限回数続くと、最終的にPendingとDesiredの両方を取り消す(次のReconcileで最初から再試行させる)`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid0 = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
     // pendingRetryMaxAttempts回（既定3回）Timeoutを発火させ続けると、最後は単発の諦めと同じ終端になる。
     let rec driveToGiveUp (attemptsLeft: int) (now: int64) (rid: RequestId) (state: PlacementState) : PlacementState =
@@ -271,7 +305,7 @@ let ``PendingDeadline満了が上限回数続くと、最終的にPendingとDesi
 [<Fact>]
 let ``新しい意図(Targetが変わったReconcile)はRetryの試行回数を引き継がない`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid0 = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
     let afterRetry, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid0 noDpi afterReconcile
     Assert.Equal(Some 1, Map.tryFind w afterRetry.RetryAttempts)
@@ -280,14 +314,14 @@ let ``新しい意図(Targetが変わったReconcile)はRetryの試行回数を�
     // これは古いTargetへの再試行ではなく新しい意図なので、試行回数は0へ戻るべき。
     let differentWorkArea: PixelRect = { X = 0; Y = 0; Width = 1280; Height = 720 }
     let differentCtx: LayoutContext = { ctxWith [ w ] with WorkArea = differentWorkArea }
-    let afterNewIntent, effects, _ = reconcileWorkspace 20L registry monocleRef differentCtx (managementOf [ w ]) (aliveOf [ w ]) afterRetry
+    let afterNewIntent, effects, _, _ = reconcileWorkspace 20L registry monocleRef differentCtx (managementOf [ w ]) (aliveOf [ w ]) afterRetry
     Assert.Equal<Effect list>([ SetRect (RequestId afterRetry.NextRequestId, w, differentWorkArea) ], effects)
     Assert.Equal(None, Map.tryFind w afterNewIntent.RetryAttempts)
 
 [<Fact>]
 let ``古い発火(期限未到達)のPendingDeadlineは無視する`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
     let stillPending, effects, timerCmds = onPendingDeadlineTimerFired 10L rid noDpi afterReconcile // Now=IssuedAt、まだdeadline未到達
     Assert.Equal(1, Map.count stillPending.Pending)
@@ -299,12 +333,12 @@ let ``古い発火(期限未到達)のPendingDeadlineは無視する`` () =
 [<Fact>]
 let ``onTopologySettledは全PendingをCancelTimer付きで取り消し、RetryAttemptsも消す`` () =
     let w1, w2 = WindowId 1L, WindowId 2L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w1 ]) (managementOf [ w1 ]) (aliveOf [ w1 ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w1 ]) (managementOf [ w1 ]) (aliveOf [ w1 ]) initial
     let rid1 = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
     let afterRetry, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid1 noDpi afterReconcile
     Assert.Equal(Some 1, Map.tryFind w1 afterRetry.RetryAttempts)
 
-    let afterSecondWindow, _, _ = reconcileWorkspace 20L registry (masterStackRef 0.5m) (ctxWith [ w1; w2 ]) (managementOf [ w1; w2 ]) (aliveOf [ w1; w2 ]) afterRetry
+    let afterSecondWindow, _, _, _ = reconcileWorkspace 20L registry (masterStackRef 0.5m) (ctxWith [ w1; w2 ]) (managementOf [ w1; w2 ]) (aliveOf [ w1; w2 ]) afterRetry
     Assert.Equal(2, Map.count afterSecondWindow.Pending)
     let expectedCancelCmds =
         afterSecondWindow.Pending |> Map.toSeq |> Seq.map (fun (rid, _) -> CancelTimer (TimerId.Placement (PendingDeadline rid))) |> List.ofSeq |> List.sort
@@ -338,7 +372,7 @@ let ``onWorkspaceShownは窓をShown NoneにしSetPresence(true)を発行する`
 [<Fact>]
 let ``Workspaceが非表示→再表示になった後のReconcileは、Shown Noneを無条件に変化ありと見て新しいSetRectを発行する`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     Assert.Equal(Some (Shown (Some workArea)), Map.tryFind w afterReconcile.Desired)
 
     let afterHidden, _, _ = onWorkspaceHidden 20L [ w ] afterReconcile
@@ -347,7 +381,7 @@ let ``Workspaceが非表示→再表示になった後のReconcileは、Shown No
 
     // 同じWorkArea/TiledWindowsでも、Shown Noneから再開すると必ず新しいSetRectが発行される
     // （隠されていた間に実際の位置が変わっていたかもしれないため、古い矩形を信用しない、§4.4）。
-    let afterReReconcile, effects, _ = reconcileWorkspace 30L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterShown
+    let afterReReconcile, effects, _, _ = reconcileWorkspace 30L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterShown
     Assert.Equal<Effect list>([ SetRect (RequestId afterShown.NextRequestId, w, workArea) ], effects)
     Assert.Equal(Some (Shown (Some workArea)), Map.tryFind w afterReReconcile.Desired)
 
@@ -464,7 +498,7 @@ let ``古い発火(期限未到達)のPresenceDeadlineは無視する`` () =
 [<Fact>]
 let ``onGateRejectedはそのRequestIdのPendingとDesiredを取り消し、CancelTimerを返す`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
     let state', timerCmds = onGateRejected [ rid ] afterReconcile
     Assert.Empty(state'.Pending)
@@ -478,7 +512,7 @@ let ``onGateRejectedはそのRequestIdのPendingとDesiredを取り消し、Canc
 [<Fact>]
 let ``onGateRejectedは、DesiredがHiddenByWmなら取り消さない(v2.86)`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
     let hidden = { afterReconcile with Desired = Map.add w HiddenByWm afterReconcile.Desired }
     let state', timerCmds = onGateRejected [ rid ] hidden
@@ -507,7 +541,7 @@ let ``onGateRejectedはPendingPresence宛てのRequestIdも取り消し、Cancel
 [<Fact>]
 let ``onWindowVanishedはPending・Desired・Epochsも除き、PendingDeadlineのCancelTimerを出す`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     Assert.NotEmpty(afterReconcile.Pending)
     let state', timerCmds = onWindowVanished w afterReconcile
     Assert.Empty(state'.Pending)
@@ -532,7 +566,7 @@ let private pendingRidFor (state: PlacementState) (w: WindowId) : RequestId =
 [<Fact>]
 let ``Ok()はPendingをSatisfiedにしない(それは観測の一致だけ)が、DispatchSeqは記録する(v2.42)`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let state', _, _, failureInfo = onEffectCallReturned 20L 2L rid (Ok ()) (Some 42L) afterReconcile
     Assert.Equal(None, failureInfo)
@@ -546,7 +580,7 @@ let ``Ok()はPendingをSatisfiedにしない(それは観測の一致だけ)が�
 [<Fact>]
 let ``ERROR_INVALID_WINDOW_HANDLEはTargetGoneに分類され、PendingとDesiredを取り消す`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let error: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 1400; ElapsedUs = 0L }
     let state', _, cmds, failureInfo = onEffectCallReturned 20L 2L rid (Error error) None afterReconcile
@@ -560,7 +594,7 @@ let ``ERROR_INVALID_WINDOW_HANDLEはTargetGoneに分類され、PendingとDesire
 [<Fact>]
 let ``ERROR_ACCESS_DENIEDはDenied OtherDenialに分類され、MovabilityをNotMovableへ修正する`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let error: NativeCallRecord = { Api = "SetWindowPos"; Space = Win32LastError; Code = 5; ElapsedUs = 0L }
     let state', _, _, failureInfo = onEffectCallReturned 20L 2L rid (Error error) None afterReconcile
@@ -573,7 +607,7 @@ let ``ERROR_ACCESS_DENIEDはDenied OtherDenialに分類され、MovabilityをNot
 [<Fact>]
 let ``TargetHungと分類された場合、Movabilityは変えない(HealthのResponsiveness修正は呼び出し側の責務)`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let error: NativeCallRecord = { Api = "SendMessageTimeout"; Space = Win32LastError; Code = 1460; ElapsedUs = 0L }
     let state', _, _, failureInfo = onEffectCallReturned 20L 2L rid (Error error) None afterReconcile
@@ -591,7 +625,7 @@ let ``対応するPendingが無いRequestId(古い結果)は無害に無視す�
 [<Fact>]
 let ``Transient(ハング判定前のERROR_TIMEOUT)は即座に再試行し、Desiredは取り消さない(v2.30)`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid0 = pendingRidFor afterReconcile w
     let error: NativeCallRecord = { Api = "SendMessageTimeout"; Space = Win32LastError; Code = 1460; ElapsedUs = 500L } // >0なのでTransient
     let afterRetry, effects, cmds, failureInfo = onEffectCallReturned 20L 2L rid0 (Error error) None afterReconcile
@@ -609,7 +643,7 @@ let ``Transient(ハング判定前のERROR_TIMEOUT)は即座に再試行し、De
 [<Fact>]
 let ``Transientが上限回数続くと、最終的にPendingとDesiredを取り消し古いPendingDeadlineもCancelTimerする(v2.30)`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let error: NativeCallRecord = { Api = "SendMessageTimeout"; Space = Win32LastError; Code = 1460; ElapsedUs = 500L }
     let rec driveToGiveUp (attemptsLeft: int) (state: PlacementState) : PlacementState * TimerCommand<TimerId> list =
         let rid = pendingRidFor state w
@@ -627,7 +661,7 @@ let ``Transientが上限回数続くと、最終的にPendingとDesiredを取り
 [<Fact>]
 let ``本当に異なる矩形が発行後に観測されたら、PendingDeadline時にMismatchとして終端し、Retryせず、Desiredは残す(v2.42)`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let mismatchedRect = { workArea with X = workArea.X + 50 }
@@ -641,7 +675,7 @@ let ``本当に異なる矩形が発行後に観測されたら、PendingDeadlin
 [<Fact>]
 let ``DispatchSeqが未確認(EffectCallReturned Okがまだ届いていない)間は、異なる矩形を観測してもMismatchと判定せずTimeout/Retryのまま(v2.42)`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let differentRect = { workArea with X = workArea.X + 50 }
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w differentRect 10L) afterReconcile
@@ -652,7 +686,7 @@ let ``DispatchSeqが未確認(EffectCallReturned Okがまだ届いていない)�
 [<Fact>]
 let ``DispatchSeqより古い(発行前に取得された)観測はMismatch判定に使わない、Timeout/Retryのまま(v2.42)`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 10L) afterReconcile
     let staleRect = { workArea with X = workArea.X + 999 }
@@ -666,7 +700,7 @@ let ``発行後も観測がBaselineのまま変わらなければMismatchにし�
     let w = WindowId 1L
     let baselineRect = { X = 10; Y = 10; Width = 300; Height = 200 }
     let afterDiscovered, _, _ = onWindowObserved 1L (observedSnapshot w baselineRect 0L) initial
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterDiscovered
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterDiscovered
     let rid = pendingRidFor afterReconcile w
     match Map.tryFind rid afterReconcile.Pending with
     | Some pr -> Assert.Equal(Some baselineRect, pr.Baseline)
@@ -680,12 +714,12 @@ let ``発行後も観測がBaselineのまま変わらなければMismatchにし�
 [<Fact>]
 let ``supersedeされた旧Epochの目標が遅れて観測されても、新しいPendingのMismatchとして扱わない(v2.42)`` () =
     let w = WindowId 1L
-    let afterReconcile1, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile1, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid0 = pendingRidFor afterReconcile1 w
     let oldTarget = workArea
     let afterDispatched0, _, _, _ = onEffectCallReturned 11L 2L rid0 (Ok ()) (Some 5L) afterReconcile1
     let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
-    let afterReconcile2, _, _ = reconcileWorkspace 15L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterDispatched0
+    let afterReconcile2, _, _, _ = reconcileWorkspace 15L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterDispatched0
     let rid1 = pendingRidFor afterReconcile2 w
     Assert.NotEqual(rid0, rid1)
     match Map.tryFind w afterReconcile2.InFlightTargets with
@@ -701,9 +735,9 @@ let ``supersedeされた旧Epochの目標が遅れて観測されても、新し
 [<Fact>]
 let ``onTopologySettledはInFlightTargetsも消す(v2.42)`` () =
     let w = WindowId 1L
-    let afterReconcile1, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile1, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
-    let afterReconcile2, _, _ = reconcileWorkspace 15L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterReconcile1
+    let afterReconcile2, _, _, _ = reconcileWorkspace 15L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterReconcile1
     Assert.NotEmpty(Map.tryFind w afterReconcile2.InFlightTargets |> Option.defaultValue [])
     let afterSettled, _ = onTopologySettled afterReconcile2
     Assert.Equal(None, Map.tryFind w afterSettled.InFlightTargets)
@@ -711,9 +745,9 @@ let ``onTopologySettledはInFlightTargetsも消す(v2.42)`` () =
 [<Fact>]
 let ``onWindowVanishedはInFlightTargetsも消す(v2.42)`` () =
     let w = WindowId 1L
-    let afterReconcile1, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile1, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
-    let afterReconcile2, _, _ = reconcileWorkspace 15L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterReconcile1
+    let afterReconcile2, _, _, _ = reconcileWorkspace 15L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterReconcile1
     Assert.NotEmpty(Map.tryFind w afterReconcile2.InFlightTargets |> Option.defaultValue [])
     let afterVanished, _ = onWindowVanished w afterReconcile2
     Assert.Equal(None, Map.tryFind w afterVanished.InFlightTargets)
@@ -725,9 +759,9 @@ let ``Satisfied(checkPendingSatisfied)もInFlightTargetsを消す(v2.69、Opus�
     // Layoutが数種類の矩形を往復するだけの窓（MasterStackで窓数が変わるたびに同じ矩形を行き来する等）
     // では無限に積み重なり、それらの矩形が将来Mismatchの証拠として検出されなくなる。
     let w = WindowId 1L
-    let afterReconcile1, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile1, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
-    let afterReconcile2, _, _ = reconcileWorkspace 15L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterReconcile1
+    let afterReconcile2, _, _, _ = reconcileWorkspace 15L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterReconcile1
     Assert.NotEmpty(Map.tryFind w afterReconcile2.InFlightTargets |> Option.defaultValue [])
     // 新しい(2回目の)Targetと一致する観測が届き、Satisfiedになる。
     let rid2 = pendingRidFor afterReconcile2 w
@@ -742,7 +776,7 @@ let ``Satisfied(checkPendingSatisfied)もInFlightTargetsを消す(v2.69、Opus�
 let ``幅が目標より広い矩形が観測されると、DIP正規化してMinWidthの証拠にする(v2.43)`` () =
     let w = WindowId 1L
     let m = MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let widerRect = { workArea with Width = 2000 } // 要求(workArea.Width=1920)より広い=アプリの最小幅制約
@@ -757,7 +791,7 @@ let ``幅が目標より広い矩形が観測されると、DIP正規化してMi
 let ``幅が目標より広くない観測はMismatchとして終端してもMinWidthの証拠にしない(v2.43)`` () =
     let w = WindowId 1L
     let m = MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     // 幅は要求と同じだがX位置が違う：Mismatchにはなるが、幅は広がっていないのでMinWidthの証拠ではない。
@@ -772,7 +806,7 @@ let ``幅が目標より広くない観測はMismatchとして終端してもMin
 let ``モニターのDPIが分からない場合は、幅が広い観測でもMinWidthの証拠にしない(v2.43)`` () =
     let w = WindowId 1L
     let m = MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let widerRect = { workArea with Width = 2000 }
@@ -788,7 +822,7 @@ let ``同じ最小幅が繰り返し観測されると、値は変えず根拠(I
     let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
     let widerRect = { workArea with Width = 2000 } // 96dpiなのでDIP=物理px、常にこの幅を観測する(固定の最小幅)
 
-    let afterReconcile1, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile1, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid1 = pendingRidFor afterReconcile1 w
     let afterDispatched1, _, _, _ = onEffectCallReturned 11L 2L rid1 (Ok ()) (Some 5L) afterReconcile1
     let afterObserved1, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w widerRect m 10L) afterDispatched1
@@ -812,7 +846,7 @@ let ``同じ最小幅が繰り返し観測されると、値は変えず根拠(I
     // 別のTargetへ切り替える(同じ窓を2回目のMismatchサイクルに乗せるため)が、観測される実際の幅は
     // 1回目と同じ(=アプリの最小幅が変わっていないことを模す)。
     let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
-    let afterReconcile2, _, _ = reconcileWorkspace 15L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterIntermediate
+    let afterReconcile2, _, _, _ = reconcileWorkspace 15L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterIntermediate
     let rid2 = pendingRidFor afterReconcile2 w
     let afterDispatched2, _, _, _ = onEffectCallReturned 16L 2L rid2 (Ok ()) (Some 20L) afterReconcile2
     let afterObserved2, _, _ = onWindowObserved 30L (observedSnapshotWithMonitor w widerRect m 25L) afterDispatched2
@@ -827,7 +861,7 @@ let ``同じ最小幅が繰り返し観測されると、値は変えず根拠(I
 let ``onWindowVanishedはMinWidthも消す(v2.43)`` () =
     let w = WindowId 1L
     let m = MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let widerRect = { workArea with Width = 2000 }
@@ -843,7 +877,7 @@ let ``DpiBehavior=RescalesItselfで2段目リサイズ待ち中(DpiCrossing未�
     let w = WindowId 1L
     let m = MonitorId 1L
     let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     // DPIクロッシング待ち中（checkDpiCrossingの記録を直接構成する——`PlacementState`は公開レコード）、
@@ -864,7 +898,7 @@ let ``DpiBehavior=OsBitmapScaledならDpiCrossing未決着中でもMismatchをMi
     let w = WindowId 1L
     let m = MonitorId 1L
     let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     // 除外はRescalesItselfの窓だけが対象(§4.5)——OsBitmapScaledなら2段目自己リサイズという概念自体が
@@ -897,7 +931,7 @@ let ``Coreが新しいSetRectを発行すると、未決着のDpiCrossingは帰�
 
     // Coreが(別の理由で)この窓へ新しいSetRectを発行する——これより後の矩形変化はCore自身の要求で
     // 説明できてしまうので、まだ決着していないDpiCrossingの記録は帰属不能として諦める。
-    let afterReconcile, _, _ = reconcileWorkspace 30L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterCrossCheck
+    let afterReconcile, _, _, _ = reconcileWorkspace 30L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterCrossCheck
     Assert.Equal(None, Map.tryFind w afterReconcile.DpiCrossing)
 
 // ===== MoveSizeStarted/MoveSizeEnded（§4.4 Suspended、§7.2「ユーザーのドラッグ」除外、v2.65） =====
@@ -914,7 +948,7 @@ let ``onMoveSizeStartedはDraggingへ加え、onMoveSizeEndedは外す`` () =
 let ``Dragging中の窓はPendingDeadline発火時にMismatch判定もRetryもせず、戦わずに終端する(v2.65、Opusレビューの条件6)`` () =
     let w = WindowId 1L
     let m = MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     // ユーザーがドラッグ中に、要求とは異なる矩形が観測される(ユーザー自身の操作の結果)。
@@ -934,7 +968,7 @@ let ``Dragging中の窓はPendingDeadline発火時にMismatch判定もRetryも�
 let ``ドラッグ終了後は通常どおりMismatch判定に戻る(回帰確認、v2.65)`` () =
     let w = WindowId 1L
     let m = MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let afterDragEnded = onMoveSizeEnded w afterDispatched // Draggingに入っていなくても安全にno-op
@@ -952,7 +986,7 @@ let ``ドラッグ終了後は通常どおりMismatch判定に戻る(回帰確�
 let ``最小化中の窓はPendingDeadline発火時にMismatch判定もRetryもせず、戦わずに終端する(v2.73、Opusレビューの条件5)`` () =
     let w = WindowId 1L
     let m = MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     // ユーザーが最小化した直後、`-32000`付近の座標が観測される(CIスパイクS25、幅も要求より広い
@@ -972,7 +1006,7 @@ let ``最小化中の窓はPendingDeadline発火時にMismatch判定もRetryも�
 let ``最大化中の窓はPendingDeadline発火時にMismatch判定もRetryもせず、戦わずに終端する(v2.77)`` () =
     let w = WindowId 1L
     let m = MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     // ユーザーが最大化すると、観測される矩形はモニターのWorkArea全体になる(TargetRectとは不一致、
@@ -996,7 +1030,7 @@ let ``最大化中の窓はPendingDeadline発火時にMismatch判定もRetryも�
 let ``最大化から復元した後は通常どおりMismatch判定に戻る(回帰確認、v2.77)`` () =
     let w = WindowId 1L
     let m = MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let widerRect = { workArea with Width = 2000 }
@@ -1011,7 +1045,7 @@ let ``最大化から復元した後は通常どおりMismatch判定に戻る(�
 let ``最小化から復元した後は通常どおりMismatch判定に戻る(回帰確認、v2.73)`` () =
     let w = WindowId 1L
     let m = MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let widerRect = { workArea with Width = 2000 }
@@ -1032,7 +1066,7 @@ let private isTiledFalse (_: WindowId) = false
 [<Fact>]
 let ``Satisfiedで観測された矩形がAcceptedに記録される(v2.70)`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w workArea 1L) afterReconcile
     Assert.Empty(afterObserved.Pending)
     Assert.Equal(Some workArea, Map.tryFind w afterObserved.Accepted)
@@ -1040,7 +1074,7 @@ let ``Satisfiedで観測された矩形がAcceptedに記録される(v2.70)`` ()
 [<Fact>]
 let ``Mismatch終端時は観測された矩形(Desiredではない)がAcceptedに記録される(v2.70、Opusレビュー§B-1)`` () =
     let w = WindowId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid = pendingRidFor afterReconcile w
     let afterDispatched, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
     let mismatchedRect = { workArea with X = workArea.X + 50 }
@@ -1051,18 +1085,18 @@ let ``Mismatch終端時は観測された矩形(Desiredではない)がAccepted�
 [<Fact>]
 let ``新しい意図をdispatchPlacementsが出すとAcceptedは消える(v2.70)`` () =
     let w = WindowId 1L
-    let afterReconcile1, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile1, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshot w workArea 1L) afterReconcile1
     Assert.Equal(Some workArea, Map.tryFind w afterObserved.Accepted)
     let narrowerCtx = { ctxWith [ w ] with WorkArea = { workArea with Width = workArea.Width - 100 } }
-    let afterReconcile2, _, _ = reconcileWorkspace 30L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterObserved
+    let afterReconcile2, _, _, _ = reconcileWorkspace 30L registry monocleRef narrowerCtx (managementOf [ w ]) (aliveOf [ w ]) afterObserved
     Assert.Equal(None, Map.tryFind w afterReconcile2.Accepted)
 
 [<Fact>]
 let ``checkUnattributedDriftは、Pendingが無くAcceptedが有りモニターが食い違えば、Desiredを消しDriftCorrectionsへ記録する(v2.70)`` () =
     let w = WindowId 1L
     let m0, m1 = MonitorId 0L, MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
     Assert.Equal(Some workArea, Map.tryFind w afterObserved.Accepted)
     // OSが別モニターへ寄せた(MoveSizeイベントを伴わない)観測。
@@ -1080,7 +1114,7 @@ let ``checkUnattributedDriftは最小化中の窓には作用しない(v2.75)`` 
     // 最小化中にモニターの観測が食い違って見えても補正・カウントしてはならない。
     let w = WindowId 1L
     let m0, m1 = MonitorId 0L, MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
     Assert.Equal(Some workArea, Map.tryFind w afterObserved.Accepted)
     // ユーザーが最小化し、観測されたモニターが(最小化中の報告の揺れ等で)食い違って見える。
@@ -1095,7 +1129,7 @@ let ``checkUnattributedDriftは最小化中の窓には作用しない(v2.75)`` 
 let ``checkUnattributedDriftは抑止区間中(ScreenPhase非Stable)は検知もカウントもしない(v2.70、Opusレビュー§Q4-1「必須」)`` () =
     let w = WindowId 1L
     let m0, m1 = MonitorId 0L, MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
     let afterMoved, _, _ = onWindowObserved 30L (observedSnapshotWithMonitor w workArea m1 2L) afterObserved
     let afterDrift, corrected, _ = checkUnattributedDrift 30L isTiledTrue (fun _ -> Some m0) false w afterMoved
@@ -1107,7 +1141,7 @@ let ``checkUnattributedDriftは抑止区間中(ScreenPhase非Stable)は検知も
 let ``checkUnattributedDriftはTiledでない窓には作用しない(v2.70、Opusレビュー§B-3)`` () =
     let w = WindowId 1L
     let m0, m1 = MonitorId 0L, MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
     let afterMoved, _, _ = onWindowObserved 30L (observedSnapshotWithMonitor w workArea m1 2L) afterObserved
     let afterDrift, corrected, _ = checkUnattributedDrift 30L isTiledFalse (fun _ -> Some m0) alwaysStable w afterMoved
@@ -1122,7 +1156,7 @@ let ``checkUnattributedDriftはPendingが残っている窓には作用しない
     // （v2.68のDecisionTraceテストで「到達しないはずの組合せ」を直接作ったのと同じ手法）。
     let w = WindowId 1L
     let m0, m1 = MonitorId 0L, MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
     Assert.Equal(Some workArea, Map.tryFind w afterObserved.Accepted)
     // 先にGeometry.Monitorをm1へ観測させてから(この時点ではPendingが無いのでcheckPendingSatisfiedは
@@ -1140,7 +1174,7 @@ let ``checkUnattributedDriftはPendingが残っている窓には作用しない
 let ``checkUnattributedDriftはDragging中の窓には作用しない(v2.70)`` () =
     let w = WindowId 1L
     let m0, m1 = MonitorId 0L, MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
     let afterMoved, _, _ = onWindowObserved 30L (observedSnapshotWithMonitor w workArea m1 2L) afterObserved
     let afterDragging = onMoveSizeStarted w afterMoved
@@ -1151,7 +1185,7 @@ let ``checkUnattributedDriftはDragging中の窓には作用しない(v2.70)`` (
 let ``checkUnattributedDriftはAcceptedが無い(一度も受け入れられていない)窓には作用しない(v2.70)`` () =
     let w = WindowId 1L
     let m0, m1 = MonitorId 0L, MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     // まだ一度もSatisfiedになっていない(Acceptedが無い)。Pendingも消して「Pending無し」の条件だけを
     // 単独で満たす人為的な状態を作る——Acceptedが無ければ検知しないことだけを確認する。
     let rid = pendingRidFor afterReconcile w
@@ -1164,7 +1198,7 @@ let ``checkUnattributedDriftはAcceptedが無い(一度も受け入れられて�
 let ``checkUnattributedDriftは同じモニターなら何もしない(v2.70)`` () =
     let w = WindowId 1L
     let m0 = MonitorId 0L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
     let afterDrift, corrected, _ = checkUnattributedDrift 30L isTiledTrue (fun _ -> Some m0) alwaysStable w afterObserved
     Assert.False(corrected)
@@ -1173,7 +1207,7 @@ let ``checkUnattributedDriftは同じモニターなら何もしない(v2.70)`` 
 let ``checkUnattributedDriftの補正は意図をまたいでもリセットされず、上限で打ち止めになる(v2.70、Opusレビュー§Q2)`` () =
     let w = WindowId 1L
     let m0, m1 = MonitorId 0L, MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
 
     // 1〜3回目：補正が出る(unattributedCorrectionLimit=3)。`desiredMonitorOf`をm1(観測m0と食い違う)に
@@ -1201,7 +1235,7 @@ let ``checkUnattributedDriftの補正は意図をまたいでもリセットさ�
 let ``checkUnattributedDriftの打ち止めは時間窓の外では再び補正できるようになる(v2.70)`` () =
     let w = WindowId 1L
     let m0, m1 = MonitorId 0L, MonitorId 1L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
     let afterDrift1, _, _ = checkUnattributedDrift 1_000L isTiledTrue (fun _ -> Some m1) alwaysStable w afterObserved
     let afterDrift2, _, _ = checkUnattributedDrift 2_000L isTiledTrue (fun _ -> Some m1) alwaysStable w afterDrift1
@@ -1215,7 +1249,7 @@ let ``checkUnattributedDriftの打ち止めは時間窓の外では再び補正�
 let ``onWindowVanishedはAccepted・DriftCorrectionsも消す(v2.70)`` () =
     let w = WindowId 1L
     let m0 = MonitorId 0L
-    let afterReconcile, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
     let afterDrift, _, _ = checkUnattributedDrift 1_000L isTiledTrue (fun _ -> Some (MonitorId 1L)) alwaysStable w afterObserved
     Assert.NotEmpty(Map.tryFind w afterDrift.DriftCorrections |> Option.defaultValue [])

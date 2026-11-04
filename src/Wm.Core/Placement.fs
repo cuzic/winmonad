@@ -171,6 +171,7 @@ open Wm.Contracts.Beliefs
 open Wm.Contracts.Timers
 open Wm.Contracts.CoreCommand
 open Wm.Contracts.SharedVocabulary
+open Wm.Core.DecisionTrace
 open Wm.Layouts.LayoutRegistry
 open Wm.Layouts.PlanValidator
 
@@ -756,26 +757,31 @@ let reconcileWorkspace
     (management: Map<WindowId, EffectiveManagement>)
     (alive: Set<WindowId>)
     (state: PlacementState)
-    : PlacementState * Effect list * TimerCommand<TimerId> list =
+    : PlacementState * Effect list * TimerCommand<TimerId> list * DecisionTrace list =
     match Registry.resolve layoutRef.Id layoutRef.ApiVersion registry with
-    | None -> state, [], [] // 未登録のLayout（Policy/Registryの構成ミス）。既知のギャップ、診断は未実装
+    | None -> state, [], [], [ LayoutNotRegistered (layoutRef.Id, layoutRef.ApiVersion) ] // 未登録のLayout（Policy/Registryの構成ミス）。v2.108で記録するようになった
     | Some impl ->
-        let attempt (c: LayoutContext) : Result<ValidatedPlan, ValidationError list> option =
+        // v2.108：`Error _ -> None`で握りつぶしていた実際の`LayoutError`値を、`LayoutInvocationFailed`
+        // Traceとして運べるよう、戻り値の形を`Result<ValidatedPlan, ValidationError list> option`から
+        // `Result<Result<ValidatedPlan, ValidationError list>, LayoutError>`へ変えた（外側Result＝
+        // Layout呼出自体の成否、内側Result＝PlanValidatorの検証結果）。
+        let attempt (c: LayoutContext) : Result<Result<ValidatedPlan, ValidationError list>, LayoutError> =
             match invokeLayout impl layoutRef.Args c with
-            | Error _ -> None // LayoutError。既知のギャップ、Explain未実装
-            | Ok placements -> Some (validate { Context = c; Management = management; Alive = alive } placements)
+            | Error e -> Error e
+            | Ok placements -> Ok (validate { Context = c; Management = management; Alive = alive } placements)
         match attempt ctx with
-        | None -> state, [], []
-        | Some (Ok validated) -> dispatchPlacements now validated state
-        | Some (Error errors) ->
+        | Error layoutErr -> state, [], [], [ LayoutInvocationFailed (layoutRef.Id, layoutErr) ]
+        | Ok (Ok validated) -> let st, e, t = dispatchPlacements now validated state in st, e, t, []
+        | Ok (Error errors) ->
             match decide errors with
-            | RejectWholePlan -> state, [], []
+            | RejectWholePlan -> state, [], [], [ PlanRejected (layoutRef.Id, errors) ]
             | RelayoutWithout targets ->
                 // 検証時点で死亡/Excluded化していた窓を除いて1回だけ再計算する（PlanValidator.fsのdecide参照）。
                 let ctx' = { ctx with TiledWindows = ctx.TiledWindows |> List.filter (fun w -> not (Set.contains w.Id targets)) }
                 match attempt ctx' with
-                | Some (Ok validated) -> dispatchPlacements now validated state
-                | _ -> state, [], [] // 再計算してもダメなら諦める(既知のギャップ、Explain未実装)
+                | Ok (Ok validated) -> let st, e, t = dispatchPlacements now validated state in st, e, t, []
+                | Ok (Error errors2) -> state, [], [], [ PlanRejected (layoutRef.Id, errors2) ] // 再計算してもダメなら諦める
+                | Error layoutErr2 -> state, [], [], [ LayoutInvocationFailed (layoutRef.Id, layoutErr2) ]
 
 /// `Timeout`（`onPendingDeadlineTimerFired`）と`Transient`な`EffectCallReturned`（下記、v2.30）の両方が
 /// 使う、同じ`TargetRect`/`Epoch`への即座の再試行（§7.2「Timeout → Retry/Backoff」のRetry部分、
