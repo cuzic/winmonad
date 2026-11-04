@@ -462,6 +462,16 @@ let main _argv =
     submit4 (liveNow ()) "wm-host" (RawFirstSeen (observeWindow (liveNow ()) monitorHandles titleMatcher testFormB.Handle) |> normalize |> List.exactlyOne) |> ignore
     pump4 800
 
+    // 診断：両窓が本当に同じWorkspaceのzipperに入っているかを直接確認する（SwapWithMasterの
+    // 実矩形検証が実機でfalseになった原因調査、両窓が同一矩形になった実際の原因はまだ未確定）。
+    let wA = WindowId (testFormA.Handle.ToInt64())
+    let wB = WindowId (testFormB.Handle.ToInt64())
+    let wsOfA = Wm.Core.Workspaces.WorkspaceSet.workspaceOf wA reducer4.State.Workspaces
+    let wsOfB = Wm.Core.Workspaces.WorkspaceSet.workspaceOf wB reducer4.State.Workspaces
+    printfn "Round 7+8 diagnostic: windowA(%A) workspace=%A, windowB(%A) workspace=%A" wA wsOfA wB wsOfB
+    for ws in [ wsOfA; wsOfB ] |> List.choose id |> List.distinct do
+        printfn "  Workspace %A stack=%A" ws (Wm.Core.Workspaces.WorkspaceSet.stateOf ws reducer4.State.Workspaces).Stack
+
     let pressChord (modifiers: byte list) (key: byte) =
         // VK_MENU(Alt)は絶対に押さない——型直前のコメント参照、実際のCI実機ハングの既知の罠。
         for m in modifiers do keybd_event (m, 0uy, 0u, UIntPtr.Zero)
