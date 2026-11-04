@@ -25,3 +25,14 @@ type DecisionTrace =
     /// 失敗したときに記録する（1回目の拒否自体は再計算成功時には記録しない——最終的に無害だった
     /// ため、6.3「例外とフォールバック」の精神どおりノイズにしない）。
     | PlanRejected of layoutId: LayoutId * errors: ValidationError list
+    /// `SetRect`発行時にCoreが不可視リサイズ枠（§4.2「座標系契約」/§13、v2.112でpad2py-pad-host
+    /// 実機から実測）を補正した場合の記録（v2.118、Opus敵対的レビュー`opus-review-frame-inset.md`
+    /// 論点3-D対策）。`SetRect`自体の意味は「望ましい可視矩形」のままにせず、Coreが既に不可視枠分
+    /// 広げた「補正済みのネイティブ矩形」を直接運ぶ——`Effect.SetRect`の型・既存の54箇所の
+    /// パターンマッチ（VirtualWorld/GatedEffect/Wm.Windows/Wm.Cli等）を一切変えずに済む設計だが、
+    /// その代償として`SetRect`の矩形引数だけでは「望ましい可視矩形」が分からなくなる。
+    /// `Wm.Cli.Replay`の`measuredLatenciesMs`/`classifySetRectOutcomes`（v2.110/v2.111）は、まさに
+    /// その「望ましい可視矩形」をVisibleFrameRectと比較しているため、ここに記録した
+    /// `desiredVisible`を読んで初めて補正後も正しく動く（補正が無かった場合はこのTrace自体が
+    /// 無いので、既存どおり`SetRect`の矩形引数をそのまま目標として使えばよい）。
+    | FrameInsetApplied of requestId: RequestId * desiredVisible: PixelRect * dispatchedNative: PixelRect

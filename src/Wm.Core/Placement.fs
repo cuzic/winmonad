@@ -734,20 +734,46 @@ let onIntegrityReprobeTimerFired (now: int64) (w: WindowId) (state: PlacementSta
 
 // ===== §7.1段⑦「Reconcile」：Layout呼び出し→PlanValidator→差分のSetRect発行 =====
 
+/// `desired`（望ましい可視矩形）を、窓に`FrameInset`の信念があれば、各辺だけ外側へ広げた
+/// 「ネイティブ矩形としての補正済みターゲット」に変換する——これを`SetRect`へ渡せば、OSが不可視
+/// リサイズ枠を適用した後の`VisibleFrameRect`が`desired`に一致するはず（実機で確認済み、
+/// architecture.md v2.112）。信念が無い窓（発見直後で観測が1回も無い等）は無補正のまま返す——
+/// 机上で既定値を仮定せず、実測が無ければ補正しない（§4.5の規律と同じ）。
+let private correctedDispatchTarget (w: WindowId) (desired: PixelRect) (insets: Map<WindowId, FrameInset>) : PixelRect =
+    match Map.tryFind w insets with
+    | None -> desired
+    | Some inset ->
+        { X = desired.X - inset.Left
+          Y = desired.Y - inset.Top
+          Width = desired.Width + inset.Left + inset.Right
+          Height = desired.Height + inset.Top + inset.Bottom }
+
 /// `ValidatedPlan`の各配置について、`Desired`と異なる場合だけ`SetRect`を発行し新しいPendingを作る
 /// （§7.3「未完了の同一Targetへの重複要求を発行しない」）。既存のPendingが同じ窓を指していれば、
 /// 新しい意図（Epochを1つ進める）がそれを失効させる（§7.2「同じ窓へ新しい意図が生じた場合、古い要求を
 /// 失効させる」「Superseded intent → Superseded」）。
-let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: PlacementState) : PlacementState * Effect list * TimerCommand<TimerId> list =
+///
+/// **v2.118で不可視リサイズ枠の補正を追加**（Opus敵対的レビュー`opus-review-frame-inset.md`論点4-B）：
+/// `SetRect`へ実際に渡す矩形だけを`correctedDispatchTarget`で補正し、`Desired`/`PendingRequest.
+/// TargetRect`/`Baseline`等、Core内部の「望ましい矩形」としての`p.Target`自体は一切変えない
+/// （`checkPendingSatisfied`は今のまま`VisibleFrameRect`と`p.Target`を比較すればよく、補正が
+/// 正しければ今度は実際に一致するはず）。補正を実際に適用した場合（＝信念があり、結果が
+/// `p.Target`と異なった場合）だけ`FrameInsetApplied`を`Trace`へ積む——`Effect.SetRect`自体は
+/// 「望ましい可視矩形」のままにせず「補正済みのネイティブ矩形」を直接運ぶため、`Wm.Cli.Replay`
+/// （`calibrate`/`classify`、v2.110/v2.111）がこのTraceを読まないと「望ましい可視矩形」を
+/// 取り戻せない（DecisionTrace.fsの`FrameInsetApplied`型直前のコメント参照）。
+/// **`retryOrGiveUp`側の同じ補正は未配線のまま**（既知のスコープ外、§21参照）——
+/// `onPendingDeadlineTimerFired`の3-タプルを4-タプルへ migrateする追加コストが要るため後回しにした。
+let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: PlacementState) : PlacementState * Effect list * TimerCommand<TimerId> list * DecisionTrace list =
     ValidatedPlan.placements validated
     |> List.fold
-        (fun (st: PlacementState, effects, cmds) (p: Placement) ->
+        (fun (st: PlacementState, effects, cmds, traces) (p: Placement) ->
             let desiredChanged =
                 match Map.tryFind p.Window st.Desired with
                 | Some (Shown (Some r)) -> r <> p.Target
                 | _ -> true
             if not desiredChanged then
-                st, effects, cmds
+                st, effects, cmds, traces
             else
                 let superseded = st.Pending |> Map.toSeq |> Seq.filter (fun (_, pr) -> pr.Window = p.Window) |> List.ofSeq
                 let supersededCmds = superseded |> List.map (fun (rid, _) -> CancelTimer (TimerId.Placement (PendingDeadline rid)))
@@ -809,8 +835,15 @@ let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: P
                     match restoreRid with
                     | Some rrid -> [ RestoreBeforeMove (rrid, p.Window) ]
                     | None -> []
-                st', effects @ restoreEffects @ [ SetRect (rid, p.Window, p.Target) ], cmds @ supersededCmds @ [ StartTimer (TimerId.Placement (PendingDeadline rid), pendingDeadlineMs) ])
-        (state, [], [])
+                // `FrameInset`補正（v2.118、`correctedDispatchTarget`/`dispatchPlacements`の型直前の
+                // コメント参照）：実際に補正を適用した場合（信念があり、結果が`p.Target`と異なる）
+                // だけ`FrameInsetApplied`を積む——補正が無かった（信念が無い、または差が無い）場合は
+                // `SetRect`の矩形がそのまま「望ましい可視矩形」なので、Trace無しで既存どおり読める。
+                let dispatchTarget = correctedDispatchTarget p.Window p.Target st.FrameInsets
+                let correctionTrace =
+                    if dispatchTarget <> p.Target then [ FrameInsetApplied (rid, p.Target, dispatchTarget) ] else []
+                st', effects @ restoreEffects @ [ SetRect (rid, p.Window, dispatchTarget) ], cmds @ supersededCmds @ [ StartTimer (TimerId.Placement (PendingDeadline rid), pendingDeadlineMs) ], traces @ correctionTrace)
+        (state, [], [], [])
 
 /// 登録済みのLayoutを呼び、PlanValidatorで検証し、差分だけを`SetRect`として発行する。`ctx`/`management`/
 /// `alive`は呼び出し側（`WmState.step`）がこのstepの状態から組み立てる読み取り専用の投影であり
@@ -843,7 +876,7 @@ let reconcileWorkspace
             | Ok placements -> Ok (validate { Context = c; Management = management; Alive = alive } placements)
         match attempt ctx with
         | Error layoutErr -> state, [], [], [ LayoutInvocationFailed (layoutRef.Id, layoutErr) ]
-        | Ok (Ok validated) -> let st, e, t = dispatchPlacements now validated state in st, e, t, []
+        | Ok (Ok validated) -> let st, e, t, tr = dispatchPlacements now validated state in st, e, t, tr
         | Ok (Error errors) ->
             match decide errors with
             | RejectWholePlan -> state, [], [], [ PlanRejected (layoutRef.Id, errors) ]
@@ -851,7 +884,7 @@ let reconcileWorkspace
                 // 検証時点で死亡/Excluded化していた窓を除いて1回だけ再計算する（PlanValidator.fsのdecide参照）。
                 let ctx' = { ctx with TiledWindows = ctx.TiledWindows |> List.filter (fun w -> not (Set.contains w.Id targets)) }
                 match attempt ctx' with
-                | Ok (Ok validated) -> let st, e, t = dispatchPlacements now validated state in st, e, t, []
+                | Ok (Ok validated) -> let st, e, t, tr = dispatchPlacements now validated state in st, e, t, tr
                 | Ok (Error errors2) -> state, [], [], [ PlanRejected (layoutRef.Id, errors2) ] // 再計算してもダメなら諦める
                 | Error layoutErr2 -> state, [], [], [ LayoutInvocationFailed (layoutRef.Id, layoutErr2) ]
 

@@ -10,6 +10,7 @@ open Wm.Contracts.Observation
 open Wm.Contracts.CoreCommand
 open Wm.Contracts.GatedEffect
 open Wm.Contracts.JournalTypes
+open Wm.Core.DecisionTrace
 open Wm.Core.WmState
 open Wm.Runtime.Reducer
 open Wm.Simulation.WindowBehaviors
@@ -209,6 +210,19 @@ let candidateBehaviors : WindowBehavior list =
       DelayedByMs 500L
       DelayedByMs 1000L ]
 
+/// `SetRect (rid, w, dispatchedRect)`の「望ましい可視矩形」を取り戻す（v2.118）。CoreがFrameInset
+/// 補正を適用した場合、`dispatchedRect`は補正済みのネイティブ矩形で、同じ`StepResult.Trace`に
+/// `FrameInsetApplied (rid, desiredVisible, _)`が積まれている——`DecisionTrace.FrameInsetApplied`
+/// の型直前のコメント参照（`Effect.SetRect`自体の契約を変えずに済ませる代わりに、Replay側が
+/// このTraceを読む必要がある）。補正が無かった場合（Traceに該当エントリが無い）は、従来どおり
+/// `dispatchedRect`自身が「望ましい可視矩形」なのでそのまま使う。
+let private desiredVisibleTarget (rid: RequestId) (dispatchedRect: PixelRect) (traces: DecisionTrace list) : PixelRect =
+    traces
+    |> List.tryPick (function
+        | FrameInsetApplied (r, desired, _) when r = rid -> Some desired
+        | _ -> None)
+    |> Option.defaultValue dispatchedRect
+
 /// 実機Journalを素の`Reducer`へ通し（`formatReplay`と同じ駆動だが、テキスト整形はしない）、
 /// 窓ごとに「直近発行された`SetRect`の発行tickと目標矩形」を追跡し、その後その窓について
 /// 目標どおりの矩形を運ぶ`WindowObserved`が実際に届いたtickとの差分（ms、Journalの
@@ -249,7 +263,13 @@ let measuredLatenciesMs (entries: JournalEntry list) : (WindowId * int64) list =
             | _ -> ()
             for g in sr.Effects do
                 match GatedEffect.effect g with
-                | SetRect (_, w, rect) -> pendingByWindow <- Map.add w (entry.MonotonicTicks, rect) pendingByWindow
+                | SetRect (rid, w, dispatchedRect) ->
+                    // v2.118：`SetRect`は補正済みのネイティブ矩形を運ぶため（`DecisionTrace.
+                    // FrameInsetApplied`の型直前のコメント参照）、補正があった場合は`Trace`に
+                    // 積まれた「望ましい可視矩形」を使う——無ければ（補正無し）従来どおり`SetRect`
+                    // 自身の矩形をそのまま使う。
+                    let desiredVisible = desiredVisibleTarget rid dispatchedRect sr.Trace
+                    pendingByWindow <- Map.add w (entry.MonotonicTicks, desiredVisible) pendingByWindow
                 | _ -> ()
         | _ -> ()
     List.rev measured
@@ -332,9 +352,12 @@ let classifySetRectOutcomes (entries: JournalEntry list) : (WindowId * SetRectOu
             | _ -> ()
             for g in sr.Effects do
                 match GatedEffect.effect g with
-                | SetRect (_, w, rect) ->
+                | SetRect (rid, w, dispatchedRect) ->
                     // 新しい発行があったら、前回分の未確定判定は捨てる——最後の発行への応答だけを見る。
-                    pendingByWindow <- Map.add w (entry.MonotonicTicks, rect) pendingByWindow
+                    // v2.118：補正があった場合はTraceに積まれた「望ましい可視矩形」を使う
+                    // （`desiredVisibleTarget`の型直前のコメント参照）。
+                    let desiredVisible = desiredVisibleTarget rid dispatchedRect sr.Trace
+                    pendingByWindow <- Map.add w (entry.MonotonicTicks, desiredVisible) pendingByWindow
                     outcomes <- Map.remove w outcomes
                 | _ -> ()
         | _ -> ()
