@@ -137,6 +137,7 @@ let KEYEVENTF_KEYUP = 2u
 let VK_LCONTROL = 0xA2uy
 let VK_LSHIFT = 0xA0uy
 let VK_J = 0x4Auy
+let VK_K = 0x4Buy
 
 let DWMWA_EXTENDED_FRAME_BOUNDS = 9
 let DWMWA_CLOAKED = 14

@@ -36,6 +36,13 @@
 /// を実際に問い合わせるようにした。これが無いと実アンビエント窓（ラウンド1/2が観測する69前後の
 /// 実窓）を`TitleContains`/`AppIs`規則で安全に絞り込めず、ラウンド3/4の隔離デモを実管理へ統合する
 /// 道が開かない（タスクリスト見直しで自己選定）。
+///
+/// ラウンド8：ラウンド7の2枚のテスト窓・隔離Reducerをそのまま使い、2本目のホットキー
+/// （Ctrl+Shift+K）で`UserCommand SwapWithMaster`を発行する。`SwapWithMaster`は
+/// `focused`（`Focus.Foreground`の信念）が`ManagedWindow w`であることを前提にするため
+/// （WmState.fs型直前のコメント参照）、実際の`EVENT_SYSTEM_FOREGROUND`も購読してラウンド7の
+/// FocusNextが変えた実フォアグラウンドをCoreへ中継し、`Focus.Foreground`を実際に満たす。
+/// 検証は`GetWindowRect`で両窓の実矩形がSwapWithMaster前後で実際に入れ替わったかを直接確認する。
 module Wm.Host.Program
 
 open System
@@ -403,13 +410,19 @@ let main _argv =
     let mutable focusNextTarget : WindowId option = None
     let onHotkey (id: int) =
         let now = liveNow ()
-        let sr = submit4 now "wm-host-hotkey" (UserCommand FocusNext)
-        let target =
-            sr.Effects
-            |> List.map GatedEffect.effect
-            |> List.tryPick (function RequestForeground (_, w) -> Some w | _ -> None)
-        focusNextTarget <- target
-        printfn "  [round7] WM_HOTKEY id=%d -> UserCommand FocusNext -> RequestForeground target=%A" id target
+        match id with
+        | 1 ->
+            let sr = submit4 now "wm-host-hotkey" (UserCommand FocusNext)
+            let target =
+                sr.Effects
+                |> List.map GatedEffect.effect
+                |> List.tryPick (function RequestForeground (_, w) -> Some w | _ -> None)
+            focusNextTarget <- target
+            printfn "  [round7] WM_HOTKEY id=%d -> UserCommand FocusNext -> RequestForeground target=%A" id target
+        | 2 ->
+            submit4 now "wm-host-hotkey" (UserCommand SwapWithMaster) |> ignore
+            printfn "  [round8] WM_HOTKEY id=%d -> UserCommand SwapWithMaster" id
+        | _ -> ()
 
     use hotkeyForm = new HotkeyForm(onHotkey)
     hotkeyForm.Show()
@@ -419,9 +432,24 @@ let main _argv =
     testFormB.Show()
     pump4 300
 
-    let hotkeyId = 1
-    let registered = RegisterHotKey(hotkeyForm.Handle, hotkeyId, MOD_CONTROL ||| MOD_SHIFT, uint32 VK_J)
-    printfn "RegisterHotKey(Ctrl+Shift+J)=%b" registered
+    // ラウンド8：`UserCommand SwapWithMaster`は`focused`（`Focus.Foreground`の信念）が
+    // `ManagedWindow w`であることを前提にする（WmState.fs型直前のコメント参照）——FocusNextと違い、
+    // zipperの意図だけでは発行されない。実際の`EVENT_SYSTEM_FOREGROUND`を購読してCoreへ中継し、
+    // ラウンド7のFocusNextが実際に変えたOSフォアグラウンドをCore自身の信念として往復させる
+    // （ラウンド7では`GetForegroundWindow()`で直接確認するだけに留めていた経路を、ここでは
+    // Core内部の`Focus.Foreground`まで実際に閉じる）。
+    let foregroundHook =
+        hookSingleEvent EVENT_SYSTEM_FOREGROUND (fun _ hwnd ->
+            if hwnd = testFormA.Handle || hwnd = testFormB.Handle then
+                let now = liveNow ()
+                let w = WindowId (hwnd.ToInt64())
+                submit4 now "wm-host-foreground" (ForegroundObserved (observation now (Ok (Some w)))) |> ignore)
+
+    let hotkeyIdFocusNext = 1
+    let hotkeyIdSwapWithMaster = 2
+    let registeredFocusNext = RegisterHotKey(hotkeyForm.Handle, hotkeyIdFocusNext, MOD_CONTROL ||| MOD_SHIFT, uint32 VK_J)
+    let registeredSwap = RegisterHotKey(hotkeyForm.Handle, hotkeyIdSwapWithMaster, MOD_CONTROL ||| MOD_SHIFT, uint32 VK_K)
+    printfn "RegisterHotKey(Ctrl+Shift+J)=%b RegisterHotKey(Ctrl+Shift+K)=%b" registeredFocusNext registeredSwap
 
     submit4 (liveNow ()) "wm-host" (MonitorTopologyObserved monitors) |> ignore
     pump4 300
@@ -430,28 +458,48 @@ let main _argv =
     submit4 (liveNow ()) "wm-host" (RawFirstSeen (observeWindow (liveNow ()) monitorHandles titleMatcher testFormB.Handle) |> normalize |> List.exactlyOne) |> ignore
     pump4 800
 
-    if registered then
-        // Ctrl+Shift+Jだけを合成する——VK_MENU(Alt)は型直前のコメントが記録する既知のCI実機ハングの
-        // 罠のため絶対に押さない。
-        keybd_event (VK_LCONTROL, 0uy, 0u, UIntPtr.Zero)
-        keybd_event (VK_LSHIFT, 0uy, 0u, UIntPtr.Zero)
-        keybd_event (VK_J, 0uy, 0u, UIntPtr.Zero)
-        keybd_event (VK_J, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
-        keybd_event (VK_LSHIFT, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
-        keybd_event (VK_LCONTROL, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
+    let pressChord (modifiers: byte list) (key: byte) =
+        // VK_MENU(Alt)は絶対に押さない——型直前のコメント参照、実際のCI実機ハングの既知の罠。
+        for m in modifiers do keybd_event (m, 0uy, 0u, UIntPtr.Zero)
+        keybd_event (key, 0uy, 0u, UIntPtr.Zero)
+        keybd_event (key, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
+        for m in List.rev modifiers do keybd_event (m, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
+
+    if registeredFocusNext then pressChord [ VK_LCONTROL; VK_LSHIFT ] VK_J
+    pump4 800 // FocusNextのRequestForeground発行・実際のSetForegroundWindow・EVENT_SYSTEM_FOREGROUNDの折返しに余裕を取る
+
+    let rectOfForm (form: Form) : RECT =
+        let mutable r = RECT()
+        GetWindowRect(form.Handle, &r) |> ignore
+        r
+    let beforeSwapA = rectOfForm testFormA
+    let beforeSwapB = rectOfForm testFormB
+
+    if registeredSwap then pressChord [ VK_LCONTROL; VK_LSHIFT ] VK_K
     pump4 800
 
-    UnregisterHotKey(hotkeyForm.Handle, hotkeyId) |> ignore
+    let afterSwapA = rectOfForm testFormA
+    let afterSwapB = rectOfForm testFormB
+
+    UnregisterHotKey(hotkeyForm.Handle, hotkeyIdFocusNext) |> ignore
+    UnregisterHotKey(hotkeyForm.Handle, hotkeyIdSwapWithMaster) |> ignore
+    foregroundHook.Unhook ()
     keepDispatching4 <- false
     effectApplyThread4.Join(2000) |> ignore
 
     // Coreとは無関係に、実際のOSフォアグラウンド窓を直接問い合わせて確認する（ラウンド3/4/6と
     // 同じ、Core状態への依存だけに頼らない二重確認）。
     let realForeground = GetForegroundWindow()
-    printfn "\nRound 7 summary: registered=%b focusNextTarget=%A realForegroundHwnd=%A" registered focusNextTarget realForeground
+    printfn "\nRound 7 summary: focusNextTarget=%A realForegroundHwnd=%A" focusNextTarget realForeground
     match focusNextTarget with
     | Some (WindowId raw) -> printfn "Real foreground matches FocusNext's RequestForeground target: %b" (IntPtr raw = realForeground)
     | None -> printfn "FocusNext produced no RequestForeground effect (no observable target to compare)"
+    printfn "Round 8 summary: testFormA rect before=%A after=%A" beforeSwapA afterSwapA
+    printfn "Round 8 summary: testFormB rect before=%A after=%A" beforeSwapB afterSwapB
+    printfn "SwapWithMaster actually swapped the two windows' real on-screen rects: %b"
+        (beforeSwapA.Left = afterSwapB.Left && beforeSwapA.Top = afterSwapB.Top
+         && beforeSwapB.Left = afterSwapA.Left && beforeSwapB.Top = afterSwapA.Top
+         && beforeSwapA <> beforeSwapB)
 
     testFormA.Close()
     testFormB.Close()

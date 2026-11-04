@@ -75,3 +75,13 @@ let hookLocationChangeForProcess (idProcess: uint32) (onEvent: uint32 -> IntPtr 
     let h = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, IntPtr.Zero, proc, idProcess, 0u, WINEVENT_OUTOFCONTEXT)
     { Unhook = fun () -> UnhookWinEvent(h) |> ignore
       KeepAlive = box proc }
+
+/// Phase B ラウンド8：単一のイベント種別だけをシステム全体で購読する（`hookEvents`の中の`hook`と
+/// 同じ形だが、呼び出し側が1件だけ欲しい場合向けの公開版——`EVENT_SYSTEM_FOREGROUND`を特定の
+/// 自作テスト窓だけに絞ってCoreへ中継する用途で使う、呼び出し側がhwndで絞り込む）。
+let hookSingleEvent (event: uint32) (onEvent: uint32 -> IntPtr -> unit) : HookSet =
+    let proc = WinEventProc(fun _hWinEventHook eventType hwnd idObject _idChild _idEventThread _dwmsEventTime ->
+        if idObject = OBJID_WINDOW then onEvent eventType hwnd)
+    let h = SetWinEventHook(event, event, IntPtr.Zero, proc, 0u, 0u, WINEVENT_OUTOFCONTEXT)
+    { Unhook = fun () -> UnhookWinEvent(h) |> ignore
+      KeepAlive = box proc }
