@@ -27,6 +27,13 @@ open Wm.Contracts.CoreCommand
 type RawWindowEvent =
     /// EnumWindowsによる全体Snapshot、またはShellが初見と判定したHWNDの最初のSnapshot。
     | RawFirstSeen of WindowSnapshot
+    /// 既知のHWNDについて、発見後に取り直したSnapshot（Phase B ラウンド4：`EVENT_OBJECT_LOCATIONCHANGE`
+    /// による再観測）。`RawFirstSeen`と同じ`InputEvent`（`WindowObserved`）へ詰め替わるが、タグを
+    /// 分けることで`RawFirstSeen`の「最初のSnapshot」という意味を保つ（Phase Bラウンド3の計画
+    /// 「Pending→Satisfied閉路はこのラウンドでは閉じない」で、`RawFirstSeen`の再利用は意味的に
+    /// 不整合だと指摘した論点への対応）。Core側（`Placement.onWindowObserved`の`checkPendingSatisfied`）
+    /// は既にどの`WindowObserved`でもPending一致判定を行うので、Core側の変更は不要。
+    | RawReobserved of WindowSnapshot
     /// EVENT_OBJECT_DESTROY。
     | RawDestroyed of WindowId
     /// EVENT_SYSTEM_FOREGROUND。
@@ -55,6 +62,7 @@ type RawWindowEvent =
 let normalize (raw: RawWindowEvent) : InputEvent list =
     match raw with
     | RawFirstSeen snapshot -> [ WindowObserved snapshot ]
+    | RawReobserved snapshot -> [ WindowObserved snapshot ]
     | RawDestroyed w -> [ WindowRemoved w ]
     | RawForeground obs -> [ ForegroundObserved obs ]
     | RawVisibility (w, obs) -> [ VisibilityChanged (w, obs) ]

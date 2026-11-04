@@ -16,6 +16,10 @@ let ``RawFirstSeenはWindowObservedへ、Snapshotを変形せずそのまま詰�
     normalize (RawFirstSeen snapshot) = [ WindowObserved snapshot ]
 
 [<Property>]
+let ``RawReobservedはWindowObservedへ、Snapshotを変形せずそのまま詰め替える(Phase Bラウンド4)`` (snapshot: WindowSnapshot) =
+    normalize (RawReobserved snapshot) = [ WindowObserved snapshot ]
+
+[<Property>]
 let ``RawDestroyedはWindowRemovedへ、WindowIdを変形せずそのまま詰め替える`` (w: WindowId) =
     normalize (RawDestroyed w) = [ WindowRemoved w ]
 

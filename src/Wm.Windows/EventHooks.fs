@@ -30,6 +30,7 @@ let EVENT_OBJECT_SHOW = 0x8002u
 let EVENT_OBJECT_HIDE = 0x8003u
 let EVENT_OBJECT_CLOAKED = 0x8017u
 let EVENT_OBJECT_UNCLOAKED = 0x8018u
+let EVENT_OBJECT_LOCATIONCHANGE = 0x800Bu
 
 /// 登録した全フックをまとめて外すためのハンドル。`KeepAlive`は、ネイティブ側へ渡した
 /// `WinEventProc`デリゲート自身をGCされないよう保持するためだけに存在する——呼び出し元が
@@ -62,3 +63,15 @@ let hookEvents (onEvent: uint32 -> IntPtr -> unit) : HookSet =
 
     { Unhook = fun () -> for h in handles do UnhookWinEvent(h) |> ignore
       KeepAlive = box delegates }
+
+/// Phase B ラウンド4：`EVENT_OBJECT_LOCATIONCHANGE`専用の購読。`hookEvents`には含めない——
+/// 全プロセス相手に購読すると系内の全窓の移動・リサイズ毎に発火し流量が大きすぎる（ラウンド1/2の
+/// アンビエント全窓観測はこの頻度のイベントを診断用途で受ける理由が無い）。`idProcess`に自プロセスの
+/// PIDを渡すことで、自分で作った使い捨てテスト窓（ラウンド3/4が対象とする、architecture.md §7.1の
+/// 「隔離された自己所有窓だけ」の方針）だけに絞り込む。
+let hookLocationChangeForProcess (idProcess: uint32) (onEvent: uint32 -> IntPtr -> unit) : HookSet =
+    let proc = WinEventProc(fun _hWinEventHook eventType hwnd idObject _idChild _idEventThread _dwmsEventTime ->
+        if idObject = OBJID_WINDOW then onEvent eventType hwnd)
+    let h = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, IntPtr.Zero, proc, idProcess, 0u, WINEVENT_OUTOFCONTEXT)
+    { Unhook = fun () -> UnhookWinEvent(h) |> ignore
+      KeepAlive = box proc }

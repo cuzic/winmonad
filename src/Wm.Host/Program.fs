@@ -23,6 +23,13 @@
 /// 「Effect適用はWinEventコールバックや安全停止の制御経路と同じスレッドで行わない」という
 /// 明文の要求に従い、専用のEffect適用スレッドを新設する——メインスレッド(`Application.DoEvents()`
 /// を回す側)はEffectをキューへ積むだけで、実際のOS呼出は専用スレッドが行う。
+///
+/// ラウンド4：ラウンド3で明示的に先送りした「Pending→Satisfied閉路をCore内で閉じる」を実装する。
+/// `EVENT_OBJECT_LOCATIONCHANGE`を自プロセスだけに絞って購読し（`EventHooks.hookLocationChangeForProcess`）、
+/// 発火ごとに再観測した`WindowSnapshot`を`RawReobserved`（Normalizerの新ケース、ラウンド3の計画の
+/// 「`RawFirstSeen`の再利用は意味的に不整合」という指摘への対応）としてCoreへ投入する。Core側
+/// （`Placement.checkPendingSatisfied`）は元々どの`WindowObserved`でもPending一致判定を行うので
+/// Coreの変更は不要——実機で閉じていなかったのはこの再観測の配線だけだった。
 module Wm.Host.Program
 
 open System
@@ -239,29 +246,50 @@ let main _argv =
     testForm3.Show()
     pump3 300
 
+    let testHWnd = testForm3.Handle
+    let testWindowId = WindowId (testHWnd.ToInt64())
+
+    // 段7：ラウンド4。Pending→Satisfied閉路を閉じる（ラウンド3の計画で明示的に先送りした論点）。
+    // `EVENT_OBJECT_LOCATIONCHANGE`は自プロセス(`idProcess`)に絞って購読する——`hookEvents`（ラウンド2、
+    // 全プロセス対象）に混ぜると流量が大きすぎるため専用の購読にする（EventHooks.fsの型直前の
+    // コメント参照）。発火ごとに再観測し`RawReobserved`としてCoreへ投入する——ディスパッチ直前に
+    // 購読しておくことで、SetRectが実際に動かした結果のLOCATIONCHANGEを取り逃さない。
+    let mutable reobserveCount = 0
+    let handleLocationChange (_eventType: uint32) (hwnd: IntPtr) =
+        if hwnd = testHWnd then
+            let now = liveNow ()
+            let snapshot = observeWindow now monitorHandles hwnd
+            for input in normalize (RawReobserved snapshot) do
+                reobserveCount <- reobserveCount + 1
+                printfn "  [round4 t=%dms] reobserved via LOCATIONCHANGE: %A" (now - liveBaseNow) input
+                submit3 now "wm-host-locationchange" input |> ignore
+    let pid = uint32 (Process.GetCurrentProcess().Id)
+    let locationHook = hookLocationChangeForProcess pid handleLocationChange
+
     submit3 (liveNow ()) "wm-host" (MonitorTopologyObserved monitors) |> ignore
     pump3 500
 
-    let testHWnd = testForm3.Handle
-    let testWindowId = WindowId (testHWnd.ToInt64())
     submit3 (liveNow ()) "wm-host" (RawFirstSeen (observeWindow (liveNow ()) monitorHandles testHWnd) |> normalize |> List.exactlyOne) |> ignore
-    pump3 1500 // 分類・Reconcile・実際のSetWindowPos・結果の折り返しに十分な余裕を取る
+    pump3 1500 // 分類・Reconcile・実際のSetWindowPos・LOCATIONCHANGEによる再観測に十分な余裕を取る
 
+    let pendingBeforeUnhook = Map.count reducer3.State.Placement.Pending
+    locationHook.Unhook ()
     keepDispatching <- false
     effectApplyThread.Join(2000) |> ignore
 
-    // Coreとは無関係に、実際にOSが報告する最終状態を直接問い合わせて確認する
-    // （計画の「Pending→Satisfiedループはこのラウンドでは閉じない」参照）。
+    // Coreとは無関係に、実際にOSが報告する最終状態を直接問い合わせて確認する（ラウンド3と同じ、
+    // Core状態への依存だけに頼らない二重確認）。
     let mutable finalRect = RECT()
     let gotFinalRect = GetWindowRect(testHWnd, &finalRect)
-    printfn "\nRound 3 dispatch summary: dispatched=%d skipped(no handler)=%d" dispatchedCount skippedCount
+    printfn "\nRound 3+4 dispatch summary: dispatched=%d skipped(no handler)=%d reobserved(LOCATIONCHANGE)=%d" dispatchedCount skippedCount reobserveCount
     printfn "Test window's real on-screen rect after dispatch (queried directly, bypassing Core): found=%b rect=%A"
         gotFinalRect
         { X = finalRect.Left; Y = finalRect.Top; Width = finalRect.Right - finalRect.Left; Height = finalRect.Bottom - finalRect.Top }
     match Map.tryFind testWindowId reducer3.State.Windows.Records with
     | Some record -> printfn "Core's classification for the test window: %A" record.Classification
     | None -> printfn "Core's classification for the test window: (not found in Windows.Records)"
-    printfn "Core's remaining Pending requests: %d" (Map.count reducer3.State.Placement.Pending)
+    printfn "Core's remaining Pending requests just before unhooking LOCATIONCHANGE: %d" pendingBeforeUnhook
+    printfn "Core's remaining Pending requests (final): %d" (Map.count reducer3.State.Placement.Pending)
 
     testForm3.Close()
 
