@@ -198,6 +198,19 @@ let applyEffect
                     dispatchedSeq <- Some dispatchSeq
                     Ok ()
                 | Immediate
+                | HungAfterMs (_, _) when rect = vw.Rect ->
+                    // Phase 0 CIスパイクS22/S23の設計コメントで実機確認済みの事実（これまでPlacementの
+                    // 設計には結び付けられていなかった）：`SetWindowPos`の要求が現在のネイティブ矩形と
+                    // 完全に同じ場合、`WM_WINDOWPOSCHANGED`/`EVENT_OBJECT_LOCATIONCHANGE`は発火しない
+                    // （OSが冗長なレイアウト処理を省く——S22/S23が初期矩形をどのtargetとも異ならせている
+                    // のは、まさにこの無反応を「遅延」と誤認しないための回避策だった）。Opus敵対的レビュー
+                    // （opus-review-frame-inset.md論点3-B、v2.113）が指摘した「既に目標どおりの位置に
+                    // いる窓へ同じ`SetRect`を再発行すると観測が一切来ずTimeout→Retry→諦めへ進み、次の
+                    // Reconcileで同じ目標をまた再発行する」というループを再現するには、この無反応を
+                    // 模す必要がある——`dispatchedEvents`を空のままにする（観測を一切生まない）。
+                    dispatchedSeq <- Some world.NextSampleSequence
+                    Ok ()
+                | Immediate
                 | HungAfterMs (_, _) ->
                     let dispatchSeq = world.NextSampleSequence
                     let sampleSeq = dispatchSeq + 1L

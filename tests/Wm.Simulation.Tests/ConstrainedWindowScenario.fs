@@ -14,6 +14,7 @@ open Wm.Contracts.Observation
 open Wm.Contracts.Beliefs
 open Wm.Contracts.SharedVocabulary
 open Wm.Contracts.CoreCommand
+open Wm.Contracts.GatedEffect
 open Wm.Core.Topology
 open Wm.Core.Windows
 open Wm.Core.Placement
@@ -143,3 +144,67 @@ let ``不可視リサイズ枠を持つ窓は、要求どおりの矩形が返�
                 "known gap closed? Movability became Confirmed even though Satisfied should never have fired here -- if a real fix landed, update this test to assert Satisfied/Confirmed instead of this known-gap shape"
         | _ -> ()
     | None -> failwith "expected a Movability belief to exist (set at discovery)"
+
+/// v2.115・既知のギャップ（Opus敵対的レビュー`opus-review-frame-inset.md`論点3-Bで指摘）：
+/// 「既にずれた/既に目標どおりの位置にいる窓へ同じ目標を再発行すると、観測が一切来ずTimeout→Retry→
+/// 諦めへ進み、次のReconcileで同じ目標をまた再発行する」という再発行ループ。WM再起動時（前回の実行で
+/// 既にタイル済みだった窓）が典型例として指摘されていた——これをVirtualWorldで再現する。
+///
+/// 根拠（推測ではない）：Phase 0 CIスパイクS22/S23の設計コメントが実機で確認済みの事実を記録していた
+/// （`Program.fs`のS22/S23冒頭コメント参照）："SetWindowPosの要求が現在のネイティブ矩形と完全に
+/// 同じ場合、WM_WINDOWPOSCHANGED/EVENT_OBJECT_LOCATIONCHANGEは発火しない"——どちらのスパイクも、
+/// この無反応を「遅延」と誤認しないよう初期矩形をどのtargetとも異ならせて回避していた。今回
+/// `VirtualWorld.applyEffect`に同じ無反応をモデル化した（`Immediate`/`HungAfterMs`、`rect = vw.Rect`
+/// の場合は観測を一切生まない、`VirtualWorld.fs`の型直前のコメント参照）。
+[<Fact>]
+let ``既に目標どおりの位置にある窓への最初のSetRectはOSの無反応(no-op)のためTimeout→Retry→諦めへ進み、次のReconcileで同じ目標がまた発行される(v2.115、既知のギャップ)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    settleTopology reducer [ mkMonitor 0 ]
+    let w = WindowId 1L
+    let workArea: PixelRect = (mkMonitor 0).WorkArea
+    // WM再起動後、前回の実行で既にタイル済みだった窓を模す——発見時点で既にネイティブ矩形が
+    // 目標(workArea)と一致している。発見イベント自体は矩形を運ばない（`visibleWindowObserved`の
+    // 型直前のコメント参照）ので、Coreの`Desired`はまだ空で、最初のReconcileは必ずSetRectを発行する
+    // （`dispatchPlacements`の`desiredChanged`判定：`Map.tryFind`が`None`なら常に`true`）。
+    let world0 = empty |> addWindow w workArea Immediate
+
+    let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
+    let mutable world = settle 1000L reducer world0 discovery.Effects
+
+    // 要求と現在のネイティブ矩形が完全に一致するため、VirtualWorldは観測を一切生まない。
+    Assert.Equal(workArea, (Map.find w world.Windows).Rect)
+    Assert.NotEmpty(reducer.State.Placement.Pending)
+
+    // PendingDeadline満了を尽きるまで進める：Timeout→Retryを`pendingRetryMaxAttempts`回使い切り、
+    // 最終的に諦める（`retryOrGiveUp`、§7.2「Timeout → Retry/Backoff、上限後は配置対象外」、v2.28）。
+    // 各リトライのSetRectも同じ理由で無反応なので、何度繰り返しても収束しない。
+    let mutable more = true
+    while more && not (Map.isEmpty reducer.State.Placement.Pending) do
+        match reducer.AdvanceToNextTimer () with
+        | Some sr -> world <- settle 1000L reducer world sr.Effects
+        | None -> more <- false
+
+    // 諦めた結果、Pendingは空になるが、これはSatisfiedではない——Desiredも消え、この窓は
+    // 「配置対象外」になる（`retryOrGiveUp`の上限到達分岐）。
+    Assert.Empty(reducer.State.Placement.Pending)
+    Assert.Equal(None, Map.tryFind w reducer.State.Placement.Desired)
+    match Map.tryFind w reducer.State.Placement.Movability with
+    | Some belief ->
+        match belief.Confidence with
+        | Confirmed -> failwith "known gap closed? Movability became Confirmed even though Satisfied should never have fired here"
+        | _ -> ()
+    | None -> failwith "expected a Movability belief to exist (set at discovery)"
+
+    // 論点3-Bの核心：次のReconcile（他窓の変化・UserCommand等、何でもよい）が走れば、Layoutは
+    // 同じ目標(workArea)を再計算し、`desiredChanged`判定（`Desired`に無い＝`true`）が同じSetRectを
+    // また発行する——この窓は二度とSatisfied/Confirmedに至らないまま、Reconcileが走るたびに同じ
+    // 無反応のSetRect→Timeout→Retry→諦めを繰り返す。ここでは2枚目の窓を発見させてReconcileを
+    // もう一度起こし、1枚目の窓への同じSetRectが実際に再発行されることだけを確認する
+    // （堂々巡りそのものの再現は、無限ループになるためこのテストでは1周だけ確認する）。
+    let w2 = WindowId 2L
+    let world2 = world |> addWindow w2 { X = 0; Y = 0; Width = 10; Height = 10 } Immediate
+    let discovery2 = reducer.Submit 2000L "virtual-world" (visibleWindowObserved w2)
+    let reissuedForW =
+        discovery2.Effects |> List.exists (fun g -> match GatedEffect.effect g with SetRect (_, w', target) -> w' = w && target = workArea | _ -> false)
+    Assert.True(reissuedForW, "expected the already-given-up window's original target to be reissued by the next Reconcile")
+    ignore world2
