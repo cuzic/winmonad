@@ -23,6 +23,7 @@
     <ProjectReference Include="../Wm.Layouts/Wm.Layouts.fsproj" />
     <ProjectReference Include="../Wm.Journal/Wm.Journal.fsproj" />
     <ProjectReference Include="../Wm.Runtime/Wm.Runtime.fsproj" />
+    <ProjectReference Include="../Wm.Simulation/Wm.Simulation.fsproj" />
   </ItemGroup>
 
 </Project>

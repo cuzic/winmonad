@@ -8,6 +8,7 @@
   <ItemGroup>
     <Compile Include="ReplayTests.fs" />
     <Compile Include="GoldenMasterTests.fs" />
+    <Compile Include="SimulateTests.fs" />
   </ItemGroup>
 
   <ItemGroup>
@@ -23,6 +24,7 @@
     <ProjectReference Include="../../src/Wm.Layouts/Wm.Layouts.fsproj" />
     <ProjectReference Include="../../src/Wm.Journal/Wm.Journal.fsproj" />
     <ProjectReference Include="../../src/Wm.Runtime/Wm.Runtime.fsproj" />
+    <ProjectReference Include="../../src/Wm.Simulation/Wm.Simulation.fsproj" />
     <ProjectReference Include="../../src/Wm.Cli/Wm.Cli.fsproj" />
   </ItemGroup>
 
