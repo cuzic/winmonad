@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- architecture.md §17：Wm.WindowsはWin32/イベントポンプ/DPI/HWND寿命を扱い、
+       Wm.Contractsだけに依存する（Wm.Core/Wm.Policy/Wm.Layoutsへは依存しない）。
+       winmonad.slnには含めない——spikes/Phase0CiSpikesと同じ理由（net8.0-windowsはLinux CIの
+       restore/buildを壊すリスクがあるため、専用のWindows実機ワークフローで別途ビルドする）。 -->
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Native.fs" />
+    <Compile Include="RealObservation.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Wm.Contracts/Wm.Contracts.fsproj" />
+  </ItemGroup>
+
+</Project>

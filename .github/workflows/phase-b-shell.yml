@@ -1,0 +1,39 @@
+name: Phase B Shell (Windows real-machine verification)
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - "src/Wm.Windows/**"
+      - "src/Wm.Host/**"
+      - ".github/workflows/phase-b-shell.yml"
+
+jobs:
+  run-host:
+    runs-on: windows-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Build
+        run: dotnet build src/Wm.Host/Wm.Host.fsproj -c Release
+
+      - name: Run Wm.Host (read-only observation, no Effects dispatched)
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path src/Wm.Host/bin/Release -Recurse -Filter Wm.Host.exe | Select-Object -First 1
+          if (-not $exe) { throw "Wm.Host.exe not found after build" }
+          & $exe.FullName | Tee-Object -FilePath phase-b-round1-report.txt
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase-b-round1-report
+          path: phase-b-round1-report.txt
+          if-no-files-found: warn

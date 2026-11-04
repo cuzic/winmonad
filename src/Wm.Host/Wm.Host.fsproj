@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- architecture.md §17：Wm.HostはCore一式(Runtime/Journal/Windows/Normalization/Policy/Layouts)を
+       実際に組み立てて動かす、Phase Bの実行入口。winmonad.slnには含めない(net8.0-windowsがLinux CIの
+       restore/buildを壊すリスクがあるため、spikes/Phase0CiSpikesと同じ理由で専用ワークフローを使う)。 -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Wm.Contracts/Wm.Contracts.fsproj" />
+    <ProjectReference Include="../Wm.Core/Wm.Core.fsproj" />
+    <ProjectReference Include="../Wm.Policy/Wm.Policy.fsproj" />
+    <ProjectReference Include="../Wm.Layouts/Wm.Layouts.fsproj" />
+    <ProjectReference Include="../Wm.Normalization/Wm.Normalization.fsproj" />
+    <ProjectReference Include="../Wm.Journal/Wm.Journal.fsproj" />
+    <ProjectReference Include="../Wm.Runtime/Wm.Runtime.fsproj" />
+    <ProjectReference Include="../Wm.Windows/Wm.Windows.fsproj" />
+  </ItemGroup>
+
+</Project>
