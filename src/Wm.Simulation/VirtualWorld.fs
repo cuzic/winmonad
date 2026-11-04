@@ -69,14 +69,36 @@ open Wm.Simulation.WindowBehaviors
 /// `IsMaximized`（v2.74、§6.2/§7.1の`NeedsRestore`/`RestoreBeforeMove`）は発見時は常に`false`
 /// （既定は非最大化窓——最大化窓を模すシナリオは`addWindow`呼び出し後に同じ要領で上書きする）。
 /// `RestoreBeforeMove`を適用すると`false`へ戻る（CIスパイクS6bで確認した`ShowWindowAsync(SW_RESTORE)`
-/// の実際の効果）。
+/// の実際の効果）。`FrameInset`（v2.113、architecture.md §4.2/§13「不可視リサイズ枠による恒常的
+/// Mismatch」）は発見時は常に`noFrameInset`（既定は枠なし——不可視枠を持つ窓を模すシナリオは
+/// `addWindow`呼び出し後に同じ要領で上書きする）。pad2py-pad-host実機（v2.112）で実測した
+/// 「X+7/Width-14/Height-7/Y不変」をそのまま再現できる値。
+
+/// 不可視リサイズ枠の推定（`Wm.Core.Placement`が将来持つ同名の信念と同じ形を想定、§4.2/§13）。
+/// `NativeRect`（Win32のネイティブ矩形）が`VisibleFrameRect`（DWMの拡張フレーム矩形）より各辺
+/// どれだけ外側に広いかを、辺ごとに独立して保持する——対称とは仮定しない。
+type FrameInset = { Left: int; Top: int; Right: int; Bottom: int }
+
+/// 既定値（枠なし）。この値を使う窓は、今までどおり`VisibleFrameRect`だけを運ぶ観測になる
+/// （既存のシナリオ・テストへの影響が無いことを保証する既定）。
+let noFrameInset : FrameInset = { Left = 0; Top = 0; Right = 0; Bottom = 0 }
+
+/// `native`（要求どおり、またはOSが実際に設定したネイティブ矩形）に`inset`を適用し、
+/// 実際に観測される`VisibleFrameRect`を計算する。
+let private shrinkByInset (inset: FrameInset) (native: PixelRect) : PixelRect =
+    { X = native.X + inset.Left
+      Y = native.Y + inset.Top
+      Width = native.Width - inset.Left - inset.Right
+      Height = native.Height - inset.Top - inset.Bottom }
+
 type VirtualWindow =
     { Id: WindowId
       Rect: PixelRect
       Behavior: WindowBehavior
       Shown: bool
       Integrity: IntegrityRelation
-      IsMaximized: bool }
+      IsMaximized: bool
+      FrameInset: FrameInset }
 
 /// §12.1「`ScheduledSimEvent`」の最小形：`DelayedByMs`な`SetRect`が、`FireAtMs`に達するまで積まれる
 /// 未発火の観測。`Seed`はまだ`WindowBehaviors`のどの挙動も使わないため持たない。
@@ -92,7 +114,18 @@ let empty: VirtualWorld = { Windows = Map.empty; ClockMs = 0L; NextSampleSequenc
 
 let addWindow (w: WindowId) (rect: PixelRect) (behavior: WindowBehavior) (world: VirtualWorld) : VirtualWorld =
     { world with
-        Windows = Map.add w { Id = w; Rect = rect; Behavior = behavior; Shown = true; Integrity = NotHigher; IsMaximized = false } world.Windows }
+        Windows =
+            Map.add
+                w
+                { Id = w; Rect = rect; Behavior = behavior; Shown = true; Integrity = NotHigher; IsMaximized = false; FrameInset = noFrameInset }
+                world.Windows }
+
+/// `addWindow`呼び出し後に不可視リサイズ枠を模す窓へ上書きする（`Integrity`/`IsMaximized`と同じ要領、
+/// `VirtualWindow`の型直前のコメント参照）。対象窓が無ければ何もしない。
+let withFrameInset (w: WindowId) (inset: FrameInset) (world: VirtualWorld) : VirtualWorld =
+    match Map.tryFind w world.Windows with
+    | Some vw -> { world with Windows = Map.add w { vw with FrameInset = inset } world.Windows }
+    | None -> world
 
 let private emptySnapshot (w: WindowId) : WindowSnapshot =
     { Id = w
@@ -172,10 +205,21 @@ let applyEffect
                         { world with
                             Windows = Map.add w { vw with Rect = rect } world.Windows
                             NextSampleSequence = sampleSeq + 1L }
+                    // `FrameInset`（v2.113、`VirtualWindow`の型直前のコメント参照）：既定(noFrameInset)
+                    // の窓は今までどおりVisibleFrameRectだけを運ぶ観測になる（既存シナリオへの影響なし）。
+                    // 枠を持つ窓は、要求どおりのネイティブ矩形（`rect`、実機でSetWindowPosがそのまま
+                    // 適用した値に対応）と、それを縮めたVisibleFrameRectの両方を運ぶ——pad2py-pad-host
+                    // 実機（v2.112）で実際に観測した「要求どおりのNativeRect・縮んだVisibleFrameRect」
+                    // という形をそのまま再現する。
+                    let visibleRect = shrinkByInset vw.FrameInset rect
+                    let visibleObs = Some { Value = Ok visibleRect; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" }
+                    let nativeObs =
+                        if vw.FrameInset = noFrameInset then
+                            None
+                        else
+                            Some { Value = Ok rect; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" }
                     dispatchedEvents <-
-                        [ WindowObserved
-                            { emptySnapshot w with
-                                VisibleFrameRect = Some { Value = Ok rect; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" } } ]
+                        [ WindowObserved { emptySnapshot w with NativeRect = nativeObs; VisibleFrameRect = visibleObs } ]
                     dispatchedSeq <- Some dispatchSeq
                     Ok ()
                 | MinimumWidth minWidthPx ->
