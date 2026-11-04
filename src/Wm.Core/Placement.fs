@@ -810,6 +810,36 @@ let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: P
                 let superseded = st.Pending |> Map.toSeq |> Seq.filter (fun (_, pr) -> pr.Window = p.Window) |> List.ofSeq
                 let supersededCmds = superseded |> List.map (fun (rid, _) -> CancelTimer (TimerId.Placement (PendingDeadline rid)))
                 let pendingWithoutOld = st.Pending |> Map.filter (fun _ pr -> pr.Window <> p.Window)
+                let isMaximized = Map.tryFind p.Window st.Geometry |> Option.bind (fun g -> LatestWins.value g.IsMaximized) |> Option.defaultValue false
+                let isMinimized = Map.tryFind p.Window st.Geometry |> Option.bind (fun g -> LatestWins.value g.IsMinimized) |> Option.defaultValue false
+                // 3-Bの再発行ループ対策（v2.122、Opus敵対的レビュー`opus-review-frame-inset.md`論点3-B、
+                // v2.115でVirtualWorldに再現済み）：既に観測されている現在の可視矩形がTargetと完全に
+                // 一致するなら、`SetRect`を発行しても無反応(no-op)のSetWindowPosになり、実機では
+                // LOCATIONCHANGEが一切発火しない（Phase0CiSpikesのS22/S23が設計時に実機確認済みの
+                // 事実、`VirtualWorld.fs`の同じno-opモデリングの型直前のコメント参照）——発行すれば
+                // 必ずTimeout→Retry→諦めへ進み、`Desired`が消えて次のReconcileで同じ目標を無限に
+                // 再発行する。発行前にこの一致を検出し、`SetRect`自体を出さず`checkPendingSatisfied`
+                // と同じ終端（`Movability`をConfirmedへ、`Accepted`に記録）を直接行う。ドラッグ中・
+                // 最大化中・最小化中は対象外（観測される矩形がユーザー操作の結果でしかなく、
+                // 偶然Targetと一致しても「満たされた」と見なしてはならない——条件5・6と同じ理由）。
+                let alreadyAtTarget =
+                    not isMaximized
+                    && not isMinimized
+                    && not (Set.contains p.Window st.Dragging)
+                    && (Map.tryFind p.Window st.Geometry |> Option.bind (fun g -> LatestWins.value g.VisibleFrameRect)) = Some p.Target
+                if alreadyAtTarget then
+                    { st with
+                        Desired = Map.add p.Window (Shown (Some p.Target)) st.Desired
+                        Pending = pendingWithoutOld
+                        Movability = Map.add p.Window { Value = Movable; Confidence = Confirmed; LastRevisedAt = now } st.Movability
+                        RetryAttempts = Map.remove p.Window st.RetryAttempts
+                        InFlightTargets = Map.remove p.Window st.InFlightTargets
+                        DpiCrossing = Map.remove p.Window st.DpiCrossing
+                        Accepted = Map.add p.Window p.Target st.Accepted },
+                    effects,
+                    cmds @ supersededCmds,
+                    traces
+                else
                 // `Mismatch → Reevaluate`（v2.42）：失効させる旧Pendingの(Epoch, TargetRect)を
                 // `InFlightTargets`へ移す——まだ遅れて適用されるかもしれない旧要求の結果を、新しい
                 // Pendingの不一致と取り違えないため（型直前のコメント参照）。
@@ -830,7 +860,6 @@ let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: P
                 // 別途採番するが、`ShowWindowAsync(SW_RESTORE)`はfire-and-forget（`RequestForeground`
                 // と同じ`callBoolNoCode`、7.1）なのでPendingには乗せない——`EffectCallReturned`が
                 // 届いても対応する記録が無く無害に無視される（v2.69の`PendingPresence`と同じ整理）。
-                let isMaximized = Map.tryFind p.Window st.Geometry |> Option.bind (fun g -> LatestWins.value g.IsMaximized) |> Option.defaultValue false
                 let restoreRid, nextRequestIdAfterRestore =
                     if isMaximized then
                         Some (RequestId st.NextRequestId), st.NextRequestId + 1L

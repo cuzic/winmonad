@@ -1434,3 +1434,61 @@ let ``onWindowVanishedはAccepted・DriftCorrectionsも消す(v2.70)`` () =
     let afterVanished, _ = onWindowVanished w afterDrift
     Assert.Equal(None, Map.tryFind w afterVanished.Accepted)
     Assert.Equal(None, Map.tryFind w afterVanished.DriftCorrections)
+
+// ===== 3-Bの再発行ループ対策（v2.122、Opus敵対的レビュー`opus-review-frame-inset.md`論点3-B、
+// v2.115でVirtualWorldに再現済み。実際のCore側対策はこのラウンドまで未着手だった） =====
+//
+// 実機（`Wm.Windows.RealObservation.observeWindow`）は`RawFirstSeen`の時点で常にNativeRect/
+// VisibleFrameRectの対を問い合わせるため、WM再起動時に既にタイル済みだった窓の発見イベントは
+// 本来矩形を伴う（v2.115の`ConstrainedWindowScenario.fs`の`visibleWindowObserved`ヘルパーは
+// 無関係な別の既知の不具合——SampleSequence衝突——を避けるため、意図的に発見イベントから矩形を
+// 省いた簡略化モデルであり、実機の挙動を表していない）。このラウンドでは、発見時点で既に
+// `Geometry.VisibleFrameRect`信念がTargetと一致している（＝実機の発見イベントが矩形を運んだ）
+// 場合に対策する——`dispatchPlacements`がこの一致を発行前に検出して`SetRect`自体を出さず、
+// 直接`checkPendingSatisfied`と同じ終端を行う。
+
+[<Fact>]
+let ``発見時に既にVisibleFrameRectがTargetと一致している窓へのReconcileは、SetRectを発行せず直接Satisfied相当にする(v2.122)`` () =
+    let w = WindowId 1L
+    // WM再起動時に既にタイル済みだった窓を模す——実機の発見イベント(RawFirstSeen)は常にNativeRect/
+    // VisibleFrameRectの対を運ぶため(RealObservation.observeWindow)、Reconcile前に既に信念がある。
+    let afterDiscovered, _, _ = onWindowObserved 1L (observedSnapshot w workArea 0L) initial
+    let afterReconcile, effects, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterDiscovered
+    Assert.Empty(effects) // SetRectを一切発行しない(=この窓への無反応no-opが起きない)
+    Assert.Empty(afterReconcile.Pending)
+    Assert.Equal(Some (Shown (Some workArea)), Map.tryFind w afterReconcile.Desired)
+    Assert.Equal(Some workArea, Map.tryFind w afterReconcile.Accepted)
+    match Map.tryFind w afterReconcile.Movability with
+    | Some { Value = Movable; Confidence = Confirmed } -> ()
+    | other -> Assert.True(false, sprintf "expected Movable/Confirmed, got %A" other)
+
+[<Fact>]
+let ``発見時のVisibleFrameRectがTargetと異なる窓へのReconcileは、通常どおりSetRectを発行する(v2.122の回帰確認)`` () =
+    let w = WindowId 1L
+    let offRect = { workArea with X = workArea.X + 50 }
+    let afterDiscovered, _, _ = onWindowObserved 1L (observedSnapshot w offRect 0L) initial
+    let afterReconcile, effects, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterDiscovered
+    Assert.Equal<Effect list>([ SetRect (RequestId 0L, w, workArea) ], effects)
+    Assert.Equal(1, Map.count afterReconcile.Pending)
+
+[<Fact>]
+let ``ドラッグ中の窓は、観測がTargetと偶然一致していてもSetRectスキップをせず通常どおり発行する(v2.122)`` () =
+    let w = WindowId 1L
+    let afterDiscovered, _, _ = onWindowObserved 1L (observedSnapshot w workArea 0L) initial
+    let afterDragging = onMoveSizeStarted w afterDiscovered
+    let afterReconcile, effects, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterDragging
+    Assert.Equal<Effect list>([ SetRect (RequestId 0L, w, workArea) ], effects)
+    Assert.Equal(1, Map.count afterReconcile.Pending)
+
+[<Fact>]
+let ``最大化中の窓は、観測がTargetと偶然一致していてもSetRectスキップをせず通常どおりRestoreBeforeMove+SetRectを発行する(v2.122)`` () =
+    let w = WindowId 1L
+    let afterDiscovered, _, _ = onWindowObserved 1L (observedSnapshotMaximized w workArea 0L) initial
+    let afterReconcile, effects, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) afterDiscovered
+    match effects with
+    | [ RestoreBeforeMove (_, restoreWindow); SetRect (_, setWindow, rect) ] ->
+        Assert.Equal(w, restoreWindow)
+        Assert.Equal(w, setWindow)
+        Assert.Equal(workArea, rect)
+    | other -> Assert.True(false, sprintf "expected [RestoreBeforeMove; SetRect], got %A" other)
+    Assert.Equal(1, Map.count afterReconcile.Pending)

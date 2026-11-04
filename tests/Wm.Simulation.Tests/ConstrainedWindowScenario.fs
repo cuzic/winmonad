@@ -156,6 +156,16 @@ let ``不可視リサイズ枠を持つ窓は、要求どおりの矩形が返�
 /// この無反応を「遅延」と誤認しないよう初期矩形をどのtargetとも異ならせて回避していた。今回
 /// `VirtualWorld.applyEffect`に同じ無反応をモデル化した（`Immediate`/`HungAfterMs`、`rect = vw.Rect`
 /// の場合は観測を一切生まない、`VirtualWorld.fs`の型直前のコメント参照）。
+///
+/// **v2.122で実際のCore側対策（`dispatchPlacements`の`alreadyAtTarget`ショートカット、
+/// `Placement.fs`の型直前のコメント参照）を入れたが、このテストはそれでも閉じない——意図的に**。
+/// このテストの`visibleWindowObserved`は発見イベントから矩形を省く簡略化モデル（型直前の
+/// コメント参照、SampleSequence衝突という別の不具合を避けるための設計）であり、実機の
+/// `Wm.Windows.RealObservation.observeWindow`（`RawFirstSeen`時点で常にNativeRect/
+/// VisibleFrameRectの対を問い合わせる）とは異なる。v2.122の対策は「発見時点で既にTargetと
+/// 一致する信念がある」場合に効く——実機では通常これが成立する（`PlacementReconcileTests.fs`の
+/// v2.122新規テスト参照）。本テストが表すのは「発見時点でも矩形情報が一切無い」というより狭い
+/// 残課題（Win32呼出自体が失敗した等）であり、実機でこれが実際に起こるかは未確認。
 [<Fact>]
 let ``既に目標どおりの位置にある窓への最初のSetRectはOSの無反応(no-op)のためTimeout→Retry→諦めへ進み、次のReconcileで同じ目標がまた発行される(v2.115、既知のギャップ)`` () =
     let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
