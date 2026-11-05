@@ -782,7 +782,12 @@ let main _argv =
             let pending13 = Map.count reducer13.State.Placement.Pending
             let movability13 = Map.tryFind testWindowId13 reducer13.State.Placement.Movability
             printfn "Round 13 summary: dispatched=%d skipped(no handler)=%d Pending=%d Movability=%A" dispatchedCount13 skippedCount13 pending13 movability13
-            let passed = dispatchedCount13 = 0 && skippedCount13 = 0 && pending13 = 0
+            // `skipped(no handler)`はこのラウンドの判定とは無関係（型直前のコメント参照）：窓の発見は
+            // 常に`Reprobe (w, KTargetIntegrity)`等（ProbeOnce、`architecture.md`§4.5）を能動的に
+            // 発行するため、新規発見のたびに2件前後の「ハンドラ無し」が出るのが通常——ラウンド3の
+            // 最初の発見（SetRectも1件発行する）でも同じ`skipped(no handler)=2`が観測されている。
+            // このラウンドが確認したいのは「SetRectが0件（＝3-Bの再発行が起きない）」だけ。
+            let passed = dispatchedCount13 = 0 && pending13 = 0
             printfn "Round 13 PASSED (zero SetRect dispatched for an already-at-target discovery): %b" passed
         | other ->
             printfn "  pre-positioning failed, VisibleFrameRect after SetWindowPos=%A (expected exact match with target=%A) -- skipping Round 13's actual check" other target
