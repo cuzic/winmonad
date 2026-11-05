@@ -74,6 +74,11 @@ type WindowSnapshot = {
     IsMinimized: Observation<bool> option
     /// 最大化状態（`IsZoomed`相当、v2.74。§6.2/§7.1の`NeedsRestore`/`RestoreBeforeMove`の生産元）。
     IsMaximized: Observation<bool> option
+    /// `GetWindowLong(GWL_STYLE)`の生の値（v2.128、E-4全画面検出、opus-review-fullscreen-detection-round2.md
+    /// §3-C）。`bool`へ判定式を潰さず生のビットを運ぶ——`CloakState`が理由ビットを捨てない方針（R3-8）
+    /// と同じ理由：ボーダレス判定式（`WS_CAPTION`/`WS_THICKFRAME`の具体的な組み合わせ）が後で変わっても、
+    /// Shell/Contracts/Journalを直さずCore側（`Placement.checkFullscreen`）の1箇所だけで直せるようにする。
+    Style: Observation<int> option
     Cloak: Observation<CloakState> option
     Monitor: Observation<MonitorId> option
     MinWidthHint: Observation<int> option

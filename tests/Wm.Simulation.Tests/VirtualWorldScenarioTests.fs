@@ -47,6 +47,7 @@ let private visibleWindowObserved (w: WindowId) : InputEvent =
           IsVisible = Some { Value = Ok true; SampleSequence = 0L; MonotonicTime = 0L; Source = "virtual-world" }
           IsMinimized = None
           IsMaximized = None
+          Style = None
           Cloak = None
           Monitor = None
           MinWidthHint = None
@@ -208,7 +209,7 @@ let ``ForgetWindowはVirtualWorldから窓を取り除くだけで、観測もEf
                   AppIdentity = emptyAppIdentity
                   Owner = None; IsDialog = None; NativeRect = None; VisibleFrameRect = None
                   IsVisible = Some { Value = Ok true; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" }
-                  IsMinimized = None; IsMaximized = None; Cloak = None; Monitor = None; MinWidthHint = None
+                  IsMinimized = None; IsMaximized = None; Style = None; Cloak = None; Monitor = None; MinWidthHint = None
                   TargetIntegrity = None; Responsiveness = None; Presence = None; DpiAwareness = None; TitleMatches = None }
         reducer.Submit 1L "virtual-world" (withProcess 1L 100) |> ignore
         let result = reducer.Submit 2L "virtual-world" (withProcess 2L 200)

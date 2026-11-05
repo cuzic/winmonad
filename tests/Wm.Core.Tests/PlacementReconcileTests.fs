@@ -159,6 +159,7 @@ let private observedSnapshot (w: WindowId) (rect: PixelRect) (sequence: int64) :
       IsVisible = None
       IsMinimized = None
       IsMaximized = None
+      Style = None
       Cloak = None
       Monitor = None
       MinWidthHint = None
@@ -418,6 +419,7 @@ let private presenceSnapshot (w: WindowId) (presence: ObservedPresence) (sequenc
       IsVisible = None
       IsMinimized = None
       IsMaximized = None
+      Style = None
       Cloak = None
       Monitor = None
       MinWidthHint = None

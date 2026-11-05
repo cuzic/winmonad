@@ -303,6 +303,7 @@ let private windowSnapshotToJson (s: WindowSnapshot) : JsonNode =
     o.["isVisible"] <- observationOptionToJson boolToJson s.IsVisible
     o.["isMinimized"] <- observationOptionToJson boolToJson s.IsMinimized
     o.["isMaximized"] <- observationOptionToJson boolToJson s.IsMaximized
+    o.["style"] <- observationOptionToJson intToJson s.Style
     o.["cloak"] <- observationOptionToJson cloakStateToJson s.Cloak
     o.["monitor"] <- observationOptionToJson monitorIdToJson s.Monitor
     o.["minWidthHint"] <- observationOptionToJson intToJson s.MinWidthHint
@@ -324,6 +325,10 @@ let private windowSnapshotOfJson (node: JsonNode) : WindowSnapshot =
       IsVisible = observationOptionOfJson boolOfJson node.["isVisible"]
       IsMinimized = observationOptionOfJson boolOfJson node.["isMinimized"]
       IsMaximized = observationOptionOfJson boolOfJson node.["isMaximized"]
+      // v2.128（E-4全画面検出）で追加。`observationOptionOfJson`はキー欠落時`null`を`None`として
+      // 扱うので、v2.128より古いJournal（このキーを一切持たない）も正しく`None`として読める
+      // （`minWidthHint`が後から足されたときと同じ扱い）。
+      Style = observationOptionOfJson intOfJson node.["style"]
       Cloak = observationOptionOfJson cloakStateOfJson node.["cloak"]
       Monitor = observationOptionOfJson monitorIdOfJson node.["monitor"]
       MinWidthHint = observationOptionOfJson intOfJson node.["minWidthHint"]

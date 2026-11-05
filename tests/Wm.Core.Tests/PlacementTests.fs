@@ -36,6 +36,7 @@ let private snapshotWith
       IsVisible = None
       IsMinimized = isMinimized
       IsMaximized = None
+      Style = None
       Cloak = None
       Monitor = monitor
       MinWidthHint = None

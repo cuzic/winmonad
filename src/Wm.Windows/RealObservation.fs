@@ -93,6 +93,36 @@ let queryMinimized (hWnd: IntPtr) : Result<bool, NativeCallRecord> = Ok (IsIconi
 
 let private queryMaximized (hWnd: IntPtr) : Result<bool, NativeCallRecord> = Ok (IsZoomed(hWnd))
 
+/// `GetWindowLong`は失敗時も0を返すことがあり（Opus敵対的レビュー第2ラウンド§3-A）、`queryVisible`
+/// 等の「falseも正当な結果」とは逆に「0は正当な値にも失敗にもなる」——`SetLastWin32Error(0)`で
+/// 消してから呼び、戻り値が0のときだけ`GetLastWin32Error()`で区別する（`callBoolRead`と同じ考え方）。
+let private queryStyle (hWnd: IntPtr) : Result<int, NativeCallRecord> =
+    let sw = Stopwatch.StartNew()
+    Marshal.SetLastWin32Error(0)
+    let style = GetWindowLong(hWnd, GWL_STYLE)
+    sw.Stop()
+    if style <> 0 then
+        Ok style
+    else
+        let code = Marshal.GetLastWin32Error()
+        if code = 0 then Ok style else Error { Api = "GetWindowLong"; Space = Win32LastError; Code = code; ElapsedUs = elapsedUsOf sw }
+
+/// スタイルと矩形は同じ瞬間には読めない（Opus敵対的レビュー第2ラウンド§3-B、F36/S28a/bが実測した
+/// とおり全画面の出入りでスタイルと矩形は別タイミングで変わる）。スタイル→矩形→スタイルの順に読み、
+/// 2回のスタイルが食い違えば「この観測内では信頼できない」としてErrorにする——`Placement.checkFullscreen`
+/// の更新規則（両方が同じ観測内で`Ok`のときだけ更新）により、食い違った回は前の状態をそのまま保つ。
+let private queryStyleAndNativeRect (hWnd: IntPtr) : Result<int, NativeCallRecord> * Result<PixelRect, NativeCallRecord> =
+    let styleBefore = queryStyle hWnd
+    let nativeRect = queryNativeRect hWnd
+    let styleAfter = queryStyle hWnd
+    let style =
+        match styleBefore, styleAfter with
+        | Ok a, Ok b when a = b -> Ok a
+        | Error _, _ -> styleBefore
+        | _, Error _ -> styleAfter
+        | Ok _, Ok _ -> Error { Api = "GetWindowLong"; Space = Win32LastError; Code = -1; ElapsedUs = 1L } // 不一致：2回の読み取りの間にスタイルが変わった（§3-B）
+    style, nativeRect
+
 let queryCloak (hWnd: IntPtr) : Result<CloakState, NativeCallRecord> =
     let mutable cloakVal = 0
     let hr = DwmGetWindowAttributeInt(hWnd, DWMWA_CLOAKED, &cloakVal, 4)
@@ -152,16 +182,18 @@ let queryMonitor (monitorHandles: IntPtr list) (hWnd: IntPtr) : Result<MonitorId
 /// ここで変換に使うだけで、`WindowSnapshot`には一切載せない）。
 let observeWindow (now: int64) (monitorHandles: IntPtr list) (titleMatcher: string -> TitleMatchVector) (hWnd: IntPtr) : WindowSnapshot =
     let w = WindowId (hWnd.ToInt64())
+    let styleResult, nativeRectResult = queryStyleAndNativeRect hWnd
     { Id = w
       Process = None
       AppIdentity = { Exe = Some (obs now (queryExePath hWnd)); HostExe = None; Aumid = None; CoreWindowExe = None }
       Owner = None
       IsDialog = None
-      NativeRect = Some (obs now (queryNativeRect hWnd))
+      NativeRect = Some (obs now nativeRectResult)
       VisibleFrameRect = Some (obs now (queryVisibleFrameRect hWnd))
       IsVisible = Some (obs now (queryVisible hWnd))
       IsMinimized = Some (obs now (queryMinimized hWnd))
       IsMaximized = Some (obs now (queryMaximized hWnd))
+      Style = Some (obs now styleResult)
       Cloak = Some (obs now (queryCloak hWnd))
       Monitor = Some (obs now (queryMonitor monitorHandles hWnd))
       MinWidthHint = None

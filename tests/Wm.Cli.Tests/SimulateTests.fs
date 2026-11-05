@@ -40,6 +40,7 @@ let private sampleWindow (w: WindowId) (rect: PixelRect) : WindowSnapshot =
       IsVisible = Some (obs 1L 2L true)
       IsMinimized = Some (obs 1L 3L false)
       IsMaximized = Some (obs 1L 4L false)
+      Style = None
       Cloak = Some (obs 1L 5L { App = false; Shell = false; Inherited = false })
       Monitor = Some (obs 1L 6L (MonitorId 0L))
       MinWidthHint = None

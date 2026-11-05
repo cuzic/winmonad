@@ -41,6 +41,7 @@ let private windowObserved (sequence: int64) (visible: bool) : InputEvent =
           IsVisible = Some { Value = Ok visible; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" }
           IsMinimized = None
           IsMaximized = None
+          Style = None
           Cloak = None
           Monitor = None
           MinWidthHint = None

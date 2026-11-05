@@ -138,6 +138,7 @@ let private emptySnapshot (w: WindowId) : WindowSnapshot =
       IsVisible = None
       IsMinimized = None
       IsMaximized = None
+      Style = None
       Cloak = None
       Monitor = None
       MinWidthHint = None
