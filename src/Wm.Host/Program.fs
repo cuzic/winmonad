@@ -710,7 +710,7 @@ let main _argv =
     printfn "Watchdog restored the last-hidden window on its own, without Core ever being told to: %b"
         (watchdog2Triggered && not minimizedAfterRecovery && not trackedAfterRecovery)
 
-    // 段9：ラウンド13。v2.122の3-B再発行ループ対策（`dispatchPlacements`の`alreadyAtTarget`
+    // 段9：ラウンド13（v2.124）。v2.122の3-B再発行ループ対策（`dispatchPlacements`の`alreadyAtTarget`
     // ショートカット、Placement.fsの型直前のコメント参照）の実際の発火条件——「発見時点で既に
     // 窓がTargetどおりの位置にある」——を実機で再現する。既存のラウンド3〜12は毎回新しいテスト窓を
     // 任意の初期位置に作るため、この条件を自然には再現できない（v2.122実装時に明記した既知の未検証
