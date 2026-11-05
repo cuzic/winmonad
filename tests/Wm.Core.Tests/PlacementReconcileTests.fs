@@ -192,6 +192,17 @@ let private observedSnapshotMaximizedWithMonitor (w: WindowId) (rect: PixelRect)
     { observedSnapshotWithMonitor w rect monitor sequence with
         IsMaximized = Some { Value = Ok true; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" } }
 
+/// `observedSnapshotWithMonitor`に、`NativeRect`（ここでは`VisibleFrameRect`と同じ、insetなし）と
+/// `Style`の観測を付け加えたもの。E-4全画面検出（v2.128/v2.129）のテストに使う。`style`の既定は
+/// `0`（`WS_CAPTION`/`WS_THICKFRAME`のビットが一切立たない、完全にボーダレス）。
+let private observedSnapshotStyled (w: WindowId) (rect: PixelRect) (monitor: MonitorId) (style: int) (sequence: int64) : WindowSnapshot =
+    { observedSnapshotWithMonitor w rect monitor sequence with
+        NativeRect = Some { Value = Ok rect; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" }
+        Style = Some { Value = Ok style; SampleSequence = sequence; MonotonicTime = sequence; Source = "test" } }
+
+let private observedSnapshotFullscreen (w: WindowId) (rect: PixelRect) (monitor: MonitorId) (sequence: int64) : WindowSnapshot =
+    observedSnapshotStyled w rect monitor 0 sequence
+
 // ===== RestoreBeforeMove（§6.2/§7.1、v2.74、CIスパイクS6bで実機確認） =====
 
 [<Fact>]
@@ -1482,6 +1493,83 @@ let ``onWindowVanishedはAccepted・DriftCorrectionsも消す(v2.70)`` () =
     let afterVanished, _ = onWindowVanished w afterDrift
     Assert.Equal(None, Map.tryFind w afterVanished.Accepted)
     Assert.Equal(None, Map.tryFind w afterVanished.DriftCorrections)
+
+// ===== 全画面（E-4、v2.128/v2.129、opus-review-fullscreen-detection(-round2).md） =====
+
+[<Fact>]
+let ``checkFullscreenはborderlessかつ矩形がモニターBoundsと一致する観測で全画面集合へ加える(E-4、v2.128)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let bounds = { X = 0; Y = 0; Width = 1920; Height = 1080 }
+    let snapshot = observedSnapshotFullscreen w bounds m 1L
+    let result = checkFullscreen [ bounds ] true snapshot initial
+    Assert.True(Set.contains w result.Fullscreen)
+
+[<Fact>]
+let ``checkFullscreenは最小化中の観測では判定を変えない(E-4、v2.128、前回レビュー§1-4条件2)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let bounds = { X = 0; Y = 0; Width = 1920; Height = 1080 }
+    let seeded = { initial with Fullscreen = Set.singleton w }
+    let minimizedSnapshot =
+        { observedSnapshotFullscreen w bounds m 1L with
+            IsMinimized = Some { Value = Ok true; SampleSequence = 1L; MonotonicTime = 1L; Source = "test" } }
+    let result = checkFullscreen [ bounds ] true minimizedSnapshot seeded
+    Assert.True(Set.contains w result.Fullscreen) // 解除もしない(保つ)
+
+[<Fact>]
+let ``checkFullscreenは部分観測(NativeRectまたはStyleが無い)では判定を変えない(E-4、v2.128、前回レビュー§1-4条件1)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let bounds = { X = 0; Y = 0; Width = 1920; Height = 1080 }
+    let seeded = { initial with Fullscreen = Set.singleton w }
+    let partial = observedSnapshotWithMonitor w bounds m 1L // StyleもNativeRectも無い
+    let result = checkFullscreen [ bounds ] true partial seeded
+    Assert.True(Set.contains w result.Fullscreen)
+
+[<Fact>]
+let ``checkFullscreenは全画面でなくなった観測でも、画面構成が不安定な間は解除しない(E-4、v2.128、前回レビュー1-F)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let bounds = { X = 0; Y = 0; Width = 1920; Height = 1080 }
+    let seeded = { initial with Fullscreen = Set.singleton w }
+    let notFullscreenRect = { bounds with Width = 300; Height = 200 } // ボーダレスのままだが矩形がBoundsと一致しない
+    let snapshot = observedSnapshotStyled w notFullscreenRect m 0 1L
+    let resultUnstable = checkFullscreen [ bounds ] false snapshot seeded
+    Assert.True(Set.contains w resultUnstable.Fullscreen) // 不安定な間は保つ
+    let resultStable = checkFullscreen [ bounds ] true snapshot seeded
+    Assert.False(Set.contains w resultStable.Fullscreen) // Stableになれば解除する
+
+[<Fact>]
+let ``全画面中の窓はPendingDeadline発火時にMismatch判定もRetryもせず、戦わずに終端する(E-4、v2.128、前回レビュー1-B)`` () =
+    let w = WindowId 1L
+    let m = MonitorId 1L
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    // 全画面化した結果、モニター全幅の矩形が観測される(MinWidthの証拠候補)。
+    let fullscreenRect = { X = 0; Y = 0; Width = 2560; Height = 1440 }
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotFullscreen w fullscreenRect m 10L) afterDispatched
+    // `checkFullscreen`自体は`WmState.step`が呼ぶ(ファイル冒頭コメント参照)ので、このPlacement単体
+    // テストでは直接マーキングする。
+    let afterFullscreen = { afterObserved with Fullscreen = Set.singleton w }
+    let dpiOf (mid: MonitorId) = if mid = m then Some 96 else None
+    let afterDeadline, effects, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid dpiOf afterFullscreen
+    Assert.Empty(afterDeadline.Pending) // 終端はする(戦わない)
+    Assert.Empty(effects) // Retryしない
+    Assert.Equal(None, Map.tryFind w afterDeadline.RetryAttempts)
+    Assert.Equal(None, Map.tryFind w afterDeadline.MinWidth) // モニター全幅をMinWidthの証拠にしない
+
+[<Fact>]
+let ``checkUnattributedDriftは全画面中の窓には作用しない(E-4、v2.128、前回レビュー1-D)`` () =
+    let w = WindowId 1L
+    let m0, m1 = MonitorId 0L, MonitorId 1L
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let afterObserved, _, _ = onWindowObserved 20L (observedSnapshotWithMonitor w workArea m0 1L) afterReconcile
+    let afterMoved, _, _ = onWindowObserved 30L (observedSnapshotWithMonitor w workArea m1 2L) afterObserved
+    let afterFullscreen = { afterMoved with Fullscreen = Set.singleton w }
+    let afterDrift, corrected, _ = checkUnattributedDrift 30L isTiledTrue (fun _ -> Some m0) alwaysStable w afterFullscreen
+    Assert.False(corrected) // 補正せず、振動検知の打ち止め(恒久的なByOscillation劣化)にも進まない
 
 // ===== 3-Bの再発行ループ対策（v2.122、Opus敵対的レビュー`opus-review-frame-inset.md`論点3-B、
 // v2.115でVirtualWorldに再現済み。実際のCore側対策はこのラウンドまで未着手だった） =====

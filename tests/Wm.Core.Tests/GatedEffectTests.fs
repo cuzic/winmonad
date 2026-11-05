@@ -152,6 +152,34 @@ let ``TargetHiddenByWm: RequestCloseに適用される`` () =
     let input = { cleanInput with HiddenByWm = Set.singleton w }
     Assert.True(rejectedWith input (RequestClose (rid, w)) (TargetHiddenByWm w))
 
+// ===== TargetFullscreen：SetRect/RestoreBeforeMoveだけに適用、他は妨げない（E-4、v2.129、
+// opus-review-fullscreen-detection-round2.md §2-1） =====
+
+[<Fact>]
+let ``TargetFullscreen: SetRectに適用される`` () =
+    let input = { cleanInput with Fullscreen = Set.singleton w }
+    Assert.True(rejectedWith input (SetRect (rid, w, rect)) (TargetFullscreen w))
+
+[<Fact>]
+let ``TargetFullscreen: RestoreBeforeMoveに適用される`` () =
+    let input = { cleanInput with Fullscreen = Set.singleton w }
+    Assert.True(rejectedWith input (RestoreBeforeMove (rid, w)) (TargetFullscreen w))
+
+[<Fact>]
+let ``TargetFullscreen: RequestForegroundには適用されない（全画面の窓を前面に出すのは妨げない）`` () =
+    let input = { cleanInput with Fullscreen = Set.singleton w }
+    Assert.True(passes input (RequestForeground (rid, w)))
+
+[<Fact>]
+let ``TargetFullscreen: SetPresenceには適用されない（ワークスペース切替での隠す/見せるは妨げない）`` () =
+    let input = { cleanInput with Fullscreen = Set.singleton w }
+    Assert.True(passes input (SetPresence (rid, w, false)))
+
+[<Fact>]
+let ``TargetFullscreen: RequestCloseには適用されない`` () =
+    let input = { cleanInput with Fullscreen = Set.singleton w }
+    Assert.True(passes input (RequestClose (rid, w)))
+
 // ===== 矩形の構造的チェック =====
 
 [<Fact>]
