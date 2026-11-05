@@ -22,6 +22,11 @@ type GateInput = {
     /// 実際に組み立てられるようになった。§6.2のMissingRestoreBeforeMove判定に使う。Aero Snap状態は
     /// 検知手段が未調査のため依然対象外のまま）。
     NeedsRestore: Set<WindowId>
+    /// 全画面と判定された窓（v2.128、E-4、opus-review-fullscreen-detection-round2.md §2-1）。
+    /// `Placement.PlacementState.Fullscreen`からそのまま組み立てる——Draggingの方式（`aliveForScreen`
+    /// から外す）ではなく、ここ（ゲート）で`SetRect`/`RestoreBeforeMove`を一律に塞ぐ。理由は
+    /// `RejectionKind.RFullscreen`の型直前のコメント参照。
+    Fullscreen: Set<WindowId>
 }
 
 type GateRejection =
@@ -33,6 +38,7 @@ type GateRejection =
     | TargetNotMovable of WindowId
     | TargetBelievedHung of WindowId
     | TargetHiddenByWm of WindowId
+    | TargetFullscreen of WindowId
 
 /// コンストラクタはinternal。InternalsVisibleTo("Wm.Core"/"Wm.Core.Tests")でそれらだけに構築を許す
 /// （R2-20、AssemblyInfo.fs参照）。`gate`自体もinternalにする（Opusレビュー2-9）：
@@ -98,6 +104,16 @@ module GatedEffect =
         | RNotMovable
         | RBelievedHung
         | RHiddenByWm
+        /// E-4全画面検出（v2.128、opus-review-fullscreen-detection-round2.md §2-1）：Draggingの方式
+        /// （`aliveForScreen`から外す、Reconcile経路だけを止める）ではなくゲートに置く理由は4つ——
+        /// (1) `dispatchPlacements`・`retryOrGiveUp`・v2.121自己修復・`RestoreBeforeMove`の
+        /// 全`SetRect`経路を1箇所で塞げる、(2) `onGateRejected`が`Desired`も消すので全画面を
+        /// 抜けた後の次のReconcileで`desiredChanged`が立ち直り再タイルされる（`aliveForScreen`方式
+        /// では`Desired`が古いまま残り取りこぼす）、(3) Layoutが全画面の窓の場所を確保したまま
+        /// 残るので、`RelayoutWithout`で兄弟の窓が広がって抜けた後に重なり続ける事故が起きない、
+        /// (4) `HiddenByWm`（v2.86）と同じ「Placementの状態からGateInputの集合を作り、RectMutating
+        /// を拒否する」という既存パターンに合う。
+        | RFullscreen
 
     let private effectKindOf (e: Effect) : EffectKind option =
         match e with
@@ -150,7 +166,14 @@ module GatedEffect =
           (RHiddenByWm, PresenceKind), false // WMが隠す/見せるためのEffectそのものなので適用しない
           (RHiddenByWm, ObserveKind), false
           (RHiddenByWm, ForgetKind), false
-          (RHiddenByWm, CloseKind), true ]
+          (RHiddenByWm, CloseKind), true
+
+          (RFullscreen, RectMutating), true
+          (RFullscreen, ForegroundKind), false // 全画面の窓を前面に出すのは妨げない
+          (RFullscreen, PresenceKind), false // 隠す/見せるのは妨げない（ワークスペース切替等）
+          (RFullscreen, ObserveKind), false // 再probeは妨げない
+          (RFullscreen, ForgetKind), false
+          (RFullscreen, CloseKind), false ] // 閉じる要求は妨げない
         |> Map.ofList
 
     /// §6.2「拒否理由ごとの適用範囲」の表に従って1つのEffectを検査する。restoreSeenは直前に通過した
@@ -170,6 +193,7 @@ module GatedEffect =
             let isNotMovable = Set.contains w input.NotMovable
             let isHung = Set.contains w input.Hung
             let isHiddenByWm = Set.contains w input.HiddenByWm
+            let isFullscreen = Set.contains w input.Fullscreen
             let notAlive = not (Set.contains w input.Alive)
 
             if notAlive && applies RNotAlive then Some (TargetNotAlive w)
@@ -177,6 +201,7 @@ module GatedEffect =
             elif isNotMovable && applies RNotMovable then Some (TargetNotMovable w)
             elif isHung && applies RBelievedHung then Some (TargetBelievedHung w)
             elif isHiddenByWm && applies RHiddenByWm then Some (TargetHiddenByWm w)
+            elif isFullscreen && applies RFullscreen then Some (TargetFullscreen w)
             else
                 match e with
                 | SetRect (_, _, r) ->

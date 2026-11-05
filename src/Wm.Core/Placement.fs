@@ -359,6 +359,11 @@ type PlacementState =
       /// Suspended（単一の状態ではなく各ドメインが自分の理由で持つ「配置対象から一時的に外す」条件の
       /// 和、architecture.md 976行目）のうち、このドメインが持つ理由。`onWindowVanished`で除く。
       Dragging: Set<WindowId>
+      /// 全画面と判定された窓（v2.128、E-4、opus-review-fullscreen-detection-round2.md §1）。
+      /// `Dragging`と同じ形の明示的な状態——`checkFullscreen`（型直前のコメント参照）が
+      /// `WindowObserved`の観測ごとに1回だけ書く。配置抑止（S1、GatedEffectの`RFullscreen`、
+      /// `GatedEffect.fs`参照）と証拠抑制（S2、`checkUnattributedDrift`）の両方がこの集合を読む。
+      Fullscreen: Set<WindowId>
       /// `MoveCause.Unattributed`のドリフト検知が比べる基準（v2.70、Opus敵対的レビュー
       /// `opus-review-unattributed-movecause.md` §B-1）。「今の意図について最後に受け入れた観測」——
       /// `Desired`と比べてはいけない理由：`Mismatch → Reevaluate`（v2.42）後は`Desired`が目標のまま
@@ -403,6 +408,7 @@ let initial: PlacementState =
       DpiBehavior = Map.empty
       DpiCrossing = Map.empty
       Dragging = Set.empty
+      Fullscreen = Set.empty
       Accepted = Map.empty
       DriftCorrections = Map.empty
       FrameInsets = Map.empty }
@@ -599,6 +605,48 @@ let onWindowObserved (now: int64) (snapshot: WindowSnapshot) (state: PlacementSt
     let pendingPresenceState, pendingPresenceTimerCmds = checkPendingPresenceSatisfied w pendingState
     pendingPresenceState, effects, timerCmds @ pendingTimerCmds @ pendingPresenceTimerCmds
 
+// Win32のウィンドウスタイルビット（E-4全画面検出、opus-review-fullscreen-detection-round2.md §3-C）。
+// Coreは`Wm.Windows.Native`に依存できない（§17の依存方向、ADR-018）ので、生の数値をここに複製する——
+// `src/Wm.Windows/Native.fs`のGWL_STYLE/WS_CAPTION/WS_THICKFRAMEと同じ値（winuser.hの公開済み定数）。
+let private WS_CAPTION = 0x00C00000
+let private WS_THICKFRAME = 0x00040000
+
+/// E-4全画面検出（opus-review-fullscreen-detection-round2.md §1、§0の訂正を反映）：`WindowSnapshot`
+/// から1回だけ判定し、結果を`PlacementState.Fullscreen`へ書く——`GeometryBeliefs.NativeRect`は
+/// 一度も更新されない信念（ファイル冒頭の`reviseGeometryFromSnapshot`型直前のコメント参照）なので、
+/// 消費側で信念を読んで比較する設計は常にfalseになる誤りだった（第1ラウンドレビューの設計案の誤り）。
+/// `monitorBounds`は`dpiOf`と同じ形の読み取り専用投影（`WmState.step`が`state.Topology`から作って
+/// 渡す、ADR-018）。`screenPhaseIsStable`はTopologyが`Stable`かどうか（`checkUnattributedDrift`の
+/// 呼び出し元と同じ式）。
+///
+/// 更新規則（§1-4、前回レビューの1-A/1-Fをここで解決する）：
+/// 1. `snapshot.NativeRect`と`snapshot.Style`の両方が`Some { Value = Ok _ }`でなければ何もしない
+///    （部分観測では状態を変えない、1-D「同じスナップショット内の対」と同じ考え方）。
+/// 2. `snapshot.IsMinimized`（信念ではなくスナップショット自身の値）が`Some { Value = Ok true }`
+///    なら何もしない——最小化中の矩形（-32000付近）やその前後の過渡的な観測で誤って全画面を
+///    解除/確定させない。`observeWindow`は矩形と同じ呼出でIsIconicも問い合わせるため、
+///    S24/S25が見つけたMINIMIZESTARTとLOCATIONCHANGEの到着順の揺れの影響を受けない。
+/// 3. 全画面に見える（ボーダレス ∧ いずれかのモニターのBoundsと矩形が一致）なら、`Stable`か
+///    どうかに関わらず集合へ加える（入る方向は不安定な画面構成変化中でも信じてよい）。
+/// 4. 全画面に見えないなら、`screenPhaseIsStable`のときだけ集合から外す（前回1-F：解像度変更中は
+///    古いBoundsと比べて誤って解除しないため、Stableになるまで保つ）。
+let checkFullscreen (monitorBounds: PixelRect list) (screenPhaseIsStable: bool) (snapshot: WindowSnapshot) (state: PlacementState) : PlacementState =
+    let w = snapshot.Id
+    match snapshot.IsMinimized with
+    | Some { Value = Ok true } -> state
+    | _ ->
+        match snapshot.NativeRect, snapshot.Style with
+        | Some { Value = Ok rect }, Some { Value = Ok style } ->
+            let borderless = (style &&& (WS_CAPTION ||| WS_THICKFRAME)) = 0
+            let looksFullscreen = borderless && monitorBounds |> List.exists (fun b -> b = rect)
+            if looksFullscreen then
+                { state with Fullscreen = Set.add w state.Fullscreen }
+            elif screenPhaseIsStable then
+                { state with Fullscreen = Set.remove w state.Fullscreen }
+            else
+                state
+        | _ -> state
+
 /// §4.5「DPIの振る舞い」の2段目自己リサイズによる修正（v2.45）：`onWindowObserved`が終わった直後に
 /// `WmState.step`が呼ぶ（`dpiOf`は他ドメインの状態を直接読まないための読み取り専用の投影、
 /// `MinWidth`の型直前のコメントと同じ考え方、ADR-018）。架空のタイマーは設けない最小実装——
@@ -693,7 +741,7 @@ let checkUnattributedDrift
     (state: PlacementState)
     : PlacementState * bool * bool =
     let isMinimized = Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.IsMinimized) |> Option.defaultValue false
-    if not screenPhaseIsStable || not (isTiled w) || (state.Pending |> Map.exists (fun _ pr -> pr.Window = w)) || Set.contains w state.Dragging || isMinimized then
+    if not screenPhaseIsStable || not (isTiled w) || (state.Pending |> Map.exists (fun _ pr -> pr.Window = w)) || Set.contains w state.Dragging || Set.contains w state.Fullscreen || isMinimized then
         state, false, false
     else
         match Map.tryFind w state.Accepted, Map.tryFind w state.Geometry |> Option.bind (fun g -> LatestWins.value g.Monitor), desiredMonitorOf w with
@@ -1124,6 +1172,16 @@ let onPendingDeadlineTimerFired
             Pending = Map.remove rid state.Pending
             RetryAttempts = Map.remove pr.Window state.RetryAttempts },
         [], [], []
+    | Some pr when awaitDeadline (Some pr.Deadline) now && Set.contains pr.Window state.Fullscreen ->
+        // 「全画面」の除外（v2.128、E-4、opus-review-fullscreen-detection-round2.md §2-2③）：
+        // 条件5・6と同じ理由でMismatch証拠にもTimeoutのRetry対象にもしない。ここで止めないと、
+        // モニター全幅の観測が`MinWidth`の証拠として記録され（§1-B）、全画面を抜けた後もPolicyの
+        // `MinWidthAtLeast`やLayoutがその値を読み続けてしまう。v2.121の自己修復（この分岐より後の
+        // `match`内）も同じ理由でこの1分岐で一緒に止まる。
+        { state with
+            Pending = Map.remove rid state.Pending
+            RetryAttempts = Map.remove pr.Window state.RetryAttempts },
+        [], [], []
     | Some pr when awaitDeadline (Some pr.Deadline) now ->
         match tryMismatchObservation pr state with
         | Some (observed, valueSeq) ->
@@ -1419,6 +1477,7 @@ let onWindowVanished (w: WindowId) (state: PlacementState) : PlacementState * Ti
         DpiBehavior = Map.remove w state.DpiBehavior
         DpiCrossing = Map.remove w state.DpiCrossing
         Dragging = Set.remove w state.Dragging
+        Fullscreen = Set.remove w state.Fullscreen
         Accepted = Map.remove w state.Accepted
         DriftCorrections = Map.remove w state.DriftCorrections
         FrameInsets = Map.remove w state.FrameInsets },

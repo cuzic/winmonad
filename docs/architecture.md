@@ -2467,6 +2467,7 @@ type GateRejection =
     | TargetNotMovable of WindowId // v2.6で追加（ADR-015）。NotMovableと信じている窓へのSetRect/RestoreBeforeMove。Reconcilerは本来これを生成しない（最終防衛線）
     | TargetBelievedHung of WindowId // v2.6で追加（R4-23）。Hungと信じている窓へのSetRect/RestoreBeforeMove/RequestForeground
     | TargetHiddenByWm of WindowId   // v2.6で追加（R4-6）。WMが隠している窓へのSetRect/RequestForeground
+    | TargetFullscreen of WindowId   // v2.128で追加（E-4、opus-review-fullscreen-detection-round2.md §2-1）。全画面と判定された窓へのSetRect/RestoreBeforeMove
 
 type GatedEffect = internal GatedEffect of Effect
 module GatedEffect =
@@ -2491,6 +2492,7 @@ module GatedEffect =
 | `TargetNotMovable` | 適用 | 適用しない | 適用しない | 適用しない |
 | `TargetBelievedHung` | 適用 | 適用 | 適用しない（ハング窓も隠す必要があり、`ShowWindowAsync`系で非同期に出す） | 適用しない（`Reprobe`はハング解除の唯一の経路） |
 | `TargetHiddenByWm` | 適用 | 適用 | 適用しない | 適用しない |
+| `TargetFullscreen` | 適用 | 適用しない（全画面の窓を前面に出すのは妨げない） | 適用しない（ワークスペース切替での隠す/見せるは妨げない） | 適用しない（再probeは妨げない） |
 
 `RequestClose`（7.1）は`RequestForeground`の列と同じ扱いにする（ただし`TargetBelievedHung`は適用しない。ハングした窓を閉じたいのはユーザーの正当な要求であり、`WM_CLOSE`の送信は非同期で呼出側をブロックしない）。観測系のEffectにほとんどの拒否理由を適用しないのは、ExcludedやSuspendedの窓の再probeを止めると「属性が変われば再分類するために信念を持ち続ける」（4.4）が死文化するからである。
 

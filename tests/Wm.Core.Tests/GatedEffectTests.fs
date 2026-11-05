@@ -32,7 +32,8 @@ let private cleanInput =
       NotMovable = Set.empty
       Hung = Set.empty
       HiddenByWm = Set.empty
-      NeedsRestore = Set.empty }
+      NeedsRestore = Set.empty
+      Fullscreen = Set.empty }
 
 let private passes (input: GateInput) (e: Effect) =
     let ok, rejected = GatedEffect.gate input [ e ]

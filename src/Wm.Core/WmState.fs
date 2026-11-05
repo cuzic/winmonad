@@ -295,6 +295,17 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             // （Placement.fsの型直前のコメント参照）。
             let oldMonitor = Map.tryFind snapshot.Id stateAfterWindows.Placement.Geometry |> Option.bind (fun g -> LatestWins.value g.Monitor)
             let s, e, t = Placement.onWindowObserved now snapshot stateAfterWindows.Placement
+            // `checkFullscreen`（E-4、v2.128）：`checkDpiCrossing`と同じ理由で`dpiOf`の隣に置く
+            // 読み取り専用投影（`state.Topology`はこの入力ではまだ更新されていない、`dpiOf`の型直前の
+            // コメントと同じ正当化）。`checkDpiCrossing`より前に置く——後で`checkDpiCrossing`側が
+            // `Fullscreen`を読むようになったとき、この観測で更新済みの値を読めるようにするため
+            // （opus-review-fullscreen-detection-round2.md §1-1）。
+            let monitorBounds =
+                match Topology.displays state.Topology with
+                | NoMonitors -> []
+                | Displays (current, visible) -> (current :: visible) |> List.map (fun sc -> sc.Monitor.Bounds)
+            let screenPhaseIsStable = match Topology.phase state.Topology with Stable -> true | _ -> false
+            let s = Placement.checkFullscreen monitorBounds screenPhaseIsStable snapshot s
             let s = Placement.checkDpiCrossing now dpiOf snapshot.Id oldMonitor s
             s, e, t, None, []
         | MinimizedStateChanged (w, obs) -> Placement.onMinimizedStateChanged now w obs stateAfterWindows.Placement, [], [], None, []
@@ -896,7 +907,8 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
             |> Map.toSeq
             |> Seq.filter (fun (_, g) -> LatestWins.value g.IsMaximized = Some true)
             |> Seq.map fst
-            |> Set.ofSeq }
+            |> Set.ofSeq
+          Fullscreen = next.Placement.Fullscreen }
 
     let gated, rejected = GatedEffect.gate gateInput (reuseForgetEffects @ topologyResponse.Actions @ placementEffects @ healthEffects @ reconcileEffects @ moveFocusedEffects @ presenceEffects @ switchForegroundEffects @ focusRotateEffects @ closeFocusedEffects @ focusMostRecentEffects @ switchSettleReRequestEffects)
 
