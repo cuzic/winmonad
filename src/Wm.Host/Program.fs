@@ -133,7 +133,15 @@ let private runRound14Child () =
             Thread.Sleep(20)
         printfn "HWND=%d" (int64 form.Handle)
         Console.Out.Flush()
-        Thread.Sleep(15000)
+        // `Thread.Sleep`だけでは止まる——`SetWindowPos`/`SWP_ASYNCWINDOWPOS`はキューへ投函する
+        // だけなので、対象窓の持ち主スレッド（この子プロセスのこのスレッド）が実際にポンプし
+        // 続けないと親が動かした結果が一切反映されない（S26スパイクの型直前のコメントと同じ地雷。
+        // 初版はここで`Thread.Sleep(15000)`にしてしまい、Round 14がrawTrackedEvents=0で実際に
+        // 失敗した——ハング耐性のための非同期呼出だからこそポンプが要る、という教訓）。
+        let deadline = Environment.TickCount64 + 15000L
+        while Environment.TickCount64 < deadline do
+            Application.DoEvents()
+            Thread.Sleep(10)
     with ex ->
         printfn "ERROR=%s" (ex.Message.Replace("\n", " ").Replace("\r", ""))
         Console.Out.Flush()
