@@ -71,6 +71,7 @@ open System
 open System.Collections.Concurrent
 open System.Diagnostics
 open System.IO
+open System.Runtime.InteropServices
 open System.Threading
 open System.Windows.Forms
 open Wm.Contracts.Identifiers
@@ -708,6 +709,88 @@ let main _argv =
         watchdog2Triggered minimizedAfterRecovery trackedAfterRecovery watchdog2Entries.Length
     printfn "Watchdog restored the last-hidden window on its own, without Core ever being told to: %b"
         (watchdog2Triggered && not minimizedAfterRecovery && not trackedAfterRecovery)
+
+    // 段9：ラウンド13。v2.122の3-B再発行ループ対策（`dispatchPlacements`の`alreadyAtTarget`
+    // ショートカット、Placement.fsの型直前のコメント参照）の実際の発火条件——「発見時点で既に
+    // 窓がTargetどおりの位置にある」——を実機で再現する。既存のラウンド3〜12は毎回新しいテスト窓を
+    // 任意の初期位置に作るため、この条件を自然には再現できない（v2.122実装時に明記した既知の未検証
+    // ギャップ）。ここでは、テスト窓をCoreへ発見させる前に、実際にOSへ問い合わせたinset（S21と同じ
+    // 手法：GetWindowRectとDwmGetWindowAttributeの差）で逆算した位置へ`SetWindowPos`で動かし、
+    // VisibleFrameRectが目標（この1枚だけのTiled窓ならMonocleが計算するWorkArea全体）と完全に一致する
+    // ことを確認してから、初めて`RawFirstSeen`を投入する——実機の`observeWindow`はこの時点で
+    // NativeRect/VisibleFrameRectの対を一度に問い合わせる（v2.122/v2.123で読み取りから確認済みの
+    // 事実）ので、`FrameInsets`も`alreadyAtTarget`の判定も同じ発見イベントの中で揃う。
+    printfn "\n--- Round 13: already-at-target discovery dispatches zero SetRect (v2.122 3-B fix) ---"
+    let journalPath13 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round13-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    printfn "Round 13 journal: %s" journalPath13
+    let reducer13 = Reducer(RuntimePolicy.defaults, "phase-b-round13", "wm-host-round13", "no-policy-artifact", Some journalPath13)
+    let mutable dispatchedCount13 = 0
+    let mutable skippedCount13 = 0
+    let harness13 =
+        EffectHarness(
+            reducer13, liveNow,
+            onDispatch = (fun e _ -> Interlocked.Increment(&dispatchedCount13) |> ignore; printfn "  [round13] UNEXPECTED dispatch: %A" e),
+            onSkip = (fun () -> Interlocked.Increment(&skippedCount13) |> ignore))
+    let submit13 = harness13.Submit
+    let pump13 (ms: int) = harness13.Pump ms
+
+    submit13 (liveNow ()) "wm-host" (MonitorTopologyObserved monitors) |> ignore
+    pump13 500
+
+    use testForm13 = new Form(Text = "wm-host-round13-test-window", Width = 300, Height = 200)
+    testForm13.Show()
+    pump13 300
+    let hwnd13 = testForm13.Handle
+
+    // Monocle（既定Layout）が1枚のTiled窓に計算するTargetは、プライマリモニターのWorkArea全体
+    // （ラウンド3と同じ前提）。
+    let primaryMonitor = monitors |> List.find (fun m -> m.IsPrimary)
+    let target = primaryMonitor.WorkArea
+
+    let readNative (hwnd: IntPtr) : RECT option =
+        let mutable r = RECT()
+        if GetWindowRect(hwnd, &r) then Some r else None
+    let readVisible (hwnd: IntPtr) : RECT option =
+        let mutable r = RECT()
+        let hr = DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &r, Marshal.SizeOf(typeof<RECT>))
+        if hr = 0 then Some r else None
+
+    match readNative hwnd13, readVisible hwnd13 with
+    | Some native0, Some visible0 ->
+        // S21/S26と同じ手法：今の位置でのシャドウ（不可視リサイズ枠）を測り、そのシャドウぶんだけ
+        // 外側へ広げた位置へ動かせば、VisibleFrameRectがちょうどtargetに一致するはず。
+        let shadowL = visible0.Left - native0.Left
+        let shadowT = visible0.Top - native0.Top
+        let shadowR = native0.Right - visible0.Right
+        let shadowB = native0.Bottom - visible0.Bottom
+        let callX = target.X - shadowL
+        let callY = target.Y - shadowT
+        let callW = target.Width + shadowL + shadowR
+        let callH = target.Height + shadowT + shadowB
+        SetWindowPos(hwnd13, IntPtr.Zero, callX, callY, callW, callH, SWP_NOZORDER) |> ignore
+        pump13 300
+
+        match readVisible hwnd13 with
+        | Some visibleAfter when
+            visibleAfter.Left = target.X && visibleAfter.Top = target.Y
+            && visibleAfter.Right - visibleAfter.Left = target.Width && visibleAfter.Bottom - visibleAfter.Top = target.Height ->
+            printfn "  pre-positioned test window: VisibleFrameRect now exactly matches target=%A (sanity check passed)" target
+            submit13 (liveNow ()) "wm-host" (RawFirstSeen (observeWindow (liveNow ()) monitorHandles titleMatcher hwnd13) |> normalize |> List.exactlyOne) |> ignore
+            pump13 1500 // 分類・Reconcileに十分な余裕を取る（ラウンド3と同じ）
+
+            let testWindowId13 = WindowId (hwnd13.ToInt64())
+            let pending13 = Map.count reducer13.State.Placement.Pending
+            let movability13 = Map.tryFind testWindowId13 reducer13.State.Placement.Movability
+            printfn "Round 13 summary: dispatched=%d skipped(no handler)=%d Pending=%d Movability=%A" dispatchedCount13 skippedCount13 pending13 movability13
+            let passed = dispatchedCount13 = 0 && skippedCount13 = 0 && pending13 = 0
+            printfn "Round 13 PASSED (zero SetRect dispatched for an already-at-target discovery): %b" passed
+        | other ->
+            printfn "  pre-positioning failed, VisibleFrameRect after SetWindowPos=%A (expected exact match with target=%A) -- skipping Round 13's actual check" other target
+
+    | _ -> printfn "  could not read this window's NativeRect/DWM frame -- skipping Round 13"
+
+    harness13.Stop()
+    testForm13.Close()
 
     printfn "\nDone."
     0
