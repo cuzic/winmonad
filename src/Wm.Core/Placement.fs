@@ -292,7 +292,13 @@ type PendingRequest =
       /// 新しいEpochを作るときは常に`false`から始まる（新しい意図には改めて1回試す価値がある）。
       /// `retryOrGiveUp`は同じEpochのTimeout再試行なので`{ pr with ... }`でそのまま引き継ぐ
       /// （リセットしない）。`RetryAttempts`（Timeout専用の別予算）とは共有しない。
-      InsetHealed: bool }
+      InsetHealed: bool
+      /// このPendingの発行先モニター（v2.123、Opusレビュー論点1-F対策）。`dispatchPlacements`が
+      /// `LayoutContext.Monitor`（このReconcileが対象とするモニター）から記録し、`correctedDispatchTarget`
+      /// が「`FrameInset`信念のモニターと発行先モニターが一致するか」を確認するのに使う——異なる
+      /// モニターで測ったinset（別のDPIかもしれない）をそのまま使い回さない。`retryOrGiveUp`は同じ
+      /// 目標への再試行なので`{ pr with ... }`でそのまま引き継ぐ。
+      TargetMonitor: MonitorId }
 
 /// `PendingRequest`と同じ考え方（§7.2「待ちをデータで表す」）を`SetPresence`へ適用した最小形
 /// （v2.41新設、ファイル冒頭「`SetPresence`の観測による確認」参照）。`Epoch`/`Retry`は持たない——
@@ -751,17 +757,6 @@ let onIntegrityReprobeTimerFired (now: int64) (w: WindowId) (state: PlacementSta
 
 // ===== §7.1段⑦「Reconcile」：Layout呼び出し→PlanValidator→差分のSetRect発行 =====
 
-/// `desired`（望ましい可視矩形）を、窓に`FrameInset`の信念があれば、各辺だけ外側へ広げた
-/// 「ネイティブ矩形としての補正済みターゲット」に変換する——これを`SetRect`へ渡せば、OSが不可視
-/// リサイズ枠を適用した後の`VisibleFrameRect`が`desired`に一致するはず（実機で確認済み、
-/// architecture.md v2.112）。信念が無い窓（発見直後で観測が1回も無い等）は無補正のまま返す——
-/// 机上で既定値を仮定せず、実測が無ければ補正しない（§4.5の規律と同じ）。
-/// **既知の未対応（Opusレビュー論点1-F）**：`FrameInset.Monitor`は観測時のモニターを記録している
-/// だけで、ここではその窓の「発行先」モニターと一致するかを一切確認していない——異なるDPIの
-/// モニターへ移った直後の最初の発行には、古いDPIで測ったinsetがそのまま使われてしまう
-/// （`dispatchPlacements`/`retryOrGiveUp`はどちらも`dpiOf`を受け取らないため、今は確認する手段が
-/// 無い）。実測で確認できるまでは「別モニターでも同じinsetを試す」という楽観的な単純化のまま
-/// にする——§21「不可視リサイズ枠の補正方式」に記録済みの残課題。
 /// 「望ましい可視矩形」を`inset`分だけ外側へ広げ、SetRectへ渡すネイティブ矩形にする純粋変換。
 /// `correctedDispatchTarget`（発行時、insetは`Map`から引く）と`onPendingDeadlineTimerFired`の
 /// `FrameInset`自己修復（発行後、insetは`pr.DispatchedInset`/今の信念そのもの）の両方が同じ変換を
@@ -774,10 +769,22 @@ let private expandByInset (visible: PixelRect) (inset: FrameInset) : PixelRect =
       Width = visible.Width + inset.Left + inset.Right
       Height = visible.Height + inset.Top + inset.Bottom }
 
-let private correctedDispatchTarget (w: WindowId) (desired: PixelRect) (insets: Map<WindowId, FrameInset>) : PixelRect =
+/// `desired`（望ましい可視矩形）を、窓に`FrameInset`の信念があれば、各辺だけ外側へ広げた
+/// 「ネイティブ矩形としての補正済みターゲット」に変換する——これを`SetRect`へ渡せば、OSが不可視
+/// リサイズ枠を適用した後の`VisibleFrameRect`が`desired`に一致するはず（実機で確認済み、
+/// architecture.md v2.112）。信念が無い窓（発見直後で観測が1回も無い等）は無補正のまま返す——
+/// 机上で既定値を仮定せず、実測が無ければ補正しない（§4.5の規律と同じ）。
+/// **v2.123でOpusレビュー論点1-Fに対処**：`targetMonitor`（このPendingの発行先モニター、
+/// `dispatchPlacements`では`LayoutContext.Monitor`、`retryOrGiveUp`では`pr.TargetMonitor`）と
+/// `FrameInset.Monitor`（その信念を測った観測時のモニター）が一致しない場合は、信念が無い場合と
+/// 同じく無補正のまま返す——異なるモニター（別のDPIかもしれない）で測ったinsetを、確認せずそのまま
+/// 使い回さない。モニター間を移動した直後の窓は、移動後のモニターで新しい観測が得られるまで
+/// 無補正の発行に戻る（これはv2.121の自己修復が後から拾える——`onPendingDeadlineTimerFired`の
+/// 自己修復判定も同じモニター一致チェックを行う、型直前のコメント参照）。
+let private correctedDispatchTarget (w: WindowId) (desired: PixelRect) (targetMonitor: MonitorId) (insets: Map<WindowId, FrameInset>) : PixelRect =
     match Map.tryFind w insets with
-    | None -> desired
-    | Some inset -> expandByInset desired inset
+    | Some inset when inset.Monitor = targetMonitor -> expandByInset desired inset
+    | _ -> desired
 
 /// `ValidatedPlan`の各配置について、`Desired`と異なる場合だけ`SetRect`を発行し新しいPendingを作る
 /// （§7.3「未完了の同一Targetへの重複要求を発行しない」）。既存のPendingが同じ窓を指していれば、
@@ -796,7 +803,7 @@ let private correctedDispatchTarget (w: WindowId) (desired: PixelRect) (insets: 
 /// **v2.119で`retryOrGiveUp`にも同じ補正を配線した**（`onPendingDeadlineTimerFired`/
 /// `onEffectCallReturned`を3/4-タプルから4/5-タプルへ migrate、既存の呼び出し元
 /// 55箇所をsedで機械的に更新——v2.108の`reconcileWorkspace`3→4タプル移行と同じ手法）。
-let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: PlacementState) : PlacementState * Effect list * TimerCommand<TimerId> list * DecisionTrace list =
+let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (targetMonitor: MonitorId) (state: PlacementState) : PlacementState * Effect list * TimerCommand<TimerId> list * DecisionTrace list =
     ValidatedPlan.placements validated
     |> List.fold
         (fun (st: PlacementState, effects, cmds, traces) (p: Placement) ->
@@ -873,9 +880,12 @@ let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: P
                 let baseline = Map.tryFind p.Window st.Geometry |> Option.bind (fun g -> LatestWins.value g.VisibleFrameRect)
                 // `FrameInset`補正（v2.118、`correctedDispatchTarget`/`dispatchPlacements`の型直前の
                 // コメント参照）：使ったinset（あれば）を`PendingRequest.DispatchedInset`へ記録する
-                // （v2.120、MinWidthの過補正ガード対策、型直前のコメント参照）。
-                let usedInset = Map.tryFind p.Window st.FrameInsets
-                let dispatchTarget = correctedDispatchTarget p.Window p.Target st.FrameInsets
+                // （v2.120、MinWidthの過補正ガード対策、型直前のコメント参照）。v2.123：モニターが
+                // 一致しない信念は`correctedDispatchTarget`自身が無視するので、`DispatchedInset`に
+                // 記録する値も同じ条件で揃える（実際に適用した補正だけを記録する、という既存の約束
+                // を保つ）。
+                let usedInset = Map.tryFind p.Window st.FrameInsets |> Option.filter (fun i -> i.Monitor = targetMonitor)
+                let dispatchTarget = correctedDispatchTarget p.Window p.Target targetMonitor st.FrameInsets
                 let pendingRequest =
                     { Window = p.Window
                       Epoch = epoch'
@@ -885,7 +895,8 @@ let private dispatchPlacements (now: int64) (validated: ValidatedPlan) (state: P
                       DispatchSeq = None
                       Baseline = baseline
                       DispatchedInset = usedInset
-                      InsetHealed = false }
+                      InsetHealed = false
+                      TargetMonitor = targetMonitor }
                 let st' =
                     { st with
                         Desired = Map.add p.Window (Shown (Some p.Target)) st.Desired
@@ -948,7 +959,7 @@ let reconcileWorkspace
             | Ok placements -> Ok (validate { Context = c; Management = management; Alive = alive } placements)
         match attempt ctx with
         | Error layoutErr -> state, [], [], [ LayoutInvocationFailed (layoutRef.Id, layoutErr) ]
-        | Ok (Ok validated) -> let st, e, t, tr = dispatchPlacements now validated state in st, e, t, tr
+        | Ok (Ok validated) -> let st, e, t, tr = dispatchPlacements now validated ctx.Monitor state in st, e, t, tr
         | Ok (Error errors) ->
             match decide errors with
             | RejectWholePlan -> state, [], [], [ PlanRejected (layoutRef.Id, errors) ]
@@ -956,7 +967,7 @@ let reconcileWorkspace
                 // 検証時点で死亡/Excluded化していた窓を除いて1回だけ再計算する（PlanValidator.fsのdecide参照）。
                 let ctx' = { ctx with TiledWindows = ctx.TiledWindows |> List.filter (fun w -> not (Set.contains w.Id targets)) }
                 match attempt ctx' with
-                | Ok (Ok validated) -> let st, e, t, tr = dispatchPlacements now validated state in st, e, t, tr
+                | Ok (Ok validated) -> let st, e, t, tr = dispatchPlacements now validated ctx.Monitor state in st, e, t, tr
                 | Ok (Error errors2) -> state, [], [], [ PlanRejected (layoutRef.Id, errors2) ] // 再計算してもダメなら諦める
                 | Error layoutErr2 -> state, [], [], [ LayoutInvocationFailed (layoutRef.Id, layoutErr2) ]
 
@@ -983,9 +994,11 @@ let private retryOrGiveUp (now: int64) (rid: RequestId) (pr: PendingRequest) (st
         // 観測をMismatch判定に使ってしまう。`Baseline`（同じ目標への再試行なので）はそのまま引き継ぐ。
         // `dispatchPlacements`と同じ補正（v2.119、`correctedDispatchTarget`の型直前のコメント参照）。
         // `DispatchedInset`はこの再発行時点の信念で上書きする（v2.120）——前回発行時と信念が変わって
-        // いることもあるため、`pr`の古い値をそのまま引き継がない。
-        let usedInset = Map.tryFind pr.Window state.FrameInsets
-        let dispatchTarget = correctedDispatchTarget pr.Window pr.TargetRect state.FrameInsets
+        // いることもあるため、`pr`の古い値をそのまま引き継がない。発行先モニターは`pr.TargetMonitor`
+        // （元の発行時点のもの、v2.123）をそのまま使う——同じ目標への再試行であり、モニター自体は
+        // 変わっていない。
+        let usedInset = Map.tryFind pr.Window state.FrameInsets |> Option.filter (fun i -> i.Monitor = pr.TargetMonitor)
+        let dispatchTarget = correctedDispatchTarget pr.Window pr.TargetRect pr.TargetMonitor state.FrameInsets
         let retried = { pr with IssuedAt = now; Deadline = deadline; DispatchSeq = None; DispatchedInset = usedInset }
         let correctionTrace =
             if dispatchTarget <> pr.TargetRect then [ FrameInsetApplied (newRid, pr.TargetRect, dispatchTarget) ] else []
@@ -1137,12 +1150,18 @@ let onPendingDeadlineTimerFired
             // 確認済み（inset=0ではなく正しい値が`EVENT_OBJECT_CREATE`/`SW_RESTORE`直後から既に読める）
             // ——それでも発行時点のinset信念が無い/古いケース（モニター間移動直後、分断された読み取り
             // 等）はあるため、この自己修復自体は引き続き必要。
+            // v2.123：`cur.Monitor`（この信念を測った観測時のモニター）が`pr.TargetMonitor`（発行先
+            // モニター）と異なる場合も自己修復しない——`correctedDispatchTarget`自身のモニター一致
+            // チェック（論点1-F対策、型直前のコメント参照）と同じ理由で、別モニターのinsetを確認せず
+            // 使い回さない。モニター間移動直後はこの経路では直らず、移動後のモニターでの新しい観測を
+            // 待つ（それも揃えば通常どおりこの述語が成立する）。
             let frameInsetHeal =
                 if isMidDpiTransition || pr.InsetHealed then
                     None
                 else
                     match Map.tryFind pr.Window state.FrameInsets with
                     | None -> None
+                    | Some cur when cur.Monitor <> pr.TargetMonitor -> None
                     | Some cur ->
                         let differs =
                             match pr.DispatchedInset with

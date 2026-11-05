@@ -809,6 +809,7 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         let ctx: LayoutContext =
             { WorkArea = screen.Monitor.WorkArea
               Dpi = screen.Monitor.Dpi
+              Monitor = screen.Monitor.Id
               // v2.48：Placement.MinWidthの実際の信念を渡すようになった（それまでは決め打ちの`None`で、
               // LayoutFunction実装（MasterStack/Monocle）がそもそも読んでいないので観測可能な挙動は
               // 変わらない——§6.2が述べる「推定最小サイズをソフト制約として扱い、満たせない場合は

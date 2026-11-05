@@ -24,8 +24,11 @@ let private registry: Registry =
 let private monocleRef: LayoutRef = { Id = LayoutId "monocle"; ApiVersion = 1; Args = NoArgs }
 let private masterStackRef (ratio: decimal) : LayoutRef = { Id = LayoutId "master-stack"; ApiVersion = 1; Args = MasterRatio ratio }
 
+// `Monitor`はMonitorId 1L固定（v2.123、FrameInset系の既存テストが`m = MonitorId 1L`で`FrameInsets`を
+// 種付けしている前提と揃える——別の値にすると、それらのテストの補正が新設のモニター一致チェックで
+// 拒否されてしまう）。
 let private ctxWith (tiled: WindowId list) : LayoutContext =
-    { WorkArea = workArea; Dpi = 96; TiledWindows = tiled |> List.map (fun w -> { Id = w; MinWidthDip = None }); Focused = None }
+    { WorkArea = workArea; Dpi = 96; TiledWindows = tiled |> List.map (fun w -> { Id = w; MinWidthDip = None }); Focused = None; Monitor = MonitorId 1L }
 
 let private aliveOf (ws: WindowId list) : Set<WindowId> = Set.ofList ws
 let private managementOf (ws: WindowId list) : Map<WindowId, EffectiveManagement> = ws |> List.map (fun w -> w, EffTiled) |> Map.ofList
@@ -292,7 +295,8 @@ let ``PendingDeadline満了の再発行(retryOrGiveUp)もFrameInsetで補正し�
     let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
     let rid0 = afterReconcile.Pending |> Map.toSeq |> Seq.head |> fst
     // pad2py-pad-host実機（v2.112）で実測した不可視リサイズ枠：X+7/Width-14/Height-7/Y不変。
-    let inset: FrameInset = { Left = 7; Top = 0; Right = 7; Bottom = 7; Monitor = MonitorId 0L }
+    // Monitorは`ctxWith`の発行先（MonitorId 1L）と一致させる（v2.123のモニター一致チェック対策）。
+    let inset: FrameInset = { Left = 7; Top = 0; Right = 7; Bottom = 7; Monitor = MonitorId 1L }
     let seeded = { afterReconcile with FrameInsets = Map.add w inset afterReconcile.FrameInsets }
     let afterRetry1, effects1, _, traces1 = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid0 noDpi seeded
     let rid1 = afterRetry1.Pending |> Map.toSeq |> Seq.head |> fst
@@ -1042,6 +1046,47 @@ let ``inset差では説明できないMismatch(アプリ自身の制約等)は�
     | Some { Value = v; Confidence = Inferred _ } -> Assert.Equal(workArea.Width + 100, v) // MinWidthの証拠は採る
     | other -> Assert.True(false, sprintf "expected an Inferred MinWidth belief, got %A" other)
 
+// ===== モニター不一致時の補正拒否（v2.123、Opus敵対的レビュー`opus-review-frame-inset.md`論点1-F対策） =====
+//
+// `FrameInset`信念の`Monitor`（観測時のモニター）と、このPendingの発行先モニター
+// （`ctxWith`は`MonitorId 1L`固定）が一致しない場合、`correctedDispatchTarget`も自己修復の述語も
+// その信念を「無い」ものとして扱う——別モニター（別のDPIかもしれない）で測ったinsetを確認せず
+// 使い回さない。
+
+[<Fact>]
+let ``FrameInset信念のモニターと発行先モニターが異なる場合、dispatchPlacementsは補正を適用しない(v2.123)`` () =
+    let w = WindowId 1L
+    let insetWrongMonitor: FrameInset = { Left = 7; Top = 0; Right = 7; Bottom = 7; Monitor = MonitorId 99L }
+    let seeded = { initial with FrameInsets = Map.ofList [ w, insetWrongMonitor ] }
+    let afterReconcile, effects, _, traces = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) seeded
+    Assert.Equal<Effect list>([ SetRect (RequestId 0L, w, workArea) ], effects) // 無補正(ネイティブ=望ましい可視矩形そのまま)
+    Assert.Empty(traces) // FrameInsetAppliedも積まない(信念が無い場合と同じ扱い)
+    let rid = pendingRidFor afterReconcile w
+    Assert.Equal(None, Map.tryFind rid afterReconcile.Pending |> Option.bind (fun pr -> pr.DispatchedInset))
+
+[<Fact>]
+let ``FrameInset自己修復も、信念のモニターが発行先と異なる場合は発火せず通常のReevaluateに落ちる(v2.123)`` () =
+    let w = WindowId 1L
+    let wrongMonitor = MonitorId 99L
+    let insetWrongMonitor: FrameInset = { Left = 7; Top = 0; Right = 7; Bottom = 7; Monitor = wrongMonitor }
+    // 発行時点ではinset信念が無いので無補正で発行される(ctxWithの発行先はMonitorId 1L)。
+    let afterReconcile, _, _, _ = reconcileWorkspace 10L registry monocleRef (ctxWith [ w ]) (managementOf [ w ]) (aliveOf [ w ]) initial
+    let rid = pendingRidFor afterReconcile w
+    let afterDispatched, _, _, _, _ = onEffectCallReturned 11L 2L rid (Ok ()) (Some 5L) afterReconcile
+    // 観測は、モニター一致チェックが無ければ自己修復の等式を満たすように作る(前の`v2.121`テストと
+    // 同じ算術)——ただし今回はこの観測自体が別モニター(wrongMonitor)からの対として学習される。
+    let visibleObserved =
+        { X = workArea.X + insetWrongMonitor.Left
+          Y = workArea.Y + insetWrongMonitor.Top
+          Width = workArea.Width - insetWrongMonitor.Left - insetWrongMonitor.Right
+          Height = workArea.Height - insetWrongMonitor.Top - insetWrongMonitor.Bottom }
+    let afterObserved, _, _ = onWindowObserved 20L (observedPairSnapshotWithMonitor w workArea visibleObserved wrongMonitor 10L) afterDispatched
+    Assert.Equal(Some insetWrongMonitor, Map.tryFind w afterObserved.FrameInsets) // insetそのものは学習される
+    let afterDeadline, effects, _, _ = onPendingDeadlineTimerFired (10L + pendingDeadlineMs) rid noDpi afterObserved
+    Assert.Empty(effects) // モニター不一致のため自己修復は発火しない
+    Assert.Empty(afterDeadline.Pending)
+    Assert.Equal(Some visibleObserved, Map.tryFind w afterDeadline.Accepted) // 通常のReevaluateに落ちる
+
 [<Fact>]
 let ``DpiBehavior=RescalesItselfで2段目リサイズ待ち中(DpiCrossing未決着)のMismatchはMinWidthの証拠にしない(v2.45)`` () =
     let w = WindowId 1L
@@ -1343,7 +1388,8 @@ let ``checkUnattributedDriftはPendingが残っている窓には作用しない
           DispatchSeq = None
           Baseline = None
           DispatchedInset = None
-          InsetHealed = false }
+          InsetHealed = false
+          TargetMonitor = m1 }
     let afterMoved = { afterMoved0 with Pending = Map.ofList [ RequestId 999L, artificialPending ] }
     let afterDrift, corrected, _ = checkUnattributedDrift 30L isTiledTrue (fun _ -> Some m0) alwaysStable w afterMoved
     Assert.False(corrected)

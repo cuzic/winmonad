@@ -17,4 +17,4 @@ let mkTiledWindows (count: int) : LayoutWindow list =
     [ for i in 0 .. (abs count % 9) - 1 -> { Id = WindowId (int64 i); MinWidthDip = None } ]
 
 let mkContext (workArea: PixelRect) (tiled: LayoutWindow list) : LayoutContext =
-    { WorkArea = workArea; Dpi = 96; TiledWindows = tiled; Focused = None }
+    { WorkArea = workArea; Dpi = 96; TiledWindows = tiled; Focused = None; Monitor = MonitorId 0L }

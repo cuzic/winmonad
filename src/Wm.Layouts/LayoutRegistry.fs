@@ -12,6 +12,10 @@ type LayoutContext = {
     TiledWindows: LayoutWindow list
     /// このWorkspaceのzipperのFocusがTiledの窓ならSome（R3-3）。
     Focused: WindowId option
+    /// このReconcileが対象とするモニター（v2.123、Core.Placementが`FrameInset`補正の論点1-F
+    /// ——別モニターで測ったinsetを別のDPIのモニターへそのまま使い回さない——を判定するために使う。
+    /// 現在のLayout関数実装（Monocle/MasterStack）はまだこのフィールドを読んでいない。
+    Monitor: MonitorId
 }
 
 /// Layoutが読む信念だけを集めた、その場で組み立てる読み取り専用の投影（状態として保存しない）。
