@@ -223,14 +223,20 @@ Tiled判定されてしまう（診断ログには既にSetRectの計算結果�
 これらは`TitleMatches`/`AppIdentity`の信念が`Unformed`のままだと`Unknown`（`AwaitingEvidence`）に
 留まり、期限超過で`Floating`へ劣化するだけで安全な`Excluded`にはならないと判明したため、
 この場では採用しなかった（Title/AppIdentityの実観測配線は別の独立した課題として持ち越す）。
-**v2.125、エージェントの自己判断として記録（2026-11-05時点ではプロジェクトオーナーの確認を得ていない
-——読み取り専用の調査を依頼したエージェントが権限を越えて書き込んだもので、以下は実際の製品判断
-ではなく、調査結果から導いた「あり得る方向性」の素案に過ぎない。正式な製品判断は別途行う）**：
-分類未確定時に`Excluded`相当の新しい安全弁を設計する必要があるか、既存の「期限超過で`Floating`へ
-劣化する」という振る舞いのままでよいか（Floatingは窓を動かさないので実害は無いという見立て）は
-未決。具体的なデフォルト`WindowRules`（どのアプリをTiled/Floating/Excludedにするか）も未決——
-机上で決めるのではなく、開発者自身の実機（Phase 0が元々意図した「普段使う10〜15個の実アプリ」の
-方針、§18）で実際のアプリ一覧を洗い出してから決める、という進め方の案がある。
+**v2.125時点では未決だったが、2026-11-05に実際のユーザーへ`AskUserQuestion`で直接確認し、WindowRules
+製品判断として確定した**（v2.125時点の「エージェントの自己判断」という誤った確認済み表記は既に
+訂正済み——project_windowrules_product_decision.md参照）。確定した内容：(1) 分類未確定時は既存の
+「期限超過で`Floating`へ劣化する」挙動を恒久仕様として維持し、`Excluded`相当の新しい安全弁は追加
+しない。(2) 具体的なデフォルト`WindowRules`は、机上ではなく`dragonflyg4`（ユーザー自身の日常使用PC）
+の実機棚卸しから作る方針で決め、Phase B round 1＋独自の`EnumWindows`列挙（可視トップレベル窓24件）を
+実行、結果を`PolicyIR.recommendedWindowRules`（`src/Wm.Policy/PolicyTypes.fs`、コミット`ba448b1`）
+へ実装・テスト済み：`explorer.exe`（デスクトップシェル）と`TextInputHost.exe`（IME候補窓）を
+`Excluded`、パスに依存しない`DialogIs true`を`Floating`という一般則。個人固有のアプリ
+（Herdr/iTop Screen Recorder/LINE/Zoom/PowerToys.QuickAccess/Microsoft.CmdPal.UI等）は意図的に
+一般化せず除外した。**`PolicyIR.defaults`/`RuntimePolicy.defaults`へはまだ配線していない**——
+これらは`PolicyActivated`配線（Phase C）が無い間の「ルール無しの安全な空既定値」という別の役割を
+持ち、既存の多数のテストがそれに依存しているため、実際にデフォルトとして有効化するのはPhase Cの
+Policy活性化・pin機構の仕事として残した。
 代わりに、ラウンド3の実際のEffect発行は**隔離された別の`Reducer`インスタンスと、自分で作った
 使い捨てのテスト窓だけ**を対象にした——spikes/Phase0CiSpikes/Program.fsのS2/S2c/S4が実際に
 `SetWindowPos`/`SetForegroundWindow`を呼ぶときも常に自分で作った`Form`/子プロセスだけが
