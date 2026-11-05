@@ -223,6 +223,12 @@ Tiled判定されてしまう（診断ログには既にSetRectの計算結果�
 これらは`TitleMatches`/`AppIdentity`の信念が`Unformed`のままだと`Unknown`（`AwaitingEvidence`）に
 留まり、期限超過で`Floating`へ劣化するだけで安全な`Excluded`にはならないと判明したため、
 この場では採用しなかった（Title/AppIdentityの実観測配線は別の独立した課題として持ち越す）。
+**v2.125でプロジェクトオーナー確認済み（製品判断）**：分類未確定時に`Excluded`相当の新しい安全弁を
+設計する必要は無い——既存の「期限超過で`Floating`へ劣化する」という振る舞いのままで良いと確認した
+（Floatingは窓を動かさないので実害が無い）。残る作業は実装ではなく調査：具体的なデフォルト
+`WindowRules`（どのアプリをTiled/Floating/Excludedにするか）は机上で決めず、開発者自身の実機
+（Phase 0が元々意図した「普段使う10〜15個の実アプリ」の方針、§18）で実際のアプリ一覧を洗い出して
+から決める。
 代わりに、ラウンド3の実際のEffect発行は**隔離された別の`Reducer`インスタンスと、自分で作った
 使い捨てのテスト窓だけ**を対象にした——spikes/Phase0CiSpikes/Program.fsのS2/S2c/S4が実際に
 `SetWindowPos`/`SetForegroundWindow`を呼ぶときも常に自分で作った`Form`/子プロセスだけが
