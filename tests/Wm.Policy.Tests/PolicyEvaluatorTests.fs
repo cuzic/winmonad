@@ -161,6 +161,36 @@ let ``同じPriorityはPolicyRuleIdの昇順で評価する`` () =
                   windowRule "a" 50 AnyWindow Floating ] }
     Assert.Equal(Resolved (Floating, Some (PolicyRuleId "a")), selectManagement emptyPatternSet emptyView policy)
 
+// ===== PolicyIR.recommendedWindowRules（WindowRules製品判断2026-11-05、dragonflyg4実機棚卸し由来） =====
+
+[<Fact>]
+let ``recommendedWindowRulesはexplorer.exe(デスクトップシェル)をExcludedにする`` () =
+    let patternSet = buildTitlePatternSet { basePolicy with WindowRules = PolicyIR.recommendedWindowRules }
+    let view = mkView { defaultIdentity with Exe = believed @"C:\Windows\explorer.exe" } (believed false) unformed unformed unformed
+    let policy = { basePolicy with WindowRules = PolicyIR.recommendedWindowRules }
+    Assert.Equal(Resolved (Excluded, Some (PolicyRuleId "exclude-desktop-shell")), selectManagement patternSet view policy)
+
+[<Fact>]
+let ``recommendedWindowRulesはTextInputHost.exe(IME候補窓)をExcludedにする`` () =
+    let patternSet = buildTitlePatternSet { basePolicy with WindowRules = PolicyIR.recommendedWindowRules }
+    let view = mkView { defaultIdentity with Exe = believed @"C:\Windows\System32\TextInputHost.exe" } (believed false) unformed unformed unformed
+    let policy = { basePolicy with WindowRules = PolicyIR.recommendedWindowRules }
+    Assert.Equal(Resolved (Excluded, Some (PolicyRuleId "exclude-ime-candidate-window")), selectManagement patternSet view policy)
+
+[<Fact>]
+let ``recommendedWindowRulesは通常アプリのダイアログをFloatingにする`` () =
+    let patternSet = buildTitlePatternSet { basePolicy with WindowRules = PolicyIR.recommendedWindowRules }
+    let view = mkView { defaultIdentity with Exe = believed @"C:\Program Files\SomeApp\app.exe" } (believed true) unformed unformed unformed
+    let policy = { basePolicy with WindowRules = PolicyIR.recommendedWindowRules }
+    Assert.Equal(Resolved (Floating, Some (PolicyRuleId "float-dialogs")), selectManagement patternSet view policy)
+
+[<Fact>]
+let ``recommendedWindowRulesは通常アプリの非ダイアログ窓をDefaultManagement(Tiled)にする`` () =
+    let patternSet = buildTitlePatternSet { basePolicy with WindowRules = PolicyIR.recommendedWindowRules }
+    let view = mkView { defaultIdentity with Exe = believed @"C:\Program Files\SomeApp\app.exe" } (believed false) unformed unformed unformed
+    let policy = { basePolicy with WindowRules = PolicyIR.recommendedWindowRules }
+    Assert.Equal(Resolved (Tiled, None), selectManagement patternSet view policy)
+
 // ===== selectLayout =====
 
 [<Fact>]
