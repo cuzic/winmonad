@@ -94,11 +94,18 @@ let queryMinimized (hWnd: IntPtr) : Result<bool, NativeCallRecord> = Ok (IsIconi
 let private queryMaximized (hWnd: IntPtr) : Result<bool, NativeCallRecord> = Ok (IsZoomed(hWnd))
 
 /// `GetWindowLong`は失敗時も0を返すことがあり（Opus敵対的レビュー第2ラウンド§3-A）、`queryVisible`
-/// 等の「falseも正当な結果」とは逆に「0は正当な値にも失敗にもなる」——`SetLastWin32Error(0)`で
+/// 等の「falseも正当な結果」とは逆に「0は正当な値にも失敗にもなる」——`SetLastSystemError(0)`で
 /// 消してから呼び、戻り値が0のときだけ`GetLastWin32Error()`で区別する（`callBoolRead`と同じ考え方）。
+/// **注**：`Marshal`に`SetLastWin32Error`という対になるsetterは存在しない（`GetLastWin32Error`は
+/// getterのみ）。実在するのは`SetLastSystemError`（`GetLastWin32Error`と対で使うレガシーAPI）と
+/// `SetLastPInvokeError`（.NET 6+の推奨API、`GetLastPInvokeError`と対）——`SetLastWin32Error`と
+/// 誤って書いたコードがLinux上の`dotnet build`（ubuntu-latest、net8.0-windowsの参照アセンブリに
+/// 寄せたクロスコンパイル）では検出されず、実機Windows（GCP self-hosted runner、v2.131）で初めて
+/// `FS0039`として表面化した——Linux CIがWindows専用APIの実在チェックとして完全な代用にはならない
+/// という教訓（architecture.md §21参照）。
 let private queryStyle (hWnd: IntPtr) : Result<int, NativeCallRecord> =
     let sw = Stopwatch.StartNew()
-    Marshal.SetLastWin32Error(0)
+    Marshal.SetLastSystemError(0)
     let style = GetWindowLong(hWnd, GWL_STYLE)
     sw.Stop()
     if style <> 0 then
