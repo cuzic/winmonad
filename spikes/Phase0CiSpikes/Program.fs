@@ -149,6 +149,33 @@ module Native =
     [<DllImport("user32.dll")>]
     extern int GetSystemMetrics(int nIndex)
 
+    // S28/S29/S30 (E-4全画面検出の設計レビュー、opus-review-fullscreen-detection.md)向けに追加。
+    [<DllImport("user32.dll", SetLastError = true)>]
+    extern int GetWindowLong(IntPtr hWnd, int nIndex)
+
+    [<DllImport("user32.dll", SetLastError = true)>]
+    extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong)
+
+    [<DllImport("user32.dll", CharSet = CharSet.Unicode)>]
+    extern IntPtr FindWindow(string lpClassName, string lpWindowName)
+
+    [<DllImport("user32.dll")>]
+    extern bool SystemParametersInfo(uint32 uiAction, uint32 uiParam, RECT& pvParam, uint32 fWinIni)
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type APPBARDATA =
+        struct
+            val mutable cbSize: uint32
+            val mutable hWnd: IntPtr
+            val mutable uCallbackMessage: uint32
+            val mutable uEdge: uint32
+            val mutable rc: RECT
+            val mutable lParam: IntPtr
+        end
+
+    [<DllImport("shell32.dll")>]
+    extern UIntPtr SHAppBarMessage(uint32 dwMessage, APPBARDATA& pData)
+
     [<DllImport("user32.dll", CharSet = CharSet.Unicode)>]
     extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount)
 
@@ -464,6 +491,83 @@ let runHangChildRecoverable () =
         Environment.Exit(1)
 
 let startHangChildRecoverable (exePath: string) = startHangChildWith "--hang-child-recoverable" exePath
+
+// S28/S29用の子プロセス（opus-review-fullscreen-detection.md §0-1/1-E）：他社プロセス役として、
+// 通常の有枠窓から「ボーダレス・モニタ全体」へ自力で遷移し、しばらくしてから元に戻る。
+// `order`で遷移の順序を切り替える：
+// - "stylefirst"：スタイル変更とリサイズを1回の`SetWindowPos`に合成する（Chromium的な順序）。
+// - "resizefirst"：先にモニタ矩形へリサイズし（スタイルは有枠のまま）、300ms後に
+//   `SWP_NOMOVE|SWP_NOSIZE|SWP_FRAMECHANGED`だけでスタイルを外す（スタイル変更だけの
+//   `SetWindowPos`がLOCATIONCHANGEを出すか、というS29の論点を同じ子で確認できる）。
+// 親プロセス（spikeS28側）がシステム全体のLOCATIONCHANGEフックでこのHWNDだけを観測する。
+let runFullscreenChild (order: string) =
+    try
+        let GWL_STYLE = -16
+        let WS_CAPTION = 0x00C00000
+        let WS_THICKFRAME = 0x00040000
+        let SWP_NOZORDER = 0x0004u
+        let SWP_FRAMECHANGED = 0x0020u
+        let SWP_NOMOVE = 0x0002u
+        let SWP_NOSIZE = 0x0001u
+
+        let form =
+            new Form(Text = "CI_FULLSCREEN_WINDOW", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(50, 50, 300, 200))
+        form.Show()
+        pump 10
+        let hwnd = form.Handle
+        printfn "HWND=%d" (int64 hwnd)
+        Console.Out.Flush()
+
+        // 親がフックを張ってHWNDを読み終えるのを待つ（信号は使わず、固定の待ち時間で揃える——
+        // この子はスパイク専用で本番のIPCではないので、簡便な固定スリープで十分）。
+        Thread.Sleep(800)
+        pump 5
+
+        let origStyle = GetWindowLong(hwnd, GWL_STYLE)
+        let sw = GetSystemMetrics(0)
+        let sh = GetSystemMetrics(1)
+        let enterSw = Stopwatch.StartNew()
+        if order = "stylefirst" then
+            SetWindowLong(hwnd, GWL_STYLE, origStyle &&& ~~~(WS_CAPTION ||| WS_THICKFRAME)) |> ignore
+            SetWindowPos(hwnd, IntPtr.Zero, 0, 0, sw, sh, SWP_FRAMECHANGED ||| SWP_NOZORDER) |> ignore
+        else
+            SetWindowPos(hwnd, IntPtr.Zero, 0, 0, sw, sh, SWP_NOZORDER) |> ignore
+            pump 5
+            printfn "RESIZED_ONLY_STILL_BORDERED t=%d" enterSw.ElapsedMilliseconds
+            Console.Out.Flush()
+            Thread.Sleep(300)
+            SetWindowLong(hwnd, GWL_STYLE, origStyle &&& ~~~(WS_CAPTION ||| WS_THICKFRAME)) |> ignore
+            SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0, SWP_FRAMECHANGED ||| SWP_NOMOVE ||| SWP_NOSIZE ||| SWP_NOZORDER) |> ignore
+        pump 5
+        printfn "ENTERED_FULLSCREEN t=%d" enterSw.ElapsedMilliseconds
+        Console.Out.Flush()
+
+        Thread.Sleep(800)
+        pump 5
+
+        let exitSw = Stopwatch.StartNew()
+        if order = "stylefirst" then
+            SetWindowLong(hwnd, GWL_STYLE, origStyle) |> ignore
+            SetWindowPos(hwnd, IntPtr.Zero, 50, 50, 300, 200, SWP_FRAMECHANGED ||| SWP_NOZORDER) |> ignore
+        else
+            SetWindowPos(hwnd, IntPtr.Zero, 50, 50, 300, 200, SWP_NOZORDER) |> ignore
+            pump 5
+            printfn "RESIZED_BACK_STILL_BORDERLESS t=%d" exitSw.ElapsedMilliseconds
+            Console.Out.Flush()
+            Thread.Sleep(300)
+            SetWindowLong(hwnd, GWL_STYLE, origStyle) |> ignore
+            SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0, SWP_FRAMECHANGED ||| SWP_NOMOVE ||| SWP_NOSIZE ||| SWP_NOZORDER) |> ignore
+        pump 5
+        printfn "EXITED_FULLSCREEN t=%d" exitSw.ElapsedMilliseconds
+        Console.Out.Flush()
+
+        Thread.Sleep(1500)
+    with ex ->
+        printfn "ERROR=%s" (ex.Message.Replace("\n", " ").Replace("\r", ""))
+        Console.Out.Flush()
+        Environment.Exit(1)
+
+let startFullscreenChild (order: string) (exePath: string) = startHangChildWith (sprintf "--fullscreen-child-%s" order) exePath
 
 // ===== spikes =====
 
@@ -2389,6 +2493,150 @@ let spikeS27_MaximizedLaunchInsetTiming () =
         finally
             UnhookWinEvent(hook) |> ignore
 
+// S28/S29 (opus-review-fullscreen-detection.md §0-1/1-E, E-4全画面検出の設計前提):
+// 他社プロセス（`runFullscreenChild`）がボーダレス・モニタ全体への遷移を自力で行う間、
+// このプロセス（WMの役）がシステム全体のEVENT_OBJECT_LOCATIONCHANGEフックでそのHWNDだけを
+// 観測できるか、遷移の順序（スタイル変更とリサイズを1回に合成するか、別々の呼出に分けるか）で
+// 観測できるイベントの数・タイミングがどう変わるかを実測する。`order`="stylefirst"は
+// Chromium的な順序、"resizefirst"はリサイズを先に行い300ms後にスタイルだけを外す順序
+// （スタイル変更だけの`SetWindowPos`がLOCATIONCHANGEを出すかというS29の論点を兼ねる）。
+let spikeS28_CrossProcessFullscreenEnterExit (order: string) (exePath: string) =
+    let EVENT_OBJECT_LOCATIONCHANGE = 0x800Bu
+    let WINEVENT_OUTOFCONTEXT = 0x0000u
+    let OBJID_WINDOW = 0
+    let GWL_STYLE = -16
+    let WS_CAPTION = 0x00C00000
+    let WS_THICKFRAME = 0x00040000
+
+    let reportStyleRect (label: string) (hwnd: IntPtr) =
+        let style = GetWindowLong(hwnd, GWL_STYLE)
+        let borderless = (style &&& (WS_CAPTION ||| WS_THICKFRAME)) = 0
+        let mutable r = RECT()
+        let gotRect = GetWindowRect(hwnd, &r)
+        log (
+            sprintf
+                "  - %s: style=0x%08x borderless=%b rect=%s"
+                label style borderless (if gotRect then sprintf "(%d,%d,%d,%d)" r.Left r.Top r.Right r.Bottom else "unavailable")
+        )
+
+    let events = ResizeArray<int64 * string>()
+    let sw = Stopwatch()
+    let mutable targetHwnd = IntPtr.Zero
+    let callback =
+        WinEventProc(fun _hWinEventHook eventType hwnd idObject _idChild _idEventThread _dwmsEventTime ->
+            if eventType = EVENT_OBJECT_LOCATIONCHANGE && hwnd = targetHwnd && idObject = OBJID_WINDOW then
+                events.Add(sw.ElapsedMilliseconds, "LOCATIONCHANGE"))
+    // idProcess=0u: このプロセスとは別プロセスの子窓を観測するので、系全体を購読してから
+    // 対象HWNDだけへコールバック内でフィルタする(src/Wm.Windows/EventHooks.fsの
+    // hookLocationChangeForProcessが自プロセスに絞っている理由＝流量と対称の、
+    // 本番実装がまだ持っていない「他社窓向け」購読をこのスパイクだけ先に試す)。
+    let hook = SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE, IntPtr.Zero, callback, 0u, 0u, WINEVENT_OUTOFCONTEXT)
+    if hook = IntPtr.Zero then
+        log (sprintf "- SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE, system-wide) failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+    else
+        try
+            let (p, hwnd) = startFullscreenChild order exePath
+            if hwnd = IntPtr.Zero then
+                log "- child did not report an HWND within timeout, skipping"
+            else
+                try
+                    targetHwnd <- hwnd
+                    sw.Restart()
+                    reportStyleRect "(a) just after child reported HWND" hwnd
+                    let mutable lastCount = 0
+                    let drainAndReport (waitMs: int) (label: string) =
+                        let deadline = sw.ElapsedMilliseconds + int64 waitMs
+                        while sw.ElapsedMilliseconds < deadline do
+                            Application.DoEvents()
+                            Thread.Sleep(5)
+                        let newEvents = events |> Seq.skip lastCount |> Seq.toList
+                        lastCount <- events.Count
+                        log (
+                            sprintf
+                                "  LOCATIONCHANGE since previous checkpoint, up to %s: %s"
+                                label
+                                (if newEvents.IsEmpty then "none" else newEvents |> List.map (fun (t, n) -> sprintf "(%dms,%s)" t n) |> String.concat " ")
+                        )
+                        reportStyleRect label hwnd
+                    // 子の標準出力のPHASEマーカーを、親側の観測と並べてログする。
+                    let readPhaseLine () =
+                        match readLineWithTimeout p.StandardOutput 3000 with
+                        | Some l when l <> null -> log (sprintf "  [child stdout] %s" l)
+                        | _ -> log "  [child stdout] (timed out waiting for next line)"
+                    drainAndReport 1200 "(b) after waiting through the enter-fullscreen window"
+                    if order = "resizefirst" then readPhaseLine () // RESIZED_ONLY_STILL_BORDERED
+                    readPhaseLine () // ENTERED_FULLSCREEN
+                    drainAndReport 1200 "(c) after waiting through the exit-fullscreen window"
+                    if order = "resizefirst" then readPhaseLine () // RESIZED_BACK_STILL_BORDERLESS
+                    readPhaseLine () // EXITED_FULLSCREEN
+                finally
+                    killProcessSafely p
+        finally
+            UnhookWinEvent(hook) |> ignore
+
+// S30 (opus-review-fullscreen-detection.md §2): タスクバー自動非表示時にWorkArea==Boundsに
+// なること、およびWS_THICKFRAMEを持たないボーダレス窓をWorkAreaへ合わせるとGetWindowRectが
+// 不可視リサイズ枠の分だけ内側にずれない（通常の有枠最大化窓とは違う）ことを実測する。
+// 自動非表示そのものをCI上で切り替えるのはレジストリ変更とシェルへの通知が絡み壊れやすいため、
+// このスパイクはCIランナーの「今の」設定を観測するだけに留める（自動非表示が有効な実デスクトップ
+// での再確認は別途必要——既知の制約としてログに明記する）。
+let spikeS30_BorderlessMaximizeGeometry () =
+    let SPI_GETWORKAREA = 0x0030u
+    let ABM_GETSTATE = 0x4u
+    let ABS_AUTOHIDE = 0x1u
+
+    let mutable workArea = RECT()
+    let gotWorkArea = SystemParametersInfo(SPI_GETWORKAREA, 0u, &workArea, 0u)
+    let boundsW, boundsH = GetSystemMetrics(0), GetSystemMetrics(1)
+    log (
+        sprintf
+            "- primary monitor: Bounds=(0,0,%d,%d) WorkArea=%s (SystemParametersInfo ok=%b)"
+            boundsW boundsH (if gotWorkArea then sprintf "(%d,%d,%d,%d)" workArea.Left workArea.Top workArea.Right workArea.Bottom else "unavailable") gotWorkArea
+    )
+    let boundsEqualsWorkArea = gotWorkArea && workArea.Left = 0 && workArea.Top = 0 && workArea.Right = boundsW && workArea.Bottom = boundsH
+    log (sprintf "- Bounds == WorkArea on this runner right now: %b (true would mean a plain maximized bordered window could false-positive as fullscreen)" boundsEqualsWorkArea)
+
+    let trayHwnd = FindWindow("Shell_TrayWnd", null)
+    if trayHwnd = IntPtr.Zero then
+        log "- Shell_TrayWnd not found (no taskbar on this runner/session) -- cannot query auto-hide state"
+    else
+        let mutable abd = APPBARDATA()
+        abd.cbSize <- uint32 (Marshal.SizeOf(typeof<APPBARDATA>))
+        abd.hWnd <- trayHwnd
+        let state = SHAppBarMessage(ABM_GETSTATE, &abd)
+        log (sprintf "- taskbar ABM_GETSTATE=0x%x auto-hide=%b" (state.ToUInt32()) ((state.ToUInt32() &&& ABS_AUTOHIDE) <> 0u))
+
+    use bordered = new Form(Text = "S30-bordered", FormBorderStyle = FormBorderStyle.Sizable, StartPosition = FormStartPosition.Manual, Bounds = Rectangle(50, 50, 300, 200))
+    bordered.Show()
+    pump 5
+    bordered.WindowState <- FormWindowState.Maximized
+    pump 10
+    let mutable rBordered = RECT()
+    GetWindowRect(bordered.Handle, &rBordered) |> ignore
+    log (
+        sprintf
+            "- ordinary bordered window, WindowState=Maximized: IsZoomed=%b GetWindowRect=(%d,%d,%d,%d) matches WorkArea exactly=%b"
+            (IsZoomed bordered.Handle) rBordered.Left rBordered.Top rBordered.Right rBordered.Bottom
+            (gotWorkArea && rBordered.Left = workArea.Left && rBordered.Top = workArea.Top && rBordered.Right = workArea.Right && rBordered.Bottom = workArea.Bottom)
+    )
+    bordered.Close()
+
+    use borderless = new Form(Text = "S30-borderless", FormBorderStyle = FormBorderStyle.None, StartPosition = FormStartPosition.Manual, Bounds = Rectangle(50, 50, 300, 200))
+    borderless.Show()
+    pump 5
+    if gotWorkArea then
+        borderless.Bounds <- Rectangle(workArea.Left, workArea.Top, workArea.Right - workArea.Left, workArea.Bottom - workArea.Top)
+    pump 10
+    let mutable rBorderless = RECT()
+    GetWindowRect(borderless.Handle, &rBorderless) |> ignore
+    log (
+        sprintf
+            "- FormBorderStyle.None window sized to WorkArea: GetWindowRect=(%d,%d,%d,%d) matches WorkArea exactly=%b (no invisible resize-border inset expected, unlike the bordered case)"
+            rBorderless.Left rBorderless.Top rBorderless.Right rBorderless.Bottom
+            (gotWorkArea && rBorderless.Left = workArea.Left && rBorderless.Top = workArea.Top && rBorderless.Right = workArea.Right && rBorderless.Bottom = workArea.Bottom)
+    )
+    borderless.Close()
+
 [<STAThread>]
 [<EntryPoint>]
 let main argv =
@@ -2401,6 +2649,12 @@ let main argv =
         0
     elif argv.Length > 0 && argv.[0] = "--hang-child-recoverable" then
         runHangChildRecoverable ()
+        0
+    elif argv.Length > 0 && argv.[0] = "--fullscreen-child-stylefirst" then
+        runFullscreenChild "stylefirst"
+        0
+    elif argv.Length > 0 && argv.[0] = "--fullscreen-child-resizefirst" then
+        runFullscreenChild "resizefirst"
         0
     elif argv.Length > 0 && argv.[0] = "--s7r-only" then
         // Re-run just S7r (no Explorer kill, no focus stealing) after the user has
@@ -2458,6 +2712,9 @@ let main argv =
         tryRun "S25 最小化時のMINIMIZESTART/LOCATIONCHANGEの到着順(M7)" spikeS25_MinimizeEventOrder
         tryRun "S26 新規窓の最初のSetRect時点でFrameInsetが既知か(frameinset-selfheal§3-3)" spikeS26_NewWindowInsetTiming
         tryRun "S27 最大化起動窓のRestoreBeforeMove直後にFrameInsetが既知か(frameinset-selfheal§3-3)" spikeS27_MaximizedLaunchInsetTiming
+        tryRun "S28a 他社プロセスの全画面出入り(スタイル変更+リサイズを1回に合成、E-4)" (fun () -> spikeS28_CrossProcessFullscreenEnterExit "stylefirst" exePath)
+        tryRun "S28b 他社プロセスの全画面出入り(リサイズ先行+スタイルのみ別呼出、E-4/S29兼)" (fun () -> spikeS28_CrossProcessFullscreenEnterExit "resizefirst" exePath)
+        tryRun "S30 タスクバー自動非表示状態とボーダレス窓のWorkArea一致(E-4)" spikeS30_BorderlessMaximizeGeometry
 
         log "\n(all spikes finished without the watchdog firing)"
         0
