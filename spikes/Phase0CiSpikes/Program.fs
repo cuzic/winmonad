@@ -65,6 +65,30 @@
 // maximized-launch case (ShowMaximized -> SW_RESTORE -> first SetWindowPos),
 // since RestoreBeforeMove's restore and the first Tiled SetRect can race the
 // same way.
+// S31-S36 ground an Opus adversarial-consult round on the Phase C Live REPL
+// Named Pipe transport design (/tmp/opus-review-named-pipe-transport.md,
+// architecture.md 10.1): that review flagged several points as implementable-
+// but-unverified rather than settled. S31 checks whether the .NET 8 BCL path
+// (NamedPipeServerStreamAcl.Create + PipeSecurity.SetSecurityDescriptorSddlForm)
+// actually applies a DACL AND a mandatory-label SACL to the created pipe (the
+// review's biggest open question: label application via ObjectSecurity was
+// unconfirmed). S32 is the P/Invoke fallback (raw CreateNamedPipe + a
+// SECURITY_ATTRIBUTES built from ConvertStringSecurityDescriptorToSecurityDescriptorW),
+// kept ready in case S31 shows the BCL path drops the label. S33 measures
+// FILE_FLAG_FIRST_PIPE_INSTANCE's actual collision behavior and the review's
+// 5-B finding that the protection only covers the first instance -- closing
+// and recreating opens a hijack window. S34 impersonates a Low-integrity
+// token on the calling thread (SetThreadToken, no process spawn needed) and
+// attempts to connect to a pipe ACL'd to "current user + own integrity level
+// or higher", to see whether the kernel access check actually denies it at
+// CreateFile time. S35 uses RunAsClient/OpenThreadToken to read a connected
+// client's real token (integrity level, via the same TokenIntegrityLevel
+// class as S7) rather than trusting PID-based checks, and compares
+// TokenImpersonationLevel.Identification vs Anonymous client connections.
+// S36 checks whether a loopback connection made through the SMB redirector
+// path ("localhost" server name) is rejected the way a true remote
+// connection would be, as a proxy for PIPE_REJECT_REMOTE_CLIENTS actually
+// taking effect (that flag has no public PipeOptions equivalent).
 // The *r-suffixed spikes (S4r/S5r/S7r/S11r) are real-desktop-
 // only: they need a genuine interactive desktop (an existing third-party
 // foreground window, a modern UWP shell, an already-running elevated
@@ -83,7 +107,9 @@ open System
 open System.Diagnostics
 open System.Drawing
 open System.IO
+open System.IO.Pipes
 open System.Runtime.InteropServices
+open System.Security.AccessControl
 open System.Security.Principal
 open System.Text
 open System.Threading
@@ -336,6 +362,62 @@ module Native =
 
     [<DllImport("user32.dll")>]
     extern bool UnhookWinEvent(IntPtr hWinEventHook)
+
+    // ===== S31-S36 (opus-review-named-pipe-transport.md、architecture.md 10.1向け) =====
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type SECURITY_ATTRIBUTES =
+        struct
+            val mutable nLength: int
+            val mutable lpSecurityDescriptor: IntPtr
+            val mutable bInheritHandle: bool
+        end
+
+    [<StructLayout(LayoutKind.Sequential)>]
+    type TOKEN_MANDATORY_LABEL =
+        struct
+            val mutable Sid: IntPtr
+            val mutable Attributes: uint32
+        end
+
+    [<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
+    extern IntPtr CreateNamedPipe(string lpName, uint32 dwOpenMode, uint32 dwPipeMode, uint32 nMaxInstances, uint32 nOutBufferSize, uint32 nInBufferSize, uint32 nDefaultTimeOut, SECURITY_ATTRIBUTES& lpSecurityAttributes)
+
+    [<DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
+    extern bool ConvertStringSecurityDescriptorToSecurityDescriptorW(string StringSecurityDescriptor, uint32 StringSDRevision, IntPtr& SecurityDescriptor, uint32& SecurityDescriptorSize)
+
+    [<DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
+    extern bool ConvertSecurityDescriptorToStringSecurityDescriptorW(IntPtr SecurityDescriptor, uint32 RequestedStringSDRevision, uint32 SecurityInformation, IntPtr& StringSecurityDescriptor, uint32& StringSecurityDescriptorLen)
+
+    [<DllImport("advapi32.dll", SetLastError = true)>]
+    extern uint32 GetSecurityInfo(IntPtr handle, int ObjectType, uint32 SecurityInfo, IntPtr& ppsidOwner, IntPtr& ppsidGroup, IntPtr& ppDacl, IntPtr& ppSacl, IntPtr& ppSecurityDescriptor)
+
+    [<DllImport("kernel32.dll")>]
+    extern IntPtr LocalFree(IntPtr hMem)
+
+    [<DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
+    extern bool ConvertStringSidToSidW(string StringSid, IntPtr& Sid)
+
+    [<DllImport("advapi32.dll", SetLastError = true)>]
+    extern bool DuplicateTokenEx(IntPtr hExistingToken, uint32 dwDesiredAccess, IntPtr lpTokenAttributes, int ImpersonationLevel, int TokenType, IntPtr& phNewToken)
+
+    [<DllImport("advapi32.dll", SetLastError = true)>]
+    extern bool SetTokenInformation(IntPtr TokenHandle, uint32 TokenInformationClass, TOKEN_MANDATORY_LABEL& TokenInformation, uint32 TokenInformationLength)
+
+    [<DllImport("advapi32.dll", SetLastError = true)>]
+    extern bool SetThreadToken(IntPtr Thread, IntPtr Token)
+
+    [<DllImport("advapi32.dll", SetLastError = true)>]
+    extern bool RevertToSelf()
+
+    [<DllImport("advapi32.dll", SetLastError = true)>]
+    extern bool OpenThreadToken(IntPtr ThreadHandle, uint32 DesiredAccess, bool OpenAsSelf, IntPtr& TokenHandle)
+
+    [<DllImport("kernel32.dll")>]
+    extern IntPtr GetCurrentThread()
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool GetNamedPipeClientProcessId(IntPtr Pipe, uint32& ClientProcessId)
 
 open Native
 
@@ -1049,6 +1131,101 @@ let private getIntegrityRid (hToken: IntPtr) : Result<int, string> =
         let pSid = IntPtr(BitConverter.ToInt64(buf, 0))
         let subAuthorityCount = int (Marshal.ReadByte(pSid, 1))
         Ok(Marshal.ReadInt32(pSid, 8 + 4 * (subAuthorityCount - 1)))
+
+// Shared by S31/S32: reads back the DACL + mandatory-label (SACL) actually applied to a
+// kernel handle via GetSecurityInfo, and renders it as SDDL for comparison against what was
+// requested. Deliberately requests only DACL_SECURITY_INFORMATION|LABEL_SECURITY_INFORMATION
+// (not full SACL_SECURITY_INFORMATION) -- reading the mandatory label specifically does not
+// require SeSecurityPrivilege, unlike reading the full SACL (opus-review-named-pipe-transport.md
+// Q2/5-A).
+let private dumpAppliedSecurity (handle: Microsoft.Win32.SafeHandles.SafeHandle) : Result<string, string> =
+    let DACL_AND_LABEL = 0x00000004u ||| 0x00000010u // DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION
+    let SE_KERNEL_OBJECT = 6
+    let mutable owner, group, dacl, sacl, sd = IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero
+    let rc = GetSecurityInfo(handle.DangerousGetHandle(), SE_KERNEL_OBJECT, DACL_AND_LABEL, &owner, &group, &dacl, &sacl, &sd)
+    if rc <> 0u then
+        Error(sprintf "GetSecurityInfo failed, error=%d" rc)
+    else
+        try
+            let mutable strPtr = IntPtr.Zero
+            let mutable strLen = 0u
+            if not (ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, 1u, DACL_AND_LABEL, &strPtr, &strLen)) then
+                Error(sprintf "ConvertSecurityDescriptorToStringSecurityDescriptorW failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+            else
+                try
+                    Ok(Marshal.PtrToStringUni(strPtr))
+                finally
+                    LocalFree(strPtr) |> ignore
+        finally
+            if sd <> IntPtr.Zero then LocalFree(sd) |> ignore
+
+// Shared by S32/S33/S34/S36: creates a Named Pipe server instance via the raw CreateNamedPipe
+// P/Invoke (the fallback path from opus-review-named-pipe-transport.md Q2, used unconditionally
+// here so every S3x spike exercises the SAME creation path rather than mixing the BCL path's
+// behavior into spikes that are really testing something else). Always requests
+// FILE_FLAG_FIRST_PIPE_INSTANCE and PIPE_REJECT_REMOTE_CLIENTS. `sddlOpt = None` leaves the
+// default security descriptor (whatever CreateNamedPipe applies when lpSecurityDescriptor is
+// NULL) in place.
+let private tryCreateFirstInstancePipe (pipeName: string) (sddlOpt: string option) : Result<NamedPipeServerStream, string> =
+    let mutable sa = SECURITY_ATTRIBUTES()
+    sa.nLength <- Marshal.SizeOf<SECURITY_ATTRIBUTES>()
+    sa.lpSecurityDescriptor <- IntPtr.Zero
+    sa.bInheritHandle <- false
+    let mutable pSdToFree = IntPtr.Zero
+    let sddlConversionError =
+        match sddlOpt with
+        | None -> None
+        | Some sddl ->
+            let mutable pSd = IntPtr.Zero
+            let mutable sdSize = 0u
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, 1u, &pSd, &sdSize) then
+                sa.lpSecurityDescriptor <- pSd
+                pSdToFree <- pSd
+                None
+            else
+                Some(sprintf "ConvertStringSecurityDescriptorToSecurityDescriptorW failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+    match sddlConversionError with
+    | Some e -> Error e
+    | None ->
+        try
+            let PIPE_ACCESS_DUPLEX = 0x00000003u
+            let FILE_FLAG_OVERLAPPED = 0x40000000u
+            let FILE_FLAG_FIRST_PIPE_INSTANCE = 0x00080000u
+            let PIPE_TYPE_BYTE = 0x00000000u
+            let PIPE_REJECT_REMOTE_CLIENTS = 0x00000008u
+            let h =
+                CreateNamedPipe(
+                    sprintf "\\\\.\\pipe\\%s" pipeName,
+                    PIPE_ACCESS_DUPLEX ||| FILE_FLAG_OVERLAPPED ||| FILE_FLAG_FIRST_PIPE_INSTANCE,
+                    PIPE_TYPE_BYTE ||| PIPE_REJECT_REMOTE_CLIENTS,
+                    1u, 4096u, 4096u, 0u, &sa)
+            if h = IntPtr(-1) then
+                Error(sprintf "CreateNamedPipe failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+            else
+                let safeHandle = new Microsoft.Win32.SafeHandles.SafePipeHandle(h, true)
+                Ok(new NamedPipeServerStream(PipeDirection.InOut, true, false, safeHandle))
+        finally
+            if pSdToFree <> IntPtr.Zero then LocalFree(pSdToFree) |> ignore
+
+/// Current process's own SID (D:P ACE subject) and integrity RID (S:(ML...) ACE subject),
+/// shared by S31/S32/S34 for building the SDDL string. Returns None (and logs why) if either
+/// lookup fails.
+let private ownSidAndIntegrityRid () : (string * int) option =
+    let userSid = WindowsIdentity.GetCurrent().User.Value
+    let TOKEN_QUERY = 0x0008u
+    let mutable hToken = IntPtr.Zero
+    if not (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) then
+        log (sprintf "- OpenProcessToken failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+        None
+    else
+        try
+            match getIntegrityRid hToken with
+            | Ok rid -> Some(userSid, rid)
+            | Error e ->
+                log (sprintf "- %s" e)
+                None
+        finally
+            CloseHandle(hToken) |> ignore
 
 // S7: how does an elevated-vs-non-elevated operation fail? Actually spawning an elevated
 // child (ShellExecute "runas") would pop a UAC consent prompt with nobody to approve it,
@@ -2637,6 +2814,237 @@ let spikeS30_BorderlessMaximizeGeometry () =
     )
     borderless.Close()
 
+// S31 (opus-review-named-pipe-transport.md Q2/Q4): does the .NET 8 BCL path
+// (NamedPipeServerStreamAcl.Create + PipeSecurity.SetSecurityDescriptorSddlForm(sddl,
+// AccessControlSections.All)) actually apply BOTH the requested DACL and the mandatory-label
+// SACL to the pipe, or does the SACL silently get dropped by ObjectSecurity? This was the
+// review's single biggest open question about whether P/Invoke is required at all.
+let spikeS31_PipeAclBclPath () =
+    match ownSidAndIntegrityRid () with
+    | None -> log "- skipping (could not determine own user SID / integrity level)"
+    | Some(userSid, rid) ->
+        let sddl = sprintf "D:P(A;;GA;;;%s)(D;;GA;;;NU)S:(ML;;NWNR;;;S-1-16-%d)" userSid rid
+        log (sprintf "- requested SDDL: %s" sddl)
+        let pipeName = sprintf "winmonad-s31-%d-%s" (Process.GetCurrentProcess().Id) (Guid.NewGuid().ToString("N").Substring(0, 8))
+        try
+            let security = PipeSecurity()
+            security.SetSecurityDescriptorSddlForm(sddl, AccessControlSections.All)
+            log "- PipeSecurity.SetSecurityDescriptorSddlForm(sddl, AccessControlSections.All): did not throw"
+            use pipe = NamedPipeServerStreamAcl.Create(pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 0, 0, security)
+            log (sprintf "- pipe created via NamedPipeServerStreamAcl.Create: \\\\.\\pipe\\%s" pipeName)
+            match dumpAppliedSecurity pipe.SafePipeHandle with
+            | Ok actualSddl ->
+                log (sprintf "- actual SDDL read back via GetSecurityInfo: %s" actualSddl)
+                log (sprintf "- actual SDDL contains a mandatory-label ACE (S:(ML...)): %b" (actualSddl.Contains("S:(ML")))
+                log (sprintf "- actual SDDL contains the requested user DACL ACE: %b" (actualSddl.Contains(userSid)))
+            | Error e -> log (sprintf "- GetSecurityInfo readback failed: %s" e)
+        with ex ->
+            log (sprintf "- BCL path (NamedPipeServerStreamAcl.Create) failed: %s" (ex.ToString()))
+
+// S32 (opus-review-named-pipe-transport.md Q2): the P/Invoke fallback path, kept ready in
+// case S31 shows the BCL path cannot apply a mandatory label. Uses the SAME
+// tryCreateFirstInstancePipe helper that S33/S34/S36 use, so this also doubles as this
+// helper's own correctness check (does the ACL it builds actually land on the pipe?).
+let spikeS32_PipeAclPInvokeFallback () =
+    match ownSidAndIntegrityRid () with
+    | None -> log "- skipping (could not determine own user SID / integrity level)"
+    | Some(userSid, rid) ->
+        let sddl = sprintf "D:P(A;;GA;;;%s)(D;;GA;;;NU)S:(ML;;NWNR;;;S-1-16-%d)" userSid rid
+        let pipeName = sprintf "winmonad-s32-%d-%s" (Process.GetCurrentProcess().Id) (Guid.NewGuid().ToString("N").Substring(0, 8))
+        match tryCreateFirstInstancePipe pipeName (Some sddl) with
+        | Error e -> log (sprintf "- pipe creation failed: %s" e)
+        | Ok server ->
+            use server = server
+            log (sprintf "- pipe created via raw CreateNamedPipe: \\\\.\\pipe\\%s" pipeName)
+            match dumpAppliedSecurity server.SafePipeHandle with
+            | Ok actualSddl ->
+                log (sprintf "- actual SDDL read back via GetSecurityInfo: %s" actualSddl)
+                log (sprintf "- actual SDDL contains a mandatory-label ACE (S:(ML...)): %b" (actualSddl.Contains("S:(ML")))
+            | Error e -> log (sprintf "- GetSecurityInfo readback failed: %s" e)
+
+// S33 (opus-review-named-pipe-transport.md Q1/5-B): measures FILE_FLAG_FIRST_PIPE_INSTANCE's
+// real collision behavior, AND the review's 5-B finding that the protection only covers the
+// FIRST instance -- once every instance of a name is closed, the name is free again and a
+// fresh FIRST_PIPE_INSTANCE create can take it. Also checks whether the BCL even exposes a
+// `FirstPipeInstance` member on `PipeOptions` (checked via reflection on the enum's member
+// names, not a direct symbol reference, so a missing member is a logged `false` rather than a
+// compile error that would take down every other spike in this same build).
+let spikeS33_FirstPipeInstanceCollision () =
+    let bclNames = Enum.GetNames(typeof<PipeOptions>)
+    log (sprintf "- PipeOptions enum members on this BCL: %s" (String.Join(", ", bclNames)))
+    log (sprintf "- PipeOptions.FirstPipeInstance exists as a BCL enum member: %b" (Array.contains "FirstPipeInstance" bclNames))
+
+    let pipeName = sprintf "winmonad-s33-%d-%s" (Process.GetCurrentProcess().Id) (Guid.NewGuid().ToString("N").Substring(0, 8))
+    match tryCreateFirstInstancePipe pipeName None with
+    | Error e -> log (sprintf "- 1本目の作成(raw CreateNamedPipe+FIRST_PIPE_INSTANCE)が失敗: %s" e)
+    | Ok first ->
+        (try
+            match tryCreateFirstInstancePipe pipeName None with
+            | Ok second ->
+                second.Dispose()
+                log "- 1本目がまだ生きている間の2本目の同名+FIRST_PIPE_INSTANCE作成: 想定外に成功した(本来ERROR_ACCESS_DENIEDで拒否されるはず)"
+            | Error e -> log (sprintf "- 1本目がまだ生きている間の2本目作成: 期待通り拒否された (%s)" e)
+         finally
+            first.Dispose())
+
+        // 1本目を完全にDispose済み: 名前が解放され、別インスタンスが先取りできる隙間が実在するか。
+        match tryCreateFirstInstancePipe pipeName None with
+        | Ok attacker ->
+            log "- 1本目をDispose済みの直後に別インスタンスが同名+FIRST_PIPE_INSTANCEで作成: 成功した(=5-Bで指摘された乗っ取り可能な隙間が実在する)"
+            attacker.Dispose()
+        | Error e -> log (sprintf "- 1本目Dispose後の同名再作成が失敗(想定外、要再調査): %s" e)
+
+// S34 (opus-review-named-pipe-transport.md Q3/5-A): does a Low-integrity caller actually get
+// denied at CreateFile time by the ACL+mandatory-label from S32's helper? Impersonates Low
+// integrity on the CALLING thread (SetThreadToken on a lowered duplicate of this process's own
+// token) rather than spawning a whole child process -- CreateFile's access check uses the
+// calling thread's effective (impersonation) token, so this exercises the real kernel check
+// without the extra complexity/privilege requirements of CreateProcessAsUser.
+let spikeS34_LowIntegrityClientRejected () =
+    match ownSidAndIntegrityRid () with
+    | None -> log "- skipping (could not determine own user SID / integrity level)"
+    | Some(userSid, rid) ->
+        let sddl = sprintf "D:P(A;;GA;;;%s)S:(ML;;NWNR;;;S-1-16-%d)" userSid rid
+        let pipeName = sprintf "winmonad-s34-%d-%s" (Process.GetCurrentProcess().Id) (Guid.NewGuid().ToString("N").Substring(0, 8))
+        match tryCreateFirstInstancePipe pipeName (Some sddl) with
+        | Error e -> log (sprintf "- pipe creation failed: %s" e)
+        | Ok server ->
+            use server = server
+            log (sprintf "- server pipe created, ACL restricted to own user + own integrity level(%s)" (integrityLabelOf rid))
+
+            let TOKEN_DUPLICATE = 0x0002u
+            let TOKEN_IMPERSONATE = 0x0004u
+            let TOKEN_QUERY = 0x0008u
+            let TOKEN_ADJUST_DEFAULT = 0x0080u
+            let mutable hSelfToken = IntPtr.Zero
+            if not (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY ||| TOKEN_DUPLICATE, &hSelfToken)) then
+                log (sprintf "- OpenProcessToken(QUERY|DUPLICATE) failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+            else
+                try
+                    let mutable hDup = IntPtr.Zero
+                    let SecurityImpersonation = 2
+                    let TokenImpersonationType = 2
+                    let desiredAccess = TOKEN_QUERY ||| TOKEN_IMPERSONATE ||| TOKEN_ADJUST_DEFAULT
+                    if not (DuplicateTokenEx(hSelfToken, desiredAccess, IntPtr.Zero, SecurityImpersonation, TokenImpersonationType, &hDup)) then
+                        log (sprintf "- DuplicateTokenEx failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+                    else
+                        try
+                            let mutable pLowSid = IntPtr.Zero
+                            if not (ConvertStringSidToSidW("S-1-16-4096", &pLowSid)) then
+                                log (sprintf "- ConvertStringSidToSidW(Low) failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+                            else
+                                try
+                                    let SE_GROUP_INTEGRITY = 0x00000020u
+                                    let mutable label = TOKEN_MANDATORY_LABEL()
+                                    label.Sid <- pLowSid
+                                    label.Attributes <- SE_GROUP_INTEGRITY
+                                    let TokenIntegrityLevel = 25u
+                                    if not (SetTokenInformation(hDup, TokenIntegrityLevel, &label, uint32 (Marshal.SizeOf<TOKEN_MANDATORY_LABEL>()))) then
+                                        log (sprintf "- SetTokenInformation(lower duplicated token to Low) failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+                                    else
+                                        log "- duplicated impersonation token successfully lowered to Low integrity"
+                                        if not (SetThreadToken(IntPtr.Zero, hDup)) then
+                                            log (sprintf "- SetThreadToken failed, GetLastError=%d" (Marshal.GetLastWin32Error()))
+                                        else
+                                            try
+                                                try
+                                                    use client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut)
+                                                    client.Connect(1000)
+                                                    log "- Low-IL(このスレッドのみ偽装)クライアントの接続: 想定外に成功した(ACL/ラベルがLow ILを拒否できていない)"
+                                                with ex ->
+                                                    log (sprintf "- Low-IL(このスレッドのみ偽装)クライアントの接続: 期待通り拒否された (%s)" ex.Message)
+                                            finally
+                                                RevertToSelf() |> ignore
+                                finally
+                                    LocalFree(pLowSid) |> ignore
+                        finally
+                            CloseHandle(hDup) |> ignore
+                finally
+                    CloseHandle(hSelfToken) |> ignore
+
+// S35 (opus-review-named-pipe-transport.md Q3): reads a CONNECTED client's real token via
+// RunAsClient (= ImpersonateNamedPipeClient) + OpenThreadToken, as the review's recommended
+// alternative to PID-based checks (a PID is only "the process that opened the handle", which
+// can be duplicated/handed off -- the impersonation token is the actual security principal).
+// Also compares what happens when the client connects with TokenImpersonationLevel.Anonymous
+// instead of the recommended .Identification, since the review flagged this as the one case
+// where RunAsClient might see nothing useful (or fail outright).
+let spikeS35_RunAsClientTokenInspection () =
+    let pipeName = sprintf "winmonad-s35-%d-%s" (Process.GetCurrentProcess().Id) (Guid.NewGuid().ToString("N").Substring(0, 8))
+    use server = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous)
+
+    let inspectConnectedClient (label: string) =
+        let TOKEN_QUERY = 0x0008u
+        try
+            server.RunAsClient(fun () ->
+                let mutable hThreadToken = IntPtr.Zero
+                if not (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, true, &hThreadToken)) then
+                    log (sprintf "- [%s] RunAsClient中のOpenThreadTokenが失敗, GetLastError=%d" label (Marshal.GetLastWin32Error()))
+                else
+                    try
+                        match getIntegrityRid hThreadToken with
+                        | Ok rid -> log (sprintf "- [%s] RunAsClient中に読めたクライアントの整合性レベル: %s (RID=0x%04x)" label (integrityLabelOf rid) rid)
+                        | Error e -> log (sprintf "- [%s] %s" label e)
+                    finally
+                        CloseHandle(hThreadToken) |> ignore)
+        with ex ->
+            log (sprintf "- [%s] RunAsClient自体が例外: %s" label (ex.ToString()))
+
+    let tryRoundTrip (level: TokenImpersonationLevel) (label: string) =
+        let acceptTask = server.WaitForConnectionAsync()
+        try
+            use client = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.None, level)
+            client.Connect(2000)
+            acceptTask.Wait(2000) |> ignore
+            log (sprintf "- [%s] クライアント接続成功" label)
+            let mutable clientPid = 0u
+            if GetNamedPipeClientProcessId(server.SafePipeHandle.DangerousGetHandle(), &clientPid) then
+                log (sprintf "- [%s] GetNamedPipeClientProcessId (補助情報、判定には使わない): %d (自プロセスPID=%d)" label clientPid (Process.GetCurrentProcess().Id))
+            inspectConnectedClient label
+            server.Disconnect()
+        with ex ->
+            log (sprintf "- [%s] クライアント接続失敗: %s" label ex.Message)
+
+    tryRoundTrip TokenImpersonationLevel.Identification "Identification(実クライアントが使う想定のレベル)"
+    tryRoundTrip TokenImpersonationLevel.Anonymous "Anonymous"
+
+// S36 (opus-review-named-pipe-transport.md Q2/5-D): PIPE_REJECT_REMOTE_CLIENTS has no public
+// PipeOptions equivalent, and whether .NET's own NamedPipeServerStream passes it internally by
+// default is undocumented. tryCreateFirstInstancePipe always sets this flag explicitly via the
+// raw P/Invoke path; this spike connects through "localhost" (forces the SMB redirector code
+// path even though it is loopback) as a proxy for what a genuinely remote connection attempt
+// would hit, and compares it against a baseline "." connection.
+let spikeS36_RemoteLikeConnectionRejected () =
+    let pipeName = sprintf "winmonad-s36-%d-%s" (Process.GetCurrentProcess().Id) (Guid.NewGuid().ToString("N").Substring(0, 8))
+    match tryCreateFirstInstancePipe pipeName None with
+    | Error e -> log (sprintf "- pipe creation failed: %s" e)
+    | Ok server ->
+        use server = server
+        log "- server pipe created via raw CreateNamedPipe with PIPE_REJECT_REMOTE_CLIENTS set"
+
+        let acceptTask1 = server.WaitForConnectionAsync()
+        (try
+            try
+                use client = new NamedPipeClientStream("localhost", pipeName, PipeDirection.InOut)
+                client.Connect(1500)
+                log "- \"localhost\"経由(SMBリダイレクタ経路)での接続: 成功した(=PIPE_REJECT_REMOTE_CLIENTSがループバックには効いていない)"
+            with ex ->
+                log (sprintf "- \"localhost\"経由での接続: 拒否/失敗した (%s)" ex.Message)
+         finally
+            (try acceptTask1.Wait(500) |> ignore with _ -> ()))
+        server.Disconnect()
+
+        let acceptTask2 = server.WaitForConnectionAsync()
+        (try
+            try
+                use client2 = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut)
+                client2.Connect(1500)
+                log "- \".\"経由での接続: 成功した(対照実験、想定通り)"
+            with ex ->
+                log (sprintf "- \".\"経由での接続が失敗(想定外): %s" ex.Message)
+         finally
+            (try acceptTask2.Wait(500) |> ignore with _ -> ()))
+
 [<STAThread>]
 [<EntryPoint>]
 let main argv =
@@ -2715,6 +3123,12 @@ let main argv =
         tryRun "S28a 他社プロセスの全画面出入り(スタイル変更+リサイズを1回に合成、E-4)" (fun () -> spikeS28_CrossProcessFullscreenEnterExit "stylefirst" exePath)
         tryRun "S28b 他社プロセスの全画面出入り(リサイズ先行+スタイルのみ別呼出、E-4/S29兼)" (fun () -> spikeS28_CrossProcessFullscreenEnterExit "resizefirst" exePath)
         tryRun "S30 タスクバー自動非表示状態とボーダレス窓のWorkArea一致(E-4)" spikeS30_BorderlessMaximizeGeometry
+        tryRun "S31 Named Pipeへの.NET BCL経路でのDACL+整合性ラベル適用(10.1/opus-review-named-pipe-transport)" spikeS31_PipeAclBclPath
+        tryRun "S32 Named Pipeへの生CreateNamedPipe経路でのDACL+整合性ラベル適用(10.1/opus-review-named-pipe-transport)" spikeS32_PipeAclPInvokeFallback
+        tryRun "S33 FIRST_PIPE_INSTANCEの衝突・乗っ取り可能な隙間(10.1/opus-review-named-pipe-transport)" spikeS33_FirstPipeInstanceCollision
+        tryRun "S34 Low整合性クライアントの接続拒否(10.1/opus-review-named-pipe-transport)" spikeS34_LowIntegrityClientRejected
+        tryRun "S35 RunAsClientによる接続済みクライアントのトークン検査(10.1/opus-review-named-pipe-transport)" spikeS35_RunAsClientTokenInspection
+        tryRun "S36 localhost経由接続の拒否とPIPE_REJECT_REMOTE_CLIENTS(10.1/opus-review-named-pipe-transport)" spikeS36_RemoteLikeConnectionRejected
 
         log "\n(all spikes finished without the watchdog firing)"
         0
