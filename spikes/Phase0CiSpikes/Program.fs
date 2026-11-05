@@ -1138,7 +1138,7 @@ let private getIntegrityRid (hToken: IntPtr) : Result<int, string> =
 // (not full SACL_SECURITY_INFORMATION) -- reading the mandatory label specifically does not
 // require SeSecurityPrivilege, unlike reading the full SACL (opus-review-named-pipe-transport.md
 // Q2/5-A).
-let private dumpAppliedSecurity (handle: Microsoft.Win32.SafeHandles.SafeHandle) : Result<string, string> =
+let private dumpAppliedSecurity (handle: SafeHandle) : Result<string, string> =
     let DACL_AND_LABEL = 0x00000004u ||| 0x00000010u // DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION
     let SE_KERNEL_OBJECT = 6
     let mutable owner, group, dacl, sacl, sd = IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero
