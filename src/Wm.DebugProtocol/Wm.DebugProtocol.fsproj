@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="Snapshot.fs" />
+    <Compile Include="SnapshotJson.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- §17依存方向：Wm.DebugProtocol（Contractsのみ） -->
+    <ProjectReference Include="../Wm.Contracts/Wm.Contracts.fsproj" />
+  </ItemGroup>
+
+</Project>
