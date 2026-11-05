@@ -1,0 +1,79 @@
+name: Phase B real-hardware check on GCP self-hosted Windows (non-default DPI / taskbar)
+
+# workflow_dispatch専用。push/pull_requestでは絶対にトリガーしない——
+# self-hosted runnerをpublic repoで使う安全上の必須条件
+# (cargo-ci-gcp-spot-instance Skillの「public repoでの安全性」参照)。
+on:
+  workflow_dispatch: {}
+
+jobs:
+  run-on-gcp-windows:
+    runs-on: [self-hosted, Windows, X64, gcp-spot]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report environment (OS edition, shell presence, current DPI)
+        shell: pwsh
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Output "Caption: $($os.Caption)"
+          Write-Output "Version: $($os.Version) Build: $($os.BuildNumber)"
+          Write-Output "InstallType (Core/Full): $((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').InstallationType)"
+          $explorer = Get-Process -Name explorer -ErrorAction SilentlyContinue
+          Write-Output "explorer.exe running: $($null -ne $explorer)"
+          $logPixels = (Get-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name LogPixels -ErrorAction SilentlyContinue).LogPixels
+          Write-Output "Current HKCU LogPixels (96=100%): $logPixels"
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Build Phase0CiSpikes
+        run: dotnet build spikes/Phase0CiSpikes/Phase0CiSpikes.fsproj -c Release
+
+      - name: Build Wm.Host
+        run: dotnet build src/Wm.Host/Wm.Host.fsproj -c Release
+
+      # ===== DPI override試行(非100%環境の再現、未検証——このジョブ自体がスパイク) =====
+      # Server Core(インタラクティブシェル無し)ではHKCU設定がどこまで意味を持つか不明なため、
+      # 設定前後でGetDpiForMonitor相当の実測値(Phase0CiSpikesのS11r等)を比較して確認する。
+      - name: Attempt to override DPI scaling to 150% (exploratory, may not take effect on Server Core)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          New-Item -Path 'HKCU:\Control Panel\Desktop' -Force | Out-Null
+          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'LogPixels' -Value 144 -Type DWord
+          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'Win8DpiScaling' -Value 1 -Type DWord
+          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'DesktopDPIOverride' -Value 1 -Type DWord
+          try {
+            rundll32.exe user32.dll,UpdatePerUserSystemParameters 1, True
+          } catch {
+            Write-Warning "UpdatePerUserSystemParameters failed: $_"
+          }
+          Write-Output "Set HKCU LogPixels=144 (intended 150%). Verifying via Phase0CiSpikes S11r-equivalent after this step."
+
+      - name: Run Phase0CiSpikes (includes S30 taskbar/WorkArea, S11r DPI query)
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path spikes/Phase0CiSpikes/bin/Release -Recurse -Filter Phase0CiSpikes.exe | Select-Object -First 1
+          if (-not $exe) { throw "Phase0CiSpikes.exe not found after build" }
+          & $exe.FullName | Tee-Object -FilePath phase0-gcp-windows-results.md
+
+      - name: Run Wm.Host (read-only observation + Phase B rounds)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $exe = Get-ChildItem -Path src/Wm.Host/bin/Release -Recurse -Filter Wm.Host.exe | Select-Object -First 1
+          if (-not $exe) { throw "Wm.Host.exe not found after build" }
+          & $exe.FullName | Tee-Object -FilePath wm-host-gcp-windows-report.txt
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gcp-windows-realcheck-results
+          path: |
+            phase0-gcp-windows-results.md
+            wm-host-gcp-windows-report.txt
+          if-no-files-found: warn
