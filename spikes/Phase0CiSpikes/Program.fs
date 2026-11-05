@@ -2835,7 +2835,7 @@ let spikeS31_PipeAclBclPath () =
             match dumpAppliedSecurity pipe.SafePipeHandle with
             | Ok actualSddl ->
                 log (sprintf "- actual SDDL read back via GetSecurityInfo: %s" actualSddl)
-                log (sprintf "- actual SDDL contains a mandatory-label ACE (S:(ML...)): %b" (actualSddl.Contains("S:(ML")))
+                log (sprintf "- actual SDDL contains a mandatory-label ACE ((ML;...)): %b" (actualSddl.Contains("(ML;")))
                 log (sprintf "- actual SDDL contains the requested user DACL ACE: %b" (actualSddl.Contains(userSid)))
             | Error e -> log (sprintf "- GetSecurityInfo readback failed: %s" e)
         with ex ->
@@ -2859,7 +2859,7 @@ let spikeS32_PipeAclPInvokeFallback () =
             match dumpAppliedSecurity server.SafePipeHandle with
             | Ok actualSddl ->
                 log (sprintf "- actual SDDL read back via GetSecurityInfo: %s" actualSddl)
-                log (sprintf "- actual SDDL contains a mandatory-label ACE (S:(ML...)): %b" (actualSddl.Contains("S:(ML")))
+                log (sprintf "- actual SDDL contains a mandatory-label ACE ((ML;...)): %b" (actualSddl.Contains("(ML;")))
             | Error e -> log (sprintf "- GetSecurityInfo readback failed: %s" e)
 
 // S33 (opus-review-named-pipe-transport.md Q1/5-B): measures FILE_FLAG_FIRST_PIPE_INSTANCE's
@@ -3007,6 +3007,10 @@ let spikeS35_RunAsClientTokenInspection () =
 
     tryRoundTrip TokenImpersonationLevel.Identification "Identification(実クライアントが使う想定のレベル)"
     tryRoundTrip TokenImpersonationLevel.Anonymous "Anonymous"
+    // 第1ラウンド(Identification)がRunAsClient自体の例外で失敗した場合、ImpersonationレベルならRunAsClientが
+    // 成功するか(= Identificationでは不十分で、クライアント側がImpersonationを許可しない限りサーバー側の
+    // トークン検査そのものが成立しないのか)を確認する。
+    tryRoundTrip TokenImpersonationLevel.Impersonation "Impersonation(RunAsClientにはこのレベル以上が要るのか確認)"
 
 // S36 (opus-review-named-pipe-transport.md Q2/5-D): PIPE_REJECT_REMOTE_CLIENTS has no public
 // PipeOptions equivalent, and whether .NET's own NamedPipeServerStream passes it internally by
@@ -3023,27 +3027,37 @@ let spikeS36_RemoteLikeConnectionRejected () =
         log "- server pipe created via raw CreateNamedPipe with PIPE_REJECT_REMOTE_CLIENTS set"
 
         let acceptTask1 = server.WaitForConnectionAsync()
-        (try
+        let connected1 =
             try
                 use client = new NamedPipeClientStream("localhost", pipeName, PipeDirection.InOut)
                 client.Connect(1500)
                 log "- \"localhost\"経由(SMBリダイレクタ経路)での接続: 成功した(=PIPE_REJECT_REMOTE_CLIENTSがループバックには効いていない)"
+                true
             with ex ->
                 log (sprintf "- \"localhost\"経由での接続: 拒否/失敗した (%s)" ex.Message)
-         finally
-            (try acceptTask1.Wait(500) |> ignore with _ -> ()))
-        server.Disconnect()
+                false
+        // 上の接続がCreateFile段階で拒否された場合、サーバー側は一度も接続を受け付けていないため
+        // Disconnect()を呼ぶとInvalidOperationExceptionになる(最初のCI実行で実際に踏んだ)。
+        // 第2ラウンド(対照実験の"."経由接続)は、状態を気にしなくて済むよう素直に別のパイプを使う。
+        if connected1 then
+            (try acceptTask1.Wait(500) |> ignore with _ -> ())
+            server.Disconnect()
 
-        let acceptTask2 = server.WaitForConnectionAsync()
-        (try
-            try
-                use client2 = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut)
-                client2.Connect(1500)
-                log "- \".\"経由での接続: 成功した(対照実験、想定通り)"
-            with ex ->
-                log (sprintf "- \".\"経由での接続が失敗(想定外): %s" ex.Message)
-         finally
-            (try acceptTask2.Wait(500) |> ignore with _ -> ()))
+        let pipeName2 = sprintf "winmonad-s36b-%d-%s" (Process.GetCurrentProcess().Id) (Guid.NewGuid().ToString("N").Substring(0, 8))
+        match tryCreateFirstInstancePipe pipeName2 None with
+        | Error e -> log (sprintf "- 対照実験用の2本目のpipe作成が失敗: %s" e)
+        | Ok server2 ->
+            use server2 = server2
+            let acceptTask2 = server2.WaitForConnectionAsync()
+            (try
+                try
+                    use client2 = new NamedPipeClientStream(".", pipeName2, PipeDirection.InOut)
+                    client2.Connect(1500)
+                    log "- \".\"経由での接続: 成功した(対照実験、想定通り)"
+                with ex ->
+                    log (sprintf "- \".\"経由での接続が失敗(想定外): %s" ex.Message)
+             finally
+                (try acceptTask2.Wait(500) |> ignore with _ -> ()))
 
 [<STAThread>]
 [<EntryPoint>]
