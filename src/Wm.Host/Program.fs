@@ -70,9 +70,11 @@ module Wm.Host.Program
 open System
 open System.Collections.Concurrent
 open System.Diagnostics
+open System.Drawing
 open System.IO
 open System.Runtime.InteropServices
 open System.Threading
+open System.Threading.Tasks
 open System.Windows.Forms
 open Wm.Contracts.Identifiers
 open Wm.Contracts.SharedVocabulary
@@ -118,8 +120,34 @@ let private printClassification (label: string) (reducer: Reducer) =
     |> Map.toSeq
     |> Seq.iter (fun (w, record) -> printfn "  %A -> %A" w record.Classification)
 
+/// ラウンド14（E-4全画面検出の前提、architecture.md §21）向けの使い捨て子プロセスモード：
+/// Wm.Hostのスコープ（「自分で作った使い捨てのテスト窓だけ」、型直前のラウンド3のコメント参照）
+/// を守ったまま他社プロセスの窓を用意するため、notepad.exe等の実アプリの代わりに自分自身を
+/// 子プロセスとして起動する（spikes/Phase0CiSpikes/Program.fsの`--hang-child`等と同じ方式）。
+let private runRound14Child () =
+    try
+        let form = new Form(Text = "wm-host-round14-child", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(50, 50, 300, 200))
+        form.Show()
+        for _ in 1 .. 10 do
+            Application.DoEvents()
+            Thread.Sleep(20)
+        printfn "HWND=%d" (int64 form.Handle)
+        Console.Out.Flush()
+        Thread.Sleep(15000)
+    with ex ->
+        printfn "ERROR=%s" (ex.Message.Replace("\n", " ").Replace("\r", ""))
+        Console.Out.Flush()
+        Environment.Exit(1)
+
 [<EntryPoint>]
-let main _argv =
+let main argv =
+    // spikes/Phase0CiSpikes/Program.fsの`suppressCrashDialogs`と同じ理由で、分岐より前に両方の
+    // プロセス（親・`--round14-child`子）で呼ぶ：子の未処理例外がWindows Error Reporting UIを
+    // 出すと、親の`StandardOutput.ReadLine()`がヘッドレスCIで無期限に止まる。
+    SetErrorMode(SEM_FAILCRITICALERRORS ||| SEM_NOGPFAULTERRORBOX) |> ignore
+    if argv.Length > 0 && argv.[0] = "--round14-child" then
+        runRound14Child ()
+        exit 0
     // DPI awareness宣言（v2.116、Opus敵対的レビュー`opus-review-frame-inset.md`論点1-G「Wm.Hostに
     // DPI awarenessの宣言が見当たらない」対策）：Per-Monitor V2を宣言しないプロセス（既定のUnaware）
     // では、`GetWindowRect`/`SetWindowPos`/`GetMonitorInfo`は仮想化された論理座標を返すが、
@@ -796,6 +824,89 @@ let main _argv =
 
     harness13.Stop()
     testForm13.Close()
+
+    // 段10：ラウンド14（E-4全画面検出の前提、architecture.md §21、opus-review-fullscreen-detection.md
+    // §0-1対応）。他社プロセス（自分自身を`--round14-child`で起動した子プロセス、ラウンド3の
+    // コメントが守る「自分で作った使い捨てのテスト窓だけ」を保ったまま他社プロセス扱いにできる）の
+    // 窓の矩形変化を、ラウンド4が使う既存の再観測経路（`RawReobserved`）で捉えられるかを、実際の
+    // Wm.Normalization→Wm.Runtimeパイプラインで確認する。`EventHooks.hookLocationChangeForProcess`
+    // （自プロセス限定）ではなく、ラウンド8がEVENT_SYSTEM_FOREGROUND向けに既に使っている汎用版
+    // `hookSingleEvent`（システム全体を購読し、呼び出し側のコールバックでHWNDを絞り込む）を使う——
+    // `EventHooks.fs`の`hookLocationChangeForProcess`の型直前のコメントが挙げる「全プロセス購読は
+    // 流量が大きすぎる」という懸念への対策は、この「安価なHWNDフィルタをコールバック内で先に行う」
+    // こと自体であり、それが実際に機能すること（追跡対象の子窓は再観測・Core投入まで届き、
+    // 追跡対象外の自作窓は一切Core投入に繋がらない）をここで確認する。spikes/Phase0CiSpikes/
+    // Program.fsのS28（F36）がWinEventHook単体で実証した「他社窓のLOCATIONCHANGEはシステム全体
+    // 購読で観測できる」ことを、ここでは実際のプロダクションパイプライン（Normalizer/Reducer）で
+    // 再確認する。境界スタイル（borderless）の読み取り（`GetWindowLong`）もここで配線するが、
+    // Core側の信念・抑止（`IsBorderless`/`PlacementState.Fullscreen`）はまだ実装していないため、
+    // このラウンドでは診断ログに出すだけで判断には使わない。
+    printfn "\n--- Round 14: filtered system-wide LOCATIONCHANGE observes a cross-process tracked window, ignores an untracked one (E-4 prerequisite) ---"
+    let reducer14 = Reducer(RuntimePolicy.defaults, "phase-b-round14", "wm-host-round14", "no-policy-artifact", None)
+    let mutable dispatchedCount14 = 0
+    let harness14 = EffectHarness(reducer14, liveNow, onDispatch = (fun e _ -> Interlocked.Increment(&dispatchedCount14) |> ignore; printfn "  [round14] UNEXPECTED dispatch: %A" e))
+    let submit14 = harness14.Submit
+    let pump14 (ms: int) = harness14.Pump ms
+
+    let exePath14 = Process.GetCurrentProcess().MainModule.FileName
+    let psi14 = ProcessStartInfo(exePath14, "--round14-child")
+    psi14.RedirectStandardOutput <- true
+    psi14.UseShellExecute <- false
+    let child14 = Process.Start(psi14)
+    // spikes/Phase0CiSpikes/Program.fsの`readLineWithTimeout`と同じ理由：`StandardOutput.ReadLine()`
+    // を無条件で待つと、子が何も書かずに終わる経路でここが無期限に止まる（同ファイルの実機CIで
+    // 実際に踏んだ既知の地雷と同じ形）。
+    let readLine14WithTimeout (timeoutMs: int) : string option =
+        let task = Task.Run<string>(Func<string>(fun () -> child14.StandardOutput.ReadLine()))
+        if task.Wait(timeoutMs) then Some task.Result else None
+    let mutable trackedHwnd = IntPtr.Zero
+    match readLine14WithTimeout 8000 with
+    | Some l when l <> null && l.StartsWith("HWND=") -> trackedHwnd <- IntPtr(Int64.Parse(l.Substring(5)))
+    | other -> printfn "  child did not report an HWND within timeout as expected (got %A)" other
+
+    use untrackedForm14 = new Form(Text = "wm-host-round14-untracked", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(400, 400, 300, 200))
+    untrackedForm14.Show()
+    pump14 300
+    let untrackedHwnd14 = untrackedForm14.Handle
+
+    if trackedHwnd = IntPtr.Zero then
+        printfn "  skipping Round 14 -- child window HWND unavailable"
+    else
+        let mutable trackedReobserveCount = 0
+        let mutable rawTrackedEvents = 0
+        let mutable rawUntrackedEvents = 0
+        let handleLocationChange14 (_eventType: uint32) (hwnd: IntPtr) =
+            if hwnd = trackedHwnd then
+                rawTrackedEvents <- rawTrackedEvents + 1
+                let now = liveNow ()
+                let snapshot = observeWindow now monitorHandles titleMatcher hwnd
+                let style = GetWindowLong(hwnd, GWL_STYLE)
+                let borderless = (style &&& (WS_CAPTION ||| WS_THICKFRAME)) = 0
+                printfn "  [round14] tracked (cross-process) window reobserved via system-wide LOCATIONCHANGE: borderless=%b rect=%A" borderless snapshot.NativeRect
+                for input in normalize (RawReobserved snapshot) do
+                    trackedReobserveCount <- trackedReobserveCount + 1
+                    submit14 now "wm-host-locationchange" input |> ignore
+            elif hwnd = untrackedHwnd14 then
+                // 意図的に何もしない：安価なHWNDフィルタで流量を抑えること自体の実証。
+                rawUntrackedEvents <- rawUntrackedEvents + 1
+
+        let locationHook14 = hookSingleEvent EVENT_OBJECT_LOCATIONCHANGE handleLocationChange14
+
+        SetWindowPos(trackedHwnd, IntPtr.Zero, 60, 60, 500, 350, SWP_NOZORDER ||| SWP_ASYNCWINDOWPOS) |> ignore
+        SetWindowPos(untrackedHwnd14, IntPtr.Zero, 410, 410, 350, 250, SWP_NOZORDER ||| SWP_ASYNCWINDOWPOS) |> ignore
+        pump14 500
+
+        locationHook14.Unhook()
+        printfn "Round 14 summary: rawTrackedEvents=%d rawUntrackedEvents=%d trackedReobserveCount=%d dispatched(unexpected)=%d"
+            rawTrackedEvents rawUntrackedEvents trackedReobserveCount dispatchedCount14
+        printfn "Round 14 PASSED (cross-process tracked window observed via the real pipeline, untracked window produced zero reobservation): %b"
+            (rawTrackedEvents > 0 && trackedReobserveCount > 0 && dispatchedCount14 = 0)
+
+    harness14.Stop()
+    (try
+        if not child14.HasExited then child14.Kill()
+     with _ -> ())
+    untrackedForm14.Close()
 
     printfn "\nDone."
     0

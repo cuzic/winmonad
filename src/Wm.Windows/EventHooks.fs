@@ -69,6 +69,13 @@ let hookEvents (onEvent: uint32 -> IntPtr -> unit) : HookSet =
 /// アンビエント全窓観測はこの頻度のイベントを診断用途で受ける理由が無い）。`idProcess`に自プロセスの
 /// PIDを渡すことで、自分で作った使い捨てテスト窓（ラウンド3/4が対象とする、architecture.md §7.1の
 /// 「隔離された自己所有窓だけ」の方針）だけに絞り込む。
+/// **ラウンド14（E-4全画面検出の前提、architecture.md §21）で判明**：他社窓の矩形変化を観測する
+/// には、この関数のように`idProcess`で絞るのではなく、`hookSingleEvent`（システム全体を購読し、
+/// コールバック側でHWNDを安価に絞り込む）を使う。流量への懸念自体は変わらないが、絞り込みを
+/// ネイティブフック登録時（`idProcess`）ではなくコールバック内（HWND比較、O(1)）で行うことで、
+/// 「追跡対象の窓だけ」に下流の処理（再観測・Core投入）を限定できる——Round 14はこの絞り込みが
+/// 実際に機能することを確認済み。残る未検証：実際の busy desktop でのネイティブイベント配送そのものの
+/// 頻度・コスト（CIの空のVMでは再現できない、既知の制約）。
 let hookLocationChangeForProcess (idProcess: uint32) (onEvent: uint32 -> IntPtr -> unit) : HookSet =
     let proc = WinEventProc(fun _hWinEventHook eventType hwnd idObject _idChild _idEventThread _dwmsEventTime ->
         if idObject = OBJID_WINDOW then onEvent eventType hwnd)

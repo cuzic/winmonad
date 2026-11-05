@@ -151,6 +151,25 @@ extern bool IsWindow(IntPtr hWnd)
 
 let WM_CLOSE = 0x0010u
 
+// Phase B ラウンド14：E-4全画面検出の前提（architecture.md §21、opus-review-fullscreen-detection.md）
+// 向けに追加。境界スタイル（WS_CAPTION/WS_THICKFRAME）の有無を読むためのAPI——
+// spikes/Phase0CiSpikes/Program.fsのS28/S30（F36/F37）で検証済みのシグネチャをそのまま移す。
+[<DllImport("user32.dll", SetLastError = true)>]
+extern int GetWindowLong(IntPtr hWnd, int nIndex)
+
+let GWL_STYLE = -16
+let WS_CAPTION = 0x00C00000
+let WS_THICKFRAME = 0x00040000
+
+/// spikes/Phase0CiSpikes/Program.fsの`suppressCrashDialogs`と同じ理由・同じシグネチャ：子プロセスの
+/// 未処理例外がWindows Error Reporting UIを出すと、親の`StandardOutput.ReadLine()`を無期限に
+/// 止める（ヘッドレスCIランナーには閉じる者がいない）。ラウンド14で子プロセスを初めて使うため移す。
+[<DllImport("kernel32.dll")>]
+extern uint32 SetErrorMode(uint32 uMode)
+
+let SEM_FAILCRITICALERRORS = 0x0001u
+let SEM_NOGPFAULTERRORBOX = 0x0002u
+
 let DWMWA_EXTENDED_FRAME_BOUNDS = 9
 let DWMWA_CLOAKED = 14
 let MDT_EFFECTIVE_DPI = 0
