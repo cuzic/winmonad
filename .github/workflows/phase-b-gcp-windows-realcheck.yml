@@ -1,8 +1,16 @@
-name: Phase B real-hardware check on GCP self-hosted Windows (non-default DPI / taskbar)
+name: Phase B build check on GCP self-hosted Windows (NOT for DPI/taskbar -- see note)
 
 # workflow_dispatch専用。push/pull_requestでは絶対にトリガーしない——
 # self-hosted runnerをpublic repoで使う安全上の必須条件
 # (cargo-ci-gcp-spot-instance Skillの「public repoでの安全性」参照)。
+#
+# v2.131で実行・確認済み：このGCP Windows runner（windows-2022-core、Server Core）は
+# 非100%DPI・タスクバー自動非表示の検証には使えない——explorer.exeが動いておらず
+# （シェル自体が無い）、DwmGetWindowAttributeもE_HANDLEで失敗する（インタラクティブな
+# デスクトップセッションが無い）。architecture.md §21参照。このworkflow自体は
+# 「windows-latestとは別のWindows環境でもビルドが通るか」程度の軽い確認（実際に
+# Marshal.SetLastWin32Error という実在しないAPIの呼び出しをここで発見した）として
+# 残す価値はあるが、DPI/taskbarの実測目的では再利用しないこと。
 on:
   workflow_dispatch: {}
 
