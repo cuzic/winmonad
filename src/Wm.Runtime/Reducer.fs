@@ -49,6 +49,14 @@ type Reducer(runtimePolicy: RuntimePolicy, sessionId: string, coreBuildId: strin
     /// 再代入されない。
     member _.LayoutRegistry = runtimePolicy.LayoutRegistry
 
+    /// Deploy Inspect（architecture.md §14/§10.2、v2.150）がJournal記録（`PolicyActivatedKind`）に
+    /// 使うSessionId。コンストラクタで渡されたまま再代入されない不変の環境値。
+    member _.SessionId = sessionId
+
+    /// Deploy Inspect（v2.150）が`ArtifactIdentity`の組み立て・Journal記録に使うCoreBuildId。
+    /// `SessionId`と同じ理由で安全に読める不変の環境値。
+    member _.CoreBuildId = coreBuildId
+
     /// 次にSubmitされる入力へ割り当てられる値（＝これまでに処理済みの入力件数）。Phase Cの
     /// Snapshot/Intervene（architecture.md §10.1/10.4）が参照する楽観的排他の起点として、
     /// Reducer所有スレッド以外からも安全に読める単調増加値を公開する。

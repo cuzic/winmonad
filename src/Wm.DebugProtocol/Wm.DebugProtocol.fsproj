@@ -15,6 +15,8 @@
     <Compile Include="ExplainJson.fs" />
     <Compile Include="Analyzer.fs" />
     <Compile Include="AnalyzerJson.fs" />
+    <Compile Include="Deploy.fs" />
+    <Compile Include="DeployJson.fs" />
     <Compile Include="WireFraming.fs" />
   </ItemGroup>
 

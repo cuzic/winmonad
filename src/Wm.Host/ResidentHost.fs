@@ -187,7 +187,9 @@ let private analyzerIssueDtoOf (issue: AnalyzerIssue) : AnalyzerIssueDto =
     | InvalidColumnCount(count, ruleId) -> InvalidColumnCountDto(count, ruleId)
     | DuplicateWorkspaceAssignment wsid -> DuplicateWorkspaceAssignmentDto wsid
 
-let private analyzerReportDtoOf (report: AnalyzerReport) : AnalyzerReportDto =
+/// `Wm.Host.PolicyArtifact`（v2.150、Deploy Inspect）も再利用するため公開（`SnapshotJson.fs`の
+/// `policyRuleIdOptionToJson`等と同じ「後続ファイルでの再利用のために`private`を外す」規約）。
+let analyzerReportDtoOf (report: AnalyzerReport) : AnalyzerReportDto =
     { Errors = report.Errors |> List.map analyzerIssueDtoOf }
 
 /// Analyzer Inspect（architecture.md §10.2、v2.149）：クライアントが送ってきた候補`PolicyDto`を、

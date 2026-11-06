@@ -4,10 +4,14 @@
 /// `PolicyArtifactHash`フィールドに実際のhashを載せる）・Rollback・起動時の「報告のみモード」を
 /// まとめて実装する（ユーザー決定2026-11-06：§14をほぼ全部、一気に）。
 ///
-/// **スコープ外として明示的に見送ったもの**：Named Pipe越しの`op=deploy`配線——この一式を直接
-/// 呼ぶ経路（Program.fsの実演Round）では実証できるが、InspectPipeServer/WmClientへの新規Inspect
-/// 操作の追加は別スライス（Snapshot/Policy/Journal/Explainと同じ形で機械的に追加できる）。
-/// architecture.md §14自身が言う「トレイ通知」も同様に対象外——`Wm.Host`にはトレイUIが無いという
+/// `op=deploy`のNamed Pipe配線は`deployCandidateOf`（v2.150）としてこのファイルに実装済み——ユーザー
+/// 決定2026-11-06：このスライスは「検証＋保存＋Journal記録」までで、Reducerの実行中Policyは
+/// swapしない。`InputEvent.PolicyActivated`は`WmState.step`で一切パターンマッチされておらず
+/// （正規の`| _ ->`に落ちる）、ライブ切替自体は§21の未決事項のまま——新Policyを実際に有効化するには
+/// 現時点ではHost再起動が必要（§21にその旨を明記する）。`ArtifactIdentity`はクライアントから受け取らず
+/// Host自身が`buildArtifactIdentity`で組み立てる（§14「クライアントの自己申告を信用しない」の実演、
+/// v2.149のAnalyzerと同じ原則）。architecture.md §14自身が言う「トレイ通知」は依然対象外——`Wm.Host`
+/// にはトレイUIが無いという
 /// 既知の欠落（Probe用UIと同じ、Phase Eへ）で、通知の「配信先」が無いため。代わりに
 /// `PolicyStaleAnalysisKind`としてJournalへ記録することまでは行う——Inspectの`Journal`操作
 /// （v2.147）で見られる、という形に留める。
@@ -29,8 +33,10 @@ open Wm.Contracts.SharedVocabulary
 open Wm.Contracts.JournalTypes
 open Wm.Policy.PolicyTypes
 open Wm.Policy.PolicyAnalyzer
+open Wm.Layouts.LayoutRegistry
 open Wm.DebugProtocol.Policy
 open Wm.DebugProtocol.PolicyJson
+open Wm.DebugProtocol.Deploy
 open Wm.Host.ResidentHost
 
 let private sha256Hex (bytes: byte[]) : string =
@@ -315,3 +321,37 @@ let rollback (baseDir: string) (journalPath: string) (manifest: RegistryManifest
             match link manifest pinned with
             | Error errs -> Error(RollbackLinkFailed errs)
             | Ok _ -> Ok pinned
+
+/// §14自身が明記する「analyzerVersion」/「normalizerSchemaVersion」の実際のバージョニング規約は
+/// まだコードに無い（ファイル冒頭コメント参照、Phase Eの配布タスクの領域）。Round 24のテストで
+/// 使った値と揃えた固定値として扱う。
+let private deployPolicySchemaVersion = 1
+let private deployNormalizerSchemaVersion = 1
+let private deployAnalyzerVersion = "v1"
+
+/// `op=deploy`（architecture.md §10.2、v2.150）。クライアントは候補`PolicyDto`だけを送り、
+/// `ArtifactIdentity`はHost自身が自分の採用中Registry/CoreBuildIdから`buildArtifactIdentity`で
+/// 組み立てる（§14「クライアントの自己申告を信用しない」、v2.149のAnalyzerと同じ原則）。成功時は
+/// `savePinnedPolicy`で`artifacts/policy/`へ保存し、`journalPath`があれば`recordPolicyActivated`で
+/// `PolicyActivatedKind`を記録する。ユーザー決定2026-11-06：このスライスはここまでで、Reducerの
+/// 実行中Policyはswapしない（ファイル冒頭コメント参照、ライブ切替には現時点でHost再起動が必要）。
+let deployCandidateOf
+    (baseDir: string)
+    (registry: Registry)
+    (journalPath: string option)
+    (sessionId: string)
+    (coreBuildId: string)
+    (now: int64)
+    (candidate: PolicyDto)
+    : DeployResultDto =
+    let manifest = Registry.toManifest registry
+    let ir = policyIrOf candidate
+    let identity =
+        buildArtifactIdentity deployPolicySchemaVersion ir manifest coreBuildId deployNormalizerSchemaVersion deployAnalyzerVersion
+    match deploy manifest candidate identity with
+    | Error(DeployIntegrityFailed(HashMismatch(expected, actual))) -> DeployIntegrityFailedDto(expected, actual)
+    | Error(DeployAnalysisFailed report) -> DeployAnalysisFailedDto(analyzerReportDtoOf report)
+    | Ok deployable ->
+        savePinnedPolicy baseDir (DeployablePolicy.pinned deployable)
+        journalPath |> Option.iter (fun path -> recordPolicyActivated path sessionId coreBuildId identity.ArtifactHash "deploy" now)
+        DeploySucceededDto identity.ArtifactHash

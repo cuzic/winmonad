@@ -6,8 +6,9 @@
 ///
 /// §10.3の概念コード（`let! wm = WmClient.connectLocalAsync ()`、`let! snapshot = wm.SnapshotAsync()`、
 /// `let! diagnostics = wm.AnalyzeAsync(rules)`）のうち、Inspectの5操作（Snapshot/Policy/Journal/
-/// Explain/Analyzer、v2.145/v2.147/v2.149）を実装済み——Fork/Probe/Intervene/Deployは後続のスライス
-/// （memory `project_named_pipe_ipc_task_breakdown.md`参照）。
+/// Explain/Analyzer、v2.145/v2.147/v2.149）とDeploy（v2.150、§14のPolicyArtifact検証＋保存＋
+/// Journal記録まで。Reducerの実行中Policyはswapしない）を実装済み——Fork/Probe/Interveneは後続の
+/// スライス（memory `project_named_pipe_ipc_task_breakdown.md`参照）。
 module Wm.ReplClient.WmClient
 
 open System
@@ -29,6 +30,8 @@ open Wm.DebugProtocol.Explain
 open Wm.DebugProtocol.ExplainJson
 open Wm.DebugProtocol.Analyzer
 open Wm.DebugProtocol.AnalyzerJson
+open Wm.DebugProtocol.Deploy
+open Wm.DebugProtocol.DeployJson
 open Wm.DebugProtocol.WireFraming
 
 /// 接続済みのクライアント。コンストラクタは`internal`——`connectAsync`/`connectLocalAsync`
@@ -88,6 +91,14 @@ type WmClient internal (pipe: NamedPipeClientStream) =
     /// すでに分析済みだという主張）は無く、常にHost側で再実行する（§14と同じ原則）。
     member this.AnalyzeAsync(candidate: PolicyDto) : Task<Result<AnalyzerReportDto, TransportError>> =
         this.RequestAsync "analyze" (fun req -> req.["policy"] <- policyDtoToJson candidate) analyzerReportDtoOfJson
+
+    /// §10.2「Inspect」のうちDeploy（v2.150で追加、§14完成により前提解消）。候補`PolicyDto`を送る
+    /// だけで、`ArtifactIdentity`はクライアントからは渡さない——Hostが自分自身のRegistry/CoreBuildId
+    /// から組み立てる（§14と同じ「クライアントの自己申告を信用しない」原則）。このスライスは
+    /// 検証＋`artifacts/policy/`への保存＋Journal記録までで、Reducerの実行中Policyはswapしない
+    /// （ユーザー決定2026-11-06、ライブ切替には現時点でHost再起動が必要）。
+    member this.DeployAsync(candidate: PolicyDto) : Task<Result<DeployResultDto, TransportError>> =
+        this.RequestAsync "deploy" (fun req -> req.["policy"] <- policyDtoToJson candidate) deployResultDtoOfJson
 
 /// パイプ名を直接知っている場合に使う経路。§10.1「クライアントは`TokenImpersonationLevel.Impersonation`
 /// で接続する」（F42、ユーザー決定2026-11-05——サーバーが`RunAsClient`で実トークンを読むにはこれが
