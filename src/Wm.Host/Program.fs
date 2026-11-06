@@ -103,6 +103,7 @@ open Wm.Host.PolicyArtifact
 open Wm.Host.InspectPipeServer
 open Wm.DebugProtocol.Snapshot
 open Wm.DebugProtocol.SnapshotJson
+open Wm.DebugProtocol.Policy
 open Wm.DebugProtocol.Explain
 open Wm.DebugProtocol.Analyzer
 open Wm.DebugProtocol.WireFraming
