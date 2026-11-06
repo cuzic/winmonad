@@ -23,8 +23,12 @@ open System.Diagnostics
 open System.IO.Pipes
 open System.Runtime.InteropServices
 open System.Security.Principal
+open System.Text
+open System.Text.Json
 open System.Threading
 open Microsoft.Win32.SafeHandles
+open Wm.DebugProtocol.Snapshot
+open Wm.DebugProtocol.SnapshotJson
 
 module private Native =
     [<StructLayout(LayoutKind.Sequential)>]
@@ -193,3 +197,74 @@ let runAcceptLoop (pipe: NamedPipeServerStream) (ct: CancellationToken) (onClien
                 pipe.Disconnect()
             with _ ->
                 ()
+
+/// 1メッセージの最大バイト数（opus-review-named-pipe-transport.md 5-E対応）。
+let maxMessageBytes = 1 <<< 20 // 1 MiB
+
+let private readExact (stream: PipeStream) (buf: byte[]) =
+    let mutable offset = 0
+    while offset < buf.Length do
+        let n = stream.Read(buf, offset, buf.Length - offset)
+        if n = 0 then failwith "pipe closed before message complete"
+        offset <- offset + n
+
+/// 長さプレフィックス（4バイトリトルエンディアンUInt32）＋UTF8本体。長さを読んだ時点で上限を
+/// 超えていればバッファ確保前に例外を投げる（opus-review 1-5/5-E対応）。**既知の未実装点**：
+/// ハンドシェイク/読み取り途中/アイドルの3種タイムアウト（opus-review 5-E）はこのスライスでは
+/// まだ実装しない——今はテスト専用の呼び出し元しかおらず、スロウロリス対策は本番公開前の
+/// 別スライスで必須にする。
+let readFramedMessage (stream: PipeStream) : byte[] =
+    let lenBuf = Array.zeroCreate<byte> 4
+    readExact stream lenBuf
+    let len = int (BitConverter.ToUInt32(lenBuf, 0))
+    if len > maxMessageBytes then
+        failwithf "incoming message (%d bytes) exceeds maxMessageBytes (%d)" len maxMessageBytes
+    let buf = Array.zeroCreate<byte> len
+    readExact stream buf
+    buf
+
+let writeFramedMessage (stream: PipeStream) (payload: byte[]) =
+    if payload.Length > maxMessageBytes then
+        failwithf "outgoing message (%d bytes) exceeds maxMessageBytes (%d)" payload.Length maxMessageBytes
+    let lenBuf = BitConverter.GetBytes(uint32 payload.Length)
+    stream.Write(lenBuf, 0, 4)
+    stream.Write(payload, 0, payload.Length)
+    stream.Flush()
+
+let private protocolVersion = 1
+
+type InspectRequest = | SnapshotRequest
+
+/// リクエストのJSONパースは標準の`System.Text.Json`を使う（信頼境界の内側に入ってくる入力を
+/// 手書きパーサで読まない、opus-review-named-pipe-transport.md 1-5対応——`Wm.Journal`の手書き
+/// `JsonNode`規約は「書き出し」専用であり、こちらは受信＝逆方向）。
+let private parseRequest (bytes: byte[]) : Result<InspectRequest, string> =
+    try
+        use doc = JsonDocument.Parse(bytes, JsonDocumentOptions(MaxDepth = 8))
+        let root = doc.RootElement
+        let v = root.GetProperty("v").GetInt32()
+        if v <> protocolVersion then
+            Error(sprintf "unsupported protocol version %d (expected %d)" v protocolVersion)
+        else
+            match root.GetProperty("op").GetString() with
+            | "snapshot" -> Ok SnapshotRequest
+            | other -> Error(sprintf "unknown op '%s'" other)
+    with ex ->
+        Error(sprintf "malformed request: %s" ex.Message)
+
+/// 1接続ぶんのInspectハンドラ本体。`principal`/`ownRid`による多層防御（カーネルのDACL/ラベルを
+/// 通過したはずの接続だが、ここでも「同一ユーザー・Host自身の整合性レベル以上」を再確認する）→
+/// 1件のリクエストを読む→`getSnapshot`を呼んで応答する、という最小の往復を実装する。Inspect
+/// （§10.2「Snapshot、Policy、Journal、Explain、Analyzerを見る」）のうちSnapshotだけがこの
+/// スライスの対象——Policy/Journal/Explain/Analyzerは後続。
+let handleOneRequest (pipe: NamedPipeServerStream) (principal: Result<ClientPrincipal, string>) (ownRid: int option) (getSnapshot: unit -> SnapshotDto) : unit =
+    let authorized =
+        match principal, ownRid with
+        | Ok p, Some own -> p.IntegrityRid >= own
+        | _ -> false
+    if authorized then
+        match parseRequest (readFramedMessage pipe) with
+        | Error _ -> ()
+        | Ok SnapshotRequest ->
+            let json = snapshotDtoToJson (getSnapshot ())
+            writeFramedMessage pipe (Encoding.UTF8.GetBytes(json.ToJsonString()))

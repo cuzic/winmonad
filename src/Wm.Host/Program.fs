@@ -75,6 +75,8 @@ open System.IO
 open System.IO.Pipes
 open System.Runtime.InteropServices
 open System.Security.Principal
+open System.Text
+open System.Text.Json.Nodes
 open System.Threading
 open System.Threading.Tasks
 open System.Windows.Forms
@@ -94,6 +96,8 @@ open Wm.Windows.EventHooks
 open Wm.Host.EffectHarness
 open Wm.Host.ResidentHost
 open Wm.Host.InspectPipeServer
+open Wm.DebugProtocol.Snapshot
+open Wm.DebugProtocol.SnapshotJson
 
 /// Phase B ラウンド7：`RegisterHotKey`→`WM_HOTKEY`を受け取るためだけの、見えない専用窓。
 /// `WM_HOTKEY`は`RegisterHotKey`に渡したHWNDへ配送されるので、`Application.DoEvents()`で
@@ -1001,6 +1005,69 @@ let main argv =
         let stoppedInTime16 = acceptThread16.Join(3000)
         printfn "Round 16 PASSED (Impersonation-level client connected to the dynamically-ACL'd pipe, server verified the real client token via RunAsClient matches this process's own integrity level, accept loop stopped cleanly): %b"
             (connectOk16 && principalMatchesOwnIntegrity16 && stoppedInTime16)
+
+    // Round 17：Named Pipeのワイヤプロトコル＋Snapshot応答（architecture.md v2.135/10.1）。
+    // ResidentHost（Round 15）とInspectPipeServer（Round 16）を初めて組み合わせ、Phase Cの
+    // 最初のゴール——別プロセス相当のクライアントが実際のパイプ経由でSnapshotAsync()を呼んで
+    // 実データを受け取る——を完成させる。長さプレフィックス＋`System.Text.Json`での受信
+    // （opus-review 1-5対応）、`protocolVersion`付きリクエスト、Inspectの多層防御（接続時の
+    // カーネルACL/ラベルに加え、アプリ層でも整合性レベルを再確認）を実際に1回のパイプ往復で通す。
+    printfn "\n--- Round 17: Named Pipe wire protocol, end-to-end Snapshot round-trip ---"
+    let journalPath17 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round17-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    let reducer17 = Reducer(RuntimePolicy.defaults, "phase-b-round17", "wm-host-round17", "no-policy-artifact", Some journalPath17)
+    let residentHost17 = ResidentHost(reducer17, liveNow)
+    let loopThread17 = Thread(fun () -> residentHost17.Run(tickMs = 1))
+    loopThread17.IsBackground <- true
+    loopThread17.Start()
+    Thread.Sleep(50)
+
+    let pipeName17 = generatePipeName ()
+    match createRestrictedPipe pipeName17 with
+    | Error e ->
+        printfn "Round 17 FAILED (createRestrictedPipe): %s" e
+        residentHost17.RequestStop()
+        loopThread17.Join(3000) |> ignore
+    | Ok pipe17 ->
+        use pipe17 = pipe17
+        use cts17 = new CancellationTokenSource()
+        let ownRid17 = ownIntegrityRid ()
+        let acceptThread17 =
+            Thread(fun () ->
+                runAcceptLoop pipe17 cts17.Token (fun p principal ->
+                    try
+                        handleOneRequest p principal ownRid17 (fun () -> residentHost17.EnqueueSnapshotQuery().Result)
+                    with _ -> ()))
+        acceptThread17.IsBackground <- true
+        acceptThread17.Start()
+        Thread.Sleep(100)
+
+        let roundTripOk17, roundTripError17, receivedSnapshot17 =
+            try
+                use client17 = new NamedPipeClientStream(".", pipeName17, PipeDirection.InOut, PipeOptions.None, TokenImpersonationLevel.Impersonation)
+                client17.Connect(2000)
+                writeFramedMessage client17 (Encoding.UTF8.GetBytes("""{"v":1,"op":"snapshot"}"""))
+                let responseBytes = readFramedMessage client17
+                let json = JsonNode.Parse(Encoding.UTF8.GetString responseBytes)
+                true, "", Some(snapshotDtoOfJson json)
+            with ex ->
+                false, ex.Message, None
+
+        let directSnapshot17 = residentHost17.EnqueueSnapshotQuery().Result
+        let matches17 =
+            match receivedSnapshot17 with
+            | Some s -> s.Revision = directSnapshot17.Revision && s.Windows = directSnapshot17.Windows
+            | None -> false
+
+        printfn "Round 17 wire round-trip: ok=%b error=%s" roundTripOk17 roundTripError17
+        printfn "Round 17 received=%A" receivedSnapshot17
+        printfn "Round 17 direct  =%A" directSnapshot17
+
+        cts17.Cancel()
+        let acceptStopped17 = acceptThread17.Join(3000)
+        residentHost17.RequestStop()
+        let loopStopped17 = loopThread17.Join(3000)
+        printfn "Round 17 PASSED (real SnapshotDto delivered end-to-end over the actual Named Pipe, matches a direct ResidentHost query, both threads stopped cleanly): %b"
+            (roundTripOk17 && matches17 && acceptStopped17 && loopStopped17)
 
     printfn "\nDone."
     0
