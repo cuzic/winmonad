@@ -505,3 +505,40 @@ let onWindowVanished (w: WindowId) (registry: WindowRegistry) : WindowRegistry =
         Records = Map.remove w registry.Records
         Identity = Map.remove w registry.Identity
         ClassInputs = Map.remove w registry.ClassInputs }
+
+/// Phase CのInspect（§10.2）が読む、1窓ぶんの外部向け分類ビュー。`ToggleFloating`（443-452行目）の
+/// `Classified (EffFloating,_) -> Floating` / `Classified (EffExcluded,_) -> Excluded`と同じ
+/// `EffectiveManagement -> Management`変換を一般化したもの——Wm.Host側（Shell）で独自に重複定義する
+/// のではなく、Coreの純粋関数としてここに1箇所だけ置く（Wm.CoreはContracts型`Management`/
+/// `PolicyRuleId`に既に依存しているため、新規依存は不要）。`EffUnplaced`はPolicy側の`Management`に
+/// 対応ケースが無いため`None`に落とす（`NotCandidate`/`AwaitingEvidence`と区別できなくなる既知の
+/// 簡略化、Inspectを本実装するスライスで型を見直す）。
+let classificationToManagement (c: ClassificationState) : Management option * PolicyRuleId option =
+    match c with
+    | NotCandidate -> None, None
+    | AwaitingEvidence _ -> None, None
+    | Classified (eff, by) ->
+        let management =
+            match eff with
+            | EffTiled -> Some Tiled
+            | EffFloating -> Some Floating
+            | EffExcluded -> Some Excluded
+            | EffUnplaced -> None
+        let matchedRule =
+            match by with
+            | ByPolicy ruleId -> ruleId
+            | ByTimeout
+            | ByUserOverride
+            | ByOscillation -> None
+        management, matchedRule
+
+/// `WindowRegistry`全体を`classificationToManagement`で射影したもの。`Wm.DebugProtocol.SnapshotDto`
+/// 型そのものはCoreが依存できない（§17の依存方向：Wm.DebugProtocolはContractsのみに依存）ため、
+/// Contracts型だけで表現できるこの中間表現を返す——呼び出し側（Wm.Host）はこれをSnapshotDto/
+/// WindowSnapshotDtoへfield-for-foldで詰め替えるだけでよく、分類の判断そのものはここに閉じる。
+let registryManagementSnapshot (registry: WindowRegistry) : (WindowId * Management option * PolicyRuleId option) list =
+    registry.Records
+    |> Map.toList
+    |> List.map (fun (w, record) ->
+        let management, matchedRule = classificationToManagement record.Classification
+        w, management, matchedRule)

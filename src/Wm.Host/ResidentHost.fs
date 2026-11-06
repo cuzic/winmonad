@@ -21,8 +21,6 @@ open System.Threading
 open System.Threading.Tasks
 open System.Windows.Forms
 open Wm.Contracts.CoreCommand
-open Wm.Contracts.Identifiers
-open Wm.Contracts.SharedVocabulary
 open Wm.Core.Windows
 open Wm.Runtime.Reducer
 open Wm.Host.EffectHarness
@@ -32,28 +30,17 @@ open Wm.DebugProtocol.Snapshot
 /// 問い合わせ元スレッドはただ`Task`を待てばよい。
 type SnapshotQuery = TaskCompletionSource<SnapshotDto>
 
-/// `ClassificationState`（Wm.Core内部表現）をSnapshotDtoの`Management option * PolicyRuleId option`へ
-/// 射影する。`EffUnplaced`（NotMovableの窓、v2.6/R5-3）はPolicy側の`Management`（Tiled|Floating|
-/// Excluded）に対応ケースが無いため、このスキトンでは`None`に落とす（NotCandidate/AwaitingEvidenceと
-/// 見分けが付かなくなる既知の簡略化——Inspect機能を本実装するスライスで型を見直す）。
-let private projectClassification (c: ClassificationState) : Management option * PolicyRuleId option =
-    match c with
-    | NotCandidate -> None, None
-    | AwaitingEvidence _ -> None, None
-    | Classified(eff, by) ->
-        let management =
-            match eff with
-            | EffTiled -> Some Tiled
-            | EffFloating -> Some Floating
-            | EffExcluded -> Some Excluded
-            | EffUnplaced -> None
-        let matchedRule =
-            match by with
-            | ByPolicy ruleId -> ruleId
-            | ByTimeout
-            | ByUserOverride
-            | ByOscillation -> None
-        management, matchedRule
+/// `WmState`＋リビジョン番号から`SnapshotDto`を組み立てる純粋関数（FCIS、ADR-002）。分類の判断
+/// そのものは`Wm.Core.Windows.registryManagementSnapshot`（Functional Core）に閉じており、ここで
+/// やっているのはその結果を`SnapshotDto`/`WindowSnapshotDto`（Wm.DebugProtocol、§17の依存方向で
+/// Coreはこちらへ依存できない）へfield-for-fieldで詰め替えるだけ。生きている`Reducer`を
+/// 一切要求しないため、`WmState`の値だけでユニットテストできる。
+let snapshotOf (state: Wm.Core.WmState.WmState) (revision: int64) : SnapshotDto =
+    { Revision = revision
+      Windows =
+        registryManagementSnapshot state.Windows
+        |> List.map (fun (w, management, matchedRule) ->
+            { Window = w; Management = management; MatchedRule = matchedRule }) }
 
 /// Reducerを1つ所有し、常駐ループとして回り続ける骨格。`Run()`を呼んだスレッドだけがReducer状態へ
 /// 触れる（ADR-012の単一スレッドアクセス不変条件をSnapshotクエリにも適用する）。
@@ -62,14 +49,7 @@ type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
     let queries = ConcurrentQueue<SnapshotQuery>()
     let cts = new CancellationTokenSource()
 
-    let projectSnapshot () : SnapshotDto =
-        { Revision = reducer.Sequence
-          Windows =
-            reducer.State.Windows.Records
-            |> Map.toList
-            |> List.map (fun (w, record) ->
-                let management, matchedRule = projectClassification record.Classification
-                { Window = w; Management = management; MatchedRule = matchedRule }) }
+    let projectSnapshot () : SnapshotDto = snapshotOf reducer.State reducer.Sequence
 
     /// 他スレッド（将来のNamed Pipe接続スレッド）から呼ぶ。即座には解決しない——次の`Run`ループの
     /// イテレーションで、Reducer所有スレッドがキューを汲んで`SetResult`する。

@@ -605,3 +605,51 @@ let ``ClearUserOverrideはByOscillationの窓にも作用し、Policyの分類�
     match (Map.find w registry3.Records).Classification with
     | Classified (EffTiled, ByPolicy (Some (PolicyRuleId "r"))) -> ()
     | other -> Assert.True(false, sprintf "unexpected: %A" other)
+
+// ===== classificationToManagement / registryManagementSnapshot（Phase C Inspect、§10.2） =====
+// FCISレビューで、元はWm.Host/ResidentHost.fsに重複して書かれていた純粋な分類マッピングをここへ
+// 寄せた(2026-11-05)。Reducer/EffectHarnessを一切立てずにテストできることが、このCore移設の目的。
+
+[<Fact>]
+let ``classificationToManagement: NotCandidateはNone,None`` () =
+    Assert.Equal((None, None), classificationToManagement NotCandidate)
+
+[<Fact>]
+let ``classificationToManagement: AwaitingEvidenceはNone,None`` () =
+    Assert.Equal((None, None), classificationToManagement (AwaitingEvidence(100L, Some (WorkspaceId 0))))
+
+[<Fact>]
+let ``classificationToManagement: EffTiledはTiled,マッチしたルール`` () =
+    let result = classificationToManagement (Classified (EffTiled, ByPolicy (Some (PolicyRuleId "r"))))
+    Assert.Equal((Some Tiled, Some (PolicyRuleId "r")), result)
+
+[<Fact>]
+let ``classificationToManagement: EffFloatingはFloating`` () =
+    Assert.Equal((Some Floating, None), classificationToManagement (Classified (EffFloating, ByTimeout)))
+
+[<Fact>]
+let ``classificationToManagement: EffExcludedはExcluded`` () =
+    Assert.Equal((Some Excluded, None), classificationToManagement (Classified (EffExcluded, ByUserOverride)))
+
+[<Fact>]
+let ``classificationToManagement: EffUnplacedはNone(NotCandidate/AwaitingEvidenceと区別できない既知の簡略化)`` () =
+    Assert.Equal((None, None), classificationToManagement (Classified (EffUnplaced, ByOscillation)))
+
+[<Fact>]
+let ``classificationToManagement: ByPolicyのruleIdがNoneならDefaultManagement扱いでNone`` () =
+    Assert.Equal((Some Tiled, None), classificationToManagement (Classified (EffTiled, ByPolicy None)))
+
+[<Fact>]
+let ``registryManagementSnapshot: Recordsの全窓を分類結果へ射影する`` () =
+    let policy = { basePolicy with WindowRules = [ windowRule "r" 10 AnyWindow Tiled ] }
+    let ctx = ctxWith policy 0L
+    let w1 = WindowId 1L
+    let w2 = WindowId 2L
+    let registry1, _, _, _ = onWindowObserved ctx (visibleSnapshot w1) initial
+    let registry2, _, _, _ = onWindowObserved ctx (visibleSnapshot w2) registry1
+    let registry3, _ = onOscillationDegraded w2 registry2
+    let snapshot = registryManagementSnapshot registry3 |> List.sortBy (fun (WindowId id, _, _) -> id)
+    Assert.Equal<(WindowId * Management option * PolicyRuleId option) list>(
+        [ w1, Some Tiled, Some (PolicyRuleId "r")
+          w2, Some Floating, None ],
+        snapshot)
