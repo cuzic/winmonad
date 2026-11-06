@@ -90,6 +90,7 @@ open Wm.Windows.Native
 open Wm.Windows.RealObservation
 open Wm.Windows.EventHooks
 open Wm.Host.EffectHarness
+open Wm.Host.ResidentHost
 
 /// Phase B ラウンド7：`RegisterHotKey`→`WM_HOTKEY`を受け取るためだけの、見えない専用窓。
 /// `WM_HOTKEY`は`RegisterHotKey`に渡したHWNDへ配送されるので、`Application.DoEvents()`で
@@ -915,6 +916,40 @@ let main argv =
         if not child14.HasExited then child14.Kill()
      with _ -> ())
     untrackedForm14.Close()
+
+    // Round 15：常駐Hostモードの骨格（architecture.md v2.135、opus-review-named-pipe-transport.md
+    // 1-2対応）。Round 1〜14はいずれも「固定の実時間だけ回して終わる」デモだったが、ここで初めて
+    // ResidentHost（Reducer所有スレッド＋外部スレッドからのSnapshotクエリキュー＋スレッドセーフな
+    // 停止要求）を実際に別スレッドで走らせ、(1)別スレッドからのクエリがResidentHost自身のループ
+    // スレッドによって処理され往復すること、(2)別スレッドからのRequestStop()で実際にループが
+    // 終了すること、の2点を実機で確認する。Named Pipeサーバー自体やS31〜S36のACL/整合性レベル
+    // 検査はまだ繋がない——これは次のスライス。
+    printfn "\n--- Round 15: ResidentHost skeleton (cross-thread snapshot query + graceful stop) ---"
+    let journalPath15 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round15-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    printfn "Round 15 journal: %s" journalPath15
+    let reducer15 = Reducer(RuntimePolicy.defaults, "phase-b-round15", "wm-host-round15", "no-policy-artifact", Some journalPath15)
+    let residentHost15 = ResidentHost(reducer15, liveNow)
+    let loopThread15 = Thread(fun () -> residentHost15.Run(tickMs = 1))
+    loopThread15.IsBackground <- true
+    loopThread15.Start()
+
+    // ループスレッドが実際に回り始める猶予。
+    Thread.Sleep(50)
+    let queryTask15 = residentHost15.EnqueueSnapshotQuery()
+    let queryCompleted15 = queryTask15.Wait(2000)
+    let snapshotOk15 =
+        queryCompleted15
+        && queryTask15.Result.Revision = 0L
+        && List.isEmpty queryTask15.Result.Windows
+    printfn "Round 15 snapshot query: completed=%b revision=%s windows=%d"
+        queryCompleted15
+        (if queryCompleted15 then string queryTask15.Result.Revision else "n/a")
+        (if queryCompleted15 then List.length queryTask15.Result.Windows else -1)
+
+    residentHost15.RequestStop()
+    let stoppedInTime15 = loopThread15.Join(3000)
+    printfn "Round 15 PASSED (cross-thread snapshot query answered by the owning loop thread, RequestStop() actually terminated the loop): %b"
+        (snapshotOk15 && stoppedInTime15)
 
     printfn "\nDone."
     0

@@ -15,6 +15,7 @@
 
   <ItemGroup>
     <Compile Include="EffectHarness.fs" />
+    <Compile Include="ResidentHost.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 
@@ -27,6 +28,7 @@
     <ProjectReference Include="../Wm.Journal/Wm.Journal.fsproj" />
     <ProjectReference Include="../Wm.Runtime/Wm.Runtime.fsproj" />
     <ProjectReference Include="../Wm.Windows/Wm.Windows.fsproj" />
+    <ProjectReference Include="../Wm.DebugProtocol/Wm.DebugProtocol.fsproj" />
   </ItemGroup>
 
 </Project>

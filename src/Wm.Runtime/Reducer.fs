@@ -18,6 +18,11 @@ type Reducer(runtimePolicy: RuntimePolicy, sessionId: string, coreBuildId: strin
     member _.State = state
     member _.Timers = timers
 
+    /// 次にSubmitされる入力へ割り当てられる値（＝これまでに処理済みの入力件数）。Phase Cの
+    /// Snapshot/Intervene（architecture.md §10.1/10.4）が参照する楽観的排他の起点として、
+    /// Reducer所有スレッド以外からも安全に読める単調増加値を公開する。
+    member _.Sequence = sequence
+
     /// §7.1固定順序：「入力をJournalに書いてから`step`を呼ぶ」。これにより`step`実行中に例外を起こした
     /// 入力（poison input）が必ずJournalに残り、Replayで再現できる。
     member _.Submit (now: int64) (source: string) (input: InputEvent) : StepResult =
