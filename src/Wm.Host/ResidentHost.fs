@@ -82,13 +82,13 @@ let policyDtoOf (policy: PolicyIR) : PolicyDto =
     { SchemaVersion = policy.SchemaVersion
       WindowRules =
         policy.WindowRules
-        |> List.map (fun (r: WindowRule) : WindowRuleDto ->
-            { Id = r.Id; Priority = r.Priority; When = windowPredicateDtoOf r.When; Apply = r.Apply })
+        |> List.map (fun (r: WindowRule) ->
+            ({ Id = r.Id; Priority = r.Priority; When = windowPredicateDtoOf r.When; Apply = r.Apply }: WindowRuleDto))
       DefaultManagement = policy.DefaultManagement
       LayoutRules =
         policy.LayoutRules
-        |> List.map (fun (r: LayoutRule) : LayoutRuleDto ->
-            { Id = r.Id; Priority = r.Priority; When = layoutPredicateDtoOf r.When; Use = r.Use })
+        |> List.map (fun (r: LayoutRule) ->
+            ({ Id = r.Id; Priority = r.Priority; When = layoutPredicateDtoOf r.When; Use = r.Use }: LayoutRuleDto))
       DefaultLayout = policy.DefaultLayout
       WorkspaceAssignments =
         policy.WorkspaceAssignments
