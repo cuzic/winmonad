@@ -55,7 +55,7 @@ let connectAsync (pipeName: string) (timeoutMs: int) : Task<Result<WmClient, Tra
         let pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.None, TokenImpersonationLevel.Impersonation)
         try
             do! pipe.ConnectAsync(timeoutMs)
-            return Ok(WmClient(pipe))
+            return Ok(new WmClient(pipe))
         with
         | :? TimeoutException ->
             pipe.Dispose()

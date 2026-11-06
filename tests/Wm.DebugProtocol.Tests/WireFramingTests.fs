@@ -6,6 +6,7 @@
 module Wm.DebugProtocol.Tests.WireFramingTests
 
 open System
+open System.IO
 open System.IO.Pipes
 open System.Text
 open Xunit
