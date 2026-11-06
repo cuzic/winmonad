@@ -35,6 +35,8 @@ open System.Threading.Tasks
 open Microsoft.Win32.SafeHandles
 open Wm.DebugProtocol.Snapshot
 open Wm.DebugProtocol.SnapshotJson
+open Wm.DebugProtocol.Policy
+open Wm.DebugProtocol.PolicyJson
 open Wm.DebugProtocol.WireFraming
 
 module private Native =
@@ -248,7 +250,9 @@ let runAcceptLoopWithTimeout (pipe: NamedPipeServerStream) (ct: CancellationToke
 let runAcceptLoop (pipe: NamedPipeServerStream) (ct: CancellationToken) (onClient: NamedPipeServerStream -> Result<ClientPrincipal, string> -> CancellationToken -> unit) =
     runAcceptLoopWithTimeout pipe ct requestTimeoutMs onClient
 
-type InspectRequest = | SnapshotRequest
+type InspectRequest =
+    | SnapshotRequest
+    | PolicyRequest
 
 /// リクエストのJSONパースは標準の`System.Text.Json`を使う（信頼境界の内側に入ってくる入力を
 /// 手書きパーサで読まない、opus-review-named-pipe-transport.md 1-5対応——`Wm.Journal`の手書き
@@ -263,18 +267,26 @@ let private parseRequest (bytes: byte[]) : Result<InspectRequest, string> =
         else
             match root.GetProperty("op").GetString() with
             | "snapshot" -> Ok SnapshotRequest
+            | "policy" -> Ok PolicyRequest
             | other -> Error(sprintf "unknown op '%s'" other)
     with ex ->
         Error(sprintf "malformed request: %s" ex.Message)
 
 /// 1接続ぶんのInspectハンドラ本体。`principal`/`ownRid`による多層防御（カーネルのDACL/ラベルを
 /// 通過したはずの接続だが、ここでも「同一ユーザー・Host自身の整合性レベル以上」を再確認する）→
-/// 1件のリクエストを読む→`getSnapshot`を呼んで応答する、という最小の往復を実装する。Inspect
-/// （§10.2「Snapshot、Policy、Journal、Explain、Analyzerを見る」）のうちSnapshotだけがこの
-/// スライスの対象——Policy/Journal/Explain/Analyzerは後続。`ct`は`runAcceptLoop`が接続ごとに
+/// 1件のリクエストを読む→`getSnapshot`/`getPolicy`を呼んで応答する、という最小の往復を実装する。
+/// Inspect（§10.2「Snapshot、Policy、Journal、Explain、Analyzerを見る」）のうちSnapshot/Policyの
+/// 2つがこのスライスまでの対象——Journal/Explain/Analyzerは後続。`ct`は`runAcceptLoop`が接続ごとに
 /// `requestTimeoutMs`で組み立てたデッドライン（5-E対応）：読取・応答送信どちらが詰まっても
 /// このトークンの期限切れで中断される。
-let handleOneRequestAsync (pipe: NamedPipeServerStream) (principal: Result<ClientPrincipal, string>) (ownRid: int option) (getSnapshot: unit -> SnapshotDto) (ct: CancellationToken) : Task =
+let handleOneRequestAsync
+    (pipe: NamedPipeServerStream)
+    (principal: Result<ClientPrincipal, string>)
+    (ownRid: int option)
+    (getSnapshot: unit -> SnapshotDto)
+    (getPolicy: unit -> PolicyDto)
+    (ct: CancellationToken)
+    : Task =
     task {
         let authorized =
             match principal, ownRid with
@@ -286,5 +298,8 @@ let handleOneRequestAsync (pipe: NamedPipeServerStream) (principal: Result<Clien
             | Error _ -> ()
             | Ok SnapshotRequest ->
                 let json = snapshotDtoToJson (getSnapshot ())
+                do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
+            | Ok PolicyRequest ->
+                let json = policyDtoToJson (getPolicy ())
                 do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
     }

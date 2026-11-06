@@ -7,6 +7,7 @@
 
   <ItemGroup>
     <Compile Include="SnapshotJsonTests.fs" />
+    <Compile Include="PolicyJsonTests.fs" />
     <Compile Include="WireFramingTests.fs" />
   </ItemGroup>
 

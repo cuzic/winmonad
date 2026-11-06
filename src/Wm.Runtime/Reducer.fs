@@ -18,6 +18,13 @@ type Reducer(runtimePolicy: RuntimePolicy, sessionId: string, coreBuildId: strin
     member _.State = state
     member _.Timers = timers
 
+    /// Phase CのPolicy Inspect（architecture.md §10.2、v2.145）が読む採用中のPolicy。`runtimePolicy`は
+    /// コンストラクタで渡されたまま一度も再代入されない不変の環境（`PolicyActivated`の配線は未実装、
+    /// §21の未決事項のまま、`WmState.fs`の`RuntimePolicy`型直前のコメント参照）なので、`Sequence`や
+    /// `State`と違いReducer所有スレッド以外から読んでも安全——ADR-012の単一スレッドアクセス不変条件は
+    /// 可変な状態（`state`/`sequence`）を対象にしたものであり、この不変な環境値には適用されない。
+    member _.Policy = runtimePolicy.Policy
+
     /// 次にSubmitされる入力へ割り当てられる値（＝これまでに処理済みの入力件数）。Phase Cの
     /// Snapshot/Intervene（architecture.md §10.1/10.4）が参照する楽観的排他の起点として、
     /// Reducer所有スレッド以外からも安全に読める単調増加値を公開する。

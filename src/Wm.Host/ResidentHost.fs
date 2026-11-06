@@ -25,6 +25,9 @@ open Wm.Core.Windows
 open Wm.Runtime.Reducer
 open Wm.Host.EffectHarness
 open Wm.DebugProtocol.Snapshot
+open Wm.DebugProtocol.Policy
+open Wm.Policy.PolicyTypes
+open Wm.Policy.MonitorSelector
 
 /// 1件のSnapshot問い合わせ。`TaskCompletionSource`自体はスレッドセーフに`SetResult`できるため、
 /// 問い合わせ元スレッドはただ`Task`を待てばよい。
@@ -42,6 +45,55 @@ let snapshotOf (state: Wm.Core.WmState.WmState) (revision: int64) : SnapshotDto 
         |> List.map (fun (w, management, matchedRule) ->
             { Window = w; Management = management; MatchedRule = matchedRule }) }
 
+/// `PolicyIR`から`PolicyDto`を組み立てる純粋関数（v2.145、Phase C Inspect「Policyを見る」、§10.2）。
+/// `snapshotOf`と同じ配置の理由：DTO自体（`Wm.DebugProtocol.Policy`）は`Wm.Policy`の内部型
+/// （`WindowPredicate`/`LayoutPredicate`/`MonitorSelector`）をそのまま晒さない方針（§17の依存方向、
+/// `Snapshot.fs`冒頭コメント参照）なので、両方へ依存できる`Wm.Host`側でこの射影を行う。
+let rec private windowPredicateDtoOf (p: WindowPredicate) : WindowPredicateDto =
+    match p with
+    | AnyWindow -> AnyWindowDto
+    | AppIs (src, v) -> AppIsDto (src, v)
+    | TitleContains v -> TitleContainsDto v
+    | DialogIs v -> DialogIsDto v
+    | MinWidthAtLeast v -> MinWidthAtLeastDto v
+    | MovableIs v -> MovableIsDto v
+    | All children -> AllDto (children |> List.map windowPredicateDtoOf)
+    | AnyOf children -> AnyOfDto (children |> List.map windowPredicateDtoOf)
+    | Not child -> NotDto (windowPredicateDtoOf child)
+
+let rec private layoutPredicateDtoOf (p: LayoutPredicate) : LayoutPredicateDto =
+    match p with
+    | Always -> AlwaysDto
+    | TiledCountAtLeast v -> TiledCountAtLeastDto v
+    | MonitorWidthAtLeast v -> MonitorWidthAtLeastDto v
+    | Both children -> BothDto (children |> List.map layoutPredicateDtoOf)
+
+let private monitorSelectorDtoOf (s: MonitorSelector) : MonitorSelectorDto =
+    match s with
+    | PrimaryMonitor -> PrimaryMonitorDto
+    | MonitorKey k -> MonitorKeyDto k
+
+/// `WindowRule`/`WindowRuleDto`、`LayoutRule`/`LayoutRuleDto`は`Id`/`Priority`/`When`/`Apply`(/`Use`)
+/// というフィールド名が完全に一致する（元の型をそのまま写したため）。両方の型が同時に`open`されて
+/// いる（`Wm.Policy.PolicyTypes`/`Wm.DebugProtocol.Policy`）ので、レコード構築時にF#が正しい側
+/// （Dto側）を選べるよう、ラムダの戻り値型を明示する——型推論の伝播に頼って黒魔術的に正しく解決
+/// されることを期待しない。
+let policyDtoOf (policy: PolicyIR) : PolicyDto =
+    { SchemaVersion = policy.SchemaVersion
+      WindowRules =
+        policy.WindowRules
+        |> List.map (fun (r: WindowRule) : WindowRuleDto ->
+            { Id = r.Id; Priority = r.Priority; When = windowPredicateDtoOf r.When; Apply = r.Apply })
+      DefaultManagement = policy.DefaultManagement
+      LayoutRules =
+        policy.LayoutRules
+        |> List.map (fun (r: LayoutRule) : LayoutRuleDto ->
+            { Id = r.Id; Priority = r.Priority; When = layoutPredicateDtoOf r.When; Use = r.Use })
+      DefaultLayout = policy.DefaultLayout
+      WorkspaceAssignments =
+        policy.WorkspaceAssignments
+        |> List.map (fun (wid, sel) -> wid, monitorSelectorDtoOf sel) }
+
 /// Reducerを1つ所有し、常駐ループとして回り続ける骨格。`Run()`を呼んだスレッドだけがReducer状態へ
 /// 触れる（ADR-012の単一スレッドアクセス不変条件をSnapshotクエリにも適用する）。
 type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
@@ -50,6 +102,10 @@ type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
     let cts = new CancellationTokenSource()
 
     let projectSnapshot () : SnapshotDto = snapshotOf reducer.State reducer.Sequence
+
+    /// `reducer.Policy`は不変の環境（`Reducer.Policy`の型直前のコメント参照）なので、Snapshotと違い
+    /// キュー経由にせず、呼び出したスレッドから直接読んでよい。
+    member _.Policy : PolicyDto = policyDtoOf reducer.Policy
 
     /// 他スレッド（将来のNamed Pipe接続スレッド）から呼ぶ。即座には解決しない——次の`Run`ループの
     /// イテレーションで、Reducer所有スレッドがキューを汲んで`SetResult`する。

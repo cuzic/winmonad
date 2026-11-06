@@ -87,6 +87,7 @@ open Wm.Contracts.CoreCommand
 open Wm.Contracts.GatedEffect
 open Wm.Contracts.JournalTypes
 open Wm.Core.WmState
+open Wm.Policy.PolicyTypes
 open Wm.Policy.PolicyEvaluator
 open Wm.Runtime.Reducer
 open Wm.Normalization.WindowEventNormalizer
@@ -1037,7 +1038,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe17 cts17.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid17 (fun () -> residentHost17.EnqueueSnapshotQuery().Result) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid17 (fun () -> residentHost17.EnqueueSnapshotQuery().Result) (fun () -> residentHost17.Policy) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread17.IsBackground <- true
         acceptThread17.Start()
@@ -1103,7 +1104,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoopWithTimeout pipe18 cts18.Token shortTimeoutMs18 (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid18 (fun () -> residentHost18.EnqueueSnapshotQuery().Result) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid18 (fun () -> residentHost18.EnqueueSnapshotQuery().Result) (fun () -> residentHost18.Policy) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread18.IsBackground <- true
         acceptThread18.Start()
@@ -1181,7 +1182,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe19 cts19.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid19 (fun () -> residentHost19.EnqueueSnapshotQuery().Result) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid19 (fun () -> residentHost19.EnqueueSnapshotQuery().Result) (fun () -> residentHost19.Policy) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread19.IsBackground <- true
         acceptThread19.Start()
@@ -1260,7 +1261,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe20 cts20.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid20 (fun () -> residentHost20.EnqueueSnapshotQuery().Result) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid20 (fun () -> residentHost20.EnqueueSnapshotQuery().Result) (fun () -> residentHost20.Policy) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread20.IsBackground <- true
         acceptThread20.Start()
@@ -1292,6 +1293,79 @@ let main argv =
         removeDiscoveryFile ()
         printfn "Round 20 PASSED (the split-out Wm.ReplClient project connects via the discovery file and fetches a correct Snapshot through the real Named Pipe, matching a direct ResidentHost query): %b"
             (discoveryWriteOk20 && roundTripOk20 && matches20 && acceptStopped20 && loopStopped20)
+
+    // Round 21：Policy Inspect操作（v2.145、memory `project_named_pipe_ipc_task_breakdown.md`の
+    // Tier 2の2項目目）。これまでのSnapshotと違い、`PolicyIR.recommendedWindowRules`（2026-11-05の
+    // ユーザー決定、WindowRules製品判断）を実際に採用したReducerを立てて、ルール内容（`AppIs`/
+    // `DialogIs`述語を含む）が本物のNamed Pipeを通して正しく往復することを確認する——`PolicyIR.defaults`
+    // （ルール無し）だけだと、`WindowRuleDto`の再帰的なJSON符号化が実際に機能しているかを実機で
+    // 確認できない。
+    printfn "\n--- Round 21: Policy Inspect op carries real WindowRules (AppIs/DialogIs) through the real Named Pipe ---"
+    let journalPath21 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round21-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    let policy21 = { PolicyIR.defaults with WindowRules = PolicyIR.recommendedWindowRules }
+    let runtimePolicy21 = { RuntimePolicy.defaults with Policy = policy21 }
+    let reducer21 = Reducer(runtimePolicy21, "phase-b-round21", "wm-host-round21", "no-policy-artifact", Some journalPath21)
+    let residentHost21 = ResidentHost(reducer21, liveNow)
+    let loopThread21 = Thread(fun () -> residentHost21.Run(tickMs = 1))
+    loopThread21.IsBackground <- true
+    loopThread21.Start()
+    Thread.Sleep(50)
+
+    let pipeName21 = generatePipeName ()
+    match createRestrictedPipe pipeName21 with
+    | Error e ->
+        printfn "Round 21 FAILED (createRestrictedPipe): %s" e
+        residentHost21.RequestStop()
+        loopThread21.Join(3000) |> ignore
+    | Ok pipe21 ->
+        use pipe21 = pipe21
+        use cts21 = new CancellationTokenSource()
+        let ownRid21 = ownIntegrityRid ()
+
+        let discoveryWriteOk21 =
+            match writeDiscoveryFile pipeName21 with
+            | Ok () -> true
+            | Error _ -> false
+
+        let acceptThread21 =
+            Thread(fun () ->
+                runAcceptLoop pipe21 cts21.Token (fun p principal reqCt ->
+                    try
+                        (handleOneRequestAsync p principal ownRid21 (fun () -> residentHost21.EnqueueSnapshotQuery().Result) (fun () -> residentHost21.Policy) reqCt).GetAwaiter().GetResult()
+                    with _ -> ()))
+        acceptThread21.IsBackground <- true
+        acceptThread21.Start()
+        Thread.Sleep(100)
+
+        let roundTripOk21, receivedPolicy21 =
+            match connectLocalAsync 2000 |> Async.AwaitTask |> Async.RunSynchronously with
+            | Error _ -> false, None
+            | Ok client ->
+                use client = client
+                match client.PolicyAsync() |> Async.AwaitTask |> Async.RunSynchronously with
+                | Ok policy -> true, Some policy
+                | Error _ -> false, None
+
+        let directPolicy21 = residentHost21.Policy
+        let matches21 =
+            match receivedPolicy21 with
+            | Some p -> p = directPolicy21
+            | None -> false
+        let carriesRealRules21 =
+            match receivedPolicy21 with
+            | Some p -> List.length p.WindowRules = List.length PolicyIR.recommendedWindowRules && not (List.isEmpty p.WindowRules)
+            | None -> false
+
+        printfn "Round 21 discovery write=%b, Wm.ReplClient Policy round-trip: ok=%b" discoveryWriteOk21 roundTripOk21
+        printfn "Round 21 received=%A" receivedPolicy21
+
+        cts21.Cancel()
+        let acceptStopped21 = acceptThread21.Join(3000)
+        residentHost21.RequestStop()
+        let loopStopped21 = loopThread21.Join(3000)
+        removeDiscoveryFile ()
+        printfn "Round 21 PASSED (op=policy carries the real recommendedWindowRules, including AppIs/DialogIs predicates, through the real Named Pipe and matches a direct query): %b"
+            (discoveryWriteOk21 && roundTripOk21 && matches21 && carriesRealRules21 && acceptStopped21 && loopStopped21)
 
     printfn "\nDone."
     0

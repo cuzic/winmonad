@@ -8,13 +8,14 @@ open Wm.Contracts.Identifiers
 open Wm.Contracts.SharedVocabulary
 open Wm.DebugProtocol.Snapshot
 
-let private managementTag (m: Management) : string =
+/// `PolicyJson.fs`も同じ`Management`の符号化に合意する必要があるため公開する（v2.145）。
+let managementTag (m: Management) : string =
     match m with
     | Tiled -> "tiled"
     | Floating -> "floating"
     | Excluded -> "excluded"
 
-let private managementOfTag (tag: string) : Management =
+let managementOfTag (tag: string) : Management =
     match tag with
     | "tiled" -> Tiled
     | "floating" -> Floating
