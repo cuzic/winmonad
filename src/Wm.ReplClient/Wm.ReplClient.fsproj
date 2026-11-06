@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- architecture.md §10.1「REPL側のF#式はクライアント側で実行され、Hostで任意コードを評価しない」。
+       §17の依存方向と同じ精神で、このプロジェクトはWm.Contracts/Wm.DebugProtocolだけに依存し、
+       Wm.Core/Wm.Host（net8.0-windows専用）には一切依存しない。plain net8.0なのでLinux CI
+       (phase-a-build.yml、winmonad.sln経由)でもビルド・テストできる。 -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="WmClient.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Wm.Contracts/Wm.Contracts.fsproj" />
+    <ProjectReference Include="../Wm.DebugProtocol/Wm.DebugProtocol.fsproj" />
+  </ItemGroup>
+
+</Project>

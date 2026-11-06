@@ -98,6 +98,8 @@ open Wm.Host.ResidentHost
 open Wm.Host.InspectPipeServer
 open Wm.DebugProtocol.Snapshot
 open Wm.DebugProtocol.SnapshotJson
+open Wm.DebugProtocol.WireFraming
+open Wm.ReplClient.WmClient
 
 /// Phase B ラウンド7：`RegisterHotKey`→`WM_HOTKEY`を受け取るためだけの、見えない専用窓。
 /// `WM_HOTKEY`は`RegisterHotKey`に渡したHWNDへ配送されるので、`Application.DoEvents()`で
@@ -1223,6 +1225,73 @@ let main argv =
         let cleanedUp19 = not (File.Exists(discoveryFilePath ()))
         printfn "Round 19 PASSED (a client with no prior knowledge of the pipe name discovers it from the Host-written file, connects, and gets a correct Snapshot; the file is removed on shutdown): %b"
             (discoveryWriteOk19 && discoveredMatches19 && roundTripOk19 && matches19 && acceptStopped19 && loopStopped19 && cleanedUp19)
+
+    // Round 20：Round 17〜19ではクライアント側コードを生の`NamedPipeClientStream`＋手動フレーミング
+    // 呼出としてこのファイル内に書いていたが、v2.144でそれを独立プロジェクト`Wm.ReplClient`
+    // （`Wm.Contracts`/`Wm.DebugProtocol`のみに依存、Wm.Core/Wm.Hostには依存しない）へ切り出した。
+    // ここではその切り出した`Wm.ReplClient.WmClient`を実際に使って、Round 19と同じ「発見用ファイル
+    // 経由で接続しSnapshotを取得する」という往復が、切り出し後も実機で変わらず動くことを確認する。
+    printfn "\n--- Round 20: Wm.ReplClient (split-out client library) connects via discovery file and fetches a Snapshot ---"
+    let journalPath20 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round20-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    let reducer20 = Reducer(RuntimePolicy.defaults, "phase-b-round20", "wm-host-round20", "no-policy-artifact", Some journalPath20)
+    let residentHost20 = ResidentHost(reducer20, liveNow)
+    let loopThread20 = Thread(fun () -> residentHost20.Run(tickMs = 1))
+    loopThread20.IsBackground <- true
+    loopThread20.Start()
+    Thread.Sleep(50)
+
+    let pipeName20 = generatePipeName ()
+    match createRestrictedPipe pipeName20 with
+    | Error e ->
+        printfn "Round 20 FAILED (createRestrictedPipe): %s" e
+        residentHost20.RequestStop()
+        loopThread20.Join(3000) |> ignore
+    | Ok pipe20 ->
+        use pipe20 = pipe20
+        use cts20 = new CancellationTokenSource()
+        let ownRid20 = ownIntegrityRid ()
+
+        let discoveryWriteOk20 =
+            match writeDiscoveryFile pipeName20 with
+            | Ok () -> true
+            | Error _ -> false
+
+        let acceptThread20 =
+            Thread(fun () ->
+                runAcceptLoop pipe20 cts20.Token (fun p principal reqCt ->
+                    try
+                        (handleOneRequestAsync p principal ownRid20 (fun () -> residentHost20.EnqueueSnapshotQuery().Result) reqCt).GetAwaiter().GetResult()
+                    with _ -> ()))
+        acceptThread20.IsBackground <- true
+        acceptThread20.Start()
+        Thread.Sleep(100)
+
+        // `Wm.ReplClient.WmClient.connectLocalAsync`がここで初めて実際のパイプ越しに使われる。
+        let roundTripOk20, receivedSnapshot20 =
+            match connectLocalAsync 2000 |> Async.AwaitTask |> Async.RunSynchronously with
+            | Error _ -> false, None
+            | Ok client ->
+                use client = client
+                match client.SnapshotAsync() |> Async.AwaitTask |> Async.RunSynchronously with
+                | Ok snapshot -> true, Some snapshot
+                | Error _ -> false, None
+
+        let directSnapshot20 = residentHost20.EnqueueSnapshotQuery().Result
+        let matches20 =
+            match receivedSnapshot20 with
+            | Some s -> s.Revision = directSnapshot20.Revision && s.Windows = directSnapshot20.Windows
+            | None -> false
+
+        printfn "Round 20 discovery write=%b, Wm.ReplClient round-trip: ok=%b" discoveryWriteOk20 roundTripOk20
+        printfn "Round 20 received=%A" receivedSnapshot20
+
+        cts20.Cancel()
+        let acceptStopped20 = acceptThread20.Join(3000)
+        residentHost20.RequestStop()
+        let loopStopped20 = loopThread20.Join(3000)
+        removeDiscoveryFile ()
+        printfn "Round 20 PASSED (the split-out Wm.ReplClient project connects via the discovery file and fetches a correct Snapshot through the real Named Pipe, matching a direct ResidentHost query): %b"
+            (discoveryWriteOk20 && roundTripOk20 && matches20 && acceptStopped20 && loopStopped20)
 
     printfn "\nDone."
     0

@@ -30,6 +30,7 @@
     <ProjectReference Include="../Wm.Runtime/Wm.Runtime.fsproj" />
     <ProjectReference Include="../Wm.Windows/Wm.Windows.fsproj" />
     <ProjectReference Include="../Wm.DebugProtocol/Wm.DebugProtocol.fsproj" />
+    <ProjectReference Include="../Wm.ReplClient/Wm.ReplClient.fsproj" />
   </ItemGroup>
 
 </Project>

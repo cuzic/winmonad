@@ -13,9 +13,12 @@
 ///   2026-11-05）。サーバーは`RunAsClient`＋`OpenThreadToken`で接続済みクライアントの実トークン
 ///   （整合性レベル）を検査する。
 ///
-/// このスライスでは上記の接続・検査までを実装する。ワイヤプロトコル（長さプレフィックス＋JSON、
-/// サイズ上限・タイムアウト、opus-review 1-3/1-4/5-E）とパイプ名の発見用ファイル配布
-/// （opus-review 5-C）は後続のスライス。
+/// ワイヤプロトコルのフレーミング（長さプレフィックス＋JSON、サイズ上限・タイムアウト、
+/// opus-review 1-3/1-4/5-E）とパイプ名の発見用ファイルの読み取り側の形式（5-C）は、
+/// `Wm.ReplClient`（v2.144で新設、`Wm.Host`——net8.0-windows専用——へ依存できない）とも共有する
+/// 必要があるため`Wm.DebugProtocol.WireFraming`へ移した（§17の依存方向：`Wm.DebugProtocol`は
+/// Contractsのみに依存）。ここに残るのは接続・認可・パイプ作成・発見用ファイルの書き込み/削除
+/// （いずれもHostのライフサイクルに属す、サーバー側専用の操作）だけ。
 module Wm.Host.InspectPipeServer
 
 open System
@@ -32,6 +35,7 @@ open System.Threading.Tasks
 open Microsoft.Win32.SafeHandles
 open Wm.DebugProtocol.Snapshot
 open Wm.DebugProtocol.SnapshotJson
+open Wm.DebugProtocol.WireFraming
 
 module private Native =
     [<StructLayout(LayoutKind.Sequential)>]
@@ -180,27 +184,11 @@ let generatePipeName () : string =
         with _ -> "unknown-session"
     sprintf "winmonad-repl-%s-%s" sessionId (Guid.NewGuid().ToString("N").Substring(0, 12))
 
-/// パイプ名の発見用ファイル（opus-review-named-pipe-transport.md 5-C対応）。クライアントは起動時に
-/// パイプ名（`generatePipeName()`が作るランダムな名前）を直接知っている前提を置けないため、この
-/// 1つの既知の場所（`%TEMP%`、この呼び出しプロセス自身のユーザーに紐づく、既存の`journalPath17`等と
-/// 同じ既定ディレクトリ）に固定ファイル名で書く——ユーザーの実運用では常駐Hostは1つだけなので、
-/// 固定名で「現在稼働中のHost」を指す1枚のファイルという設計にできる。PID＋作成時刻を含める
-/// （§10.1の既定どおり）。**このファイルの内容自体の真正性は検証しない**：なりすまされても実害は
-/// 無い——偽の内容を信じて繋いだクライアントは、繋いだ先のパイプ自身のDACL/整合性ラベル＋
-/// `FILE_FLAG_FIRST_PIPE_INSTANCE`(F38-F40)・`RunAsClient`によるトークン検査(F41/F42)に阻まれる
-/// だけで、Hostへの偽装はこのファイルの内容だけでは成立しない（本当の安全境界はパイプ自身が持つ）。
-/// 古いHostが異常終了してファイルを消せなかった場合も、次に本物のHostが起動した時点で上書きされ
-/// 自己修復する——「ファイルが古いパイプを指している」ケースは、クライアントの`Connect`が単に
-/// 失敗する（既存の`Result<_, TransportError>`スタイルの失敗経路）だけで、追加のPID生存確認は
-/// このスライスでは作らない（grounded discipline：F38-F43が既に担保している安全性を、このファイル
-/// 側で重ねて検証する必要性はまだ裏付けられていない）。
-let discoveryFilePath () : string =
-    Path.Combine(Path.GetTempPath(), "winmonad-repl-discovery.json")
-
-type DiscoveryInfo = { PipeName: string; Pid: int; CreatedAtUtc: DateTime }
-
-/// Hostがパイプ作成直後に呼ぶ。書き込み失敗（権限等）はHost起動そのものを失敗させるほどの重大性
-/// ではないので`Result`で呼び出し側へ返すだけにする。
+/// パイプ名の発見用ファイル（opus-review-named-pipe-transport.md 5-C対応、場所・形式・読み取り側は
+/// `Wm.DebugProtocol.WireFraming.discoveryFilePath`/`tryReadDiscoveryFile`参照）。Hostはパイプ作成
+/// 直後にここで書く——ユーザーの実運用では常駐Hostは1つだけなので、固定名で「現在稼働中のHost」を
+/// 指す1枚のファイルという設計にできる。書き込み失敗（権限等）はHost起動そのものを失敗させるほどの
+/// 重大性ではないので`Result`で呼び出し側へ返すだけにする。
 let writeDiscoveryFile (pipeName: string) : Result<unit, string> =
     try
         let o = JsonObject()
@@ -218,24 +206,6 @@ let removeDiscoveryFile () : unit =
         File.Delete(discoveryFilePath ())
     with _ ->
         ()
-
-/// クライアントがパイプ名を知るために読む。受信＝信頼境界の内側に入ってくる入力ではない
-/// （自分自身のHostが自分のために書いたファイルを自分で読むだけ）が、`parseRequest`と同じ標準
-/// パーサ（`System.Text.Json`）に揃えておく。
-let tryReadDiscoveryFile () : Result<DiscoveryInfo, string> =
-    try
-        let path = discoveryFilePath ()
-        if not (File.Exists path) then
-            Error "discovery file not found"
-        else
-            use doc = JsonDocument.Parse(File.ReadAllText path)
-            let root = doc.RootElement
-            Ok
-                { PipeName = root.GetProperty("pipeName").GetString()
-                  Pid = root.GetProperty("pid").GetInt32()
-                  CreatedAtUtc = root.GetProperty("createdAtUtc").GetDateTime() }
-    with ex ->
-        Error ex.Message
 
 /// 1接続あたりの壁時計デッドライン(ms)。handshake(接続後最初の受信)・読取途中(送信の停滞)の
 /// どちらも、現行プロトコル(1接続=1リクエスト、`handleOneRequest`が1件処理して戻ったら
@@ -277,76 +247,6 @@ let runAcceptLoopWithTimeout (pipe: NamedPipeServerStream) (ct: CancellationToke
 
 let runAcceptLoop (pipe: NamedPipeServerStream) (ct: CancellationToken) (onClient: NamedPipeServerStream -> Result<ClientPrincipal, string> -> CancellationToken -> unit) =
     runAcceptLoopWithTimeout pipe ct requestTimeoutMs onClient
-
-/// 1メッセージの最大バイト数（opus-review-named-pipe-transport.md 5-E対応）。
-let maxMessageBytes = 1 <<< 20 // 1 MiB
-
-let private readExact (stream: PipeStream) (buf: byte[]) =
-    let mutable offset = 0
-    while offset < buf.Length do
-        let n = stream.Read(buf, offset, buf.Length - offset)
-        if n = 0 then failwith "pipe closed before message complete"
-        offset <- offset + n
-
-/// サーバー側のタイムアウト付き読み取りが使う（`ct`が`requestTimeoutMs`で期限切れになると、
-/// 保留中の`ReadAsync`が`OperationCanceledException`で中断される）。クライアント側（現行の
-/// テスト専用呼び出し元、Program.fsのRound 17）は接続自体に`NamedPipeClientStream.Connect(ms)`の
-/// タイムアウトを既に持っているため、同期版の`readExact`/`readFramedMessage`をそのまま使い続ける。
-let private readExactAsync (stream: PipeStream) (buf: byte[]) (ct: CancellationToken) : Task =
-    task {
-        let mutable offset = 0
-        while offset < buf.Length do
-            let! n = stream.ReadAsync(buf, offset, buf.Length - offset, ct)
-            if n = 0 then failwith "pipe closed before message complete"
-            offset <- offset + n
-    }
-
-/// 長さプレフィックス（4バイトリトルエンディアンUInt32）＋UTF8本体。長さを読んだ時点で上限を
-/// 超えていればバッファ確保前に例外を投げる（opus-review 1-5/5-E対応）。
-let readFramedMessage (stream: PipeStream) : byte[] =
-    let lenBuf = Array.zeroCreate<byte> 4
-    readExact stream lenBuf
-    let len = int (BitConverter.ToUInt32(lenBuf, 0))
-    if len > maxMessageBytes then
-        failwithf "incoming message (%d bytes) exceeds maxMessageBytes (%d)" len maxMessageBytes
-    let buf = Array.zeroCreate<byte> len
-    readExact stream buf
-    buf
-
-/// サーバー側専用：`ct`の期限切れ（handshake/読取途中タイムアウト、5-E）で中断できる版。
-let readFramedMessageAsync (stream: PipeStream) (ct: CancellationToken) : Task<byte[]> =
-    task {
-        let lenBuf = Array.zeroCreate<byte> 4
-        do! readExactAsync stream lenBuf ct
-        let len = int (BitConverter.ToUInt32(lenBuf, 0))
-        if len > maxMessageBytes then
-            failwithf "incoming message (%d bytes) exceeds maxMessageBytes (%d)" len maxMessageBytes
-        let buf = Array.zeroCreate<byte> len
-        do! readExactAsync stream buf ct
-        return buf
-    }
-
-let writeFramedMessage (stream: PipeStream) (payload: byte[]) =
-    if payload.Length > maxMessageBytes then
-        failwithf "outgoing message (%d bytes) exceeds maxMessageBytes (%d)" payload.Length maxMessageBytes
-    let lenBuf = BitConverter.GetBytes(uint32 payload.Length)
-    stream.Write(lenBuf, 0, 4)
-    stream.Write(payload, 0, payload.Length)
-    stream.Flush()
-
-/// サーバー側専用：応答をクライアントが読み切らず詰まるケースも同じ`ct`で中断できるようにする
-/// （読み取りだけでなく送信側も塞がれ得る、同じ5-Eの精神を書き込みにも及ぼす）。
-let writeFramedMessageAsync (stream: PipeStream) (payload: byte[]) (ct: CancellationToken) : Task =
-    task {
-        if payload.Length > maxMessageBytes then
-            failwithf "outgoing message (%d bytes) exceeds maxMessageBytes (%d)" payload.Length maxMessageBytes
-        let lenBuf = BitConverter.GetBytes(uint32 payload.Length)
-        do! stream.WriteAsync(lenBuf, 0, 4, ct)
-        do! stream.WriteAsync(payload, 0, payload.Length, ct)
-        do! stream.FlushAsync(ct)
-    }
-
-let private protocolVersion = 1
 
 type InspectRequest = | SnapshotRequest
 

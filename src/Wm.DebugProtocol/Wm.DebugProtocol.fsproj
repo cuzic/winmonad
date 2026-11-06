@@ -7,6 +7,7 @@
   <ItemGroup>
     <Compile Include="Snapshot.fs" />
     <Compile Include="SnapshotJson.fs" />
+    <Compile Include="WireFraming.fs" />
   </ItemGroup>
 
   <ItemGroup>
