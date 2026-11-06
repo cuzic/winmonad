@@ -2253,11 +2253,16 @@ let main argv =
             with _ ->
                 false
 
-        // (5) レート制限：短時間に多数送ると、少なくとも1件は受付拒否されるはず。
+        // (5) レート制限：実機では1回のNamed Pipe往復自体が1秒前後かかる（接続・フレーミング・
+        // `drainUntilClientClosesAsync`等のオーバーヘッド）ため、パイプ越しに30回送るだけでは
+        // 1秒のスライディングウィンドウに同時に収まらず、レート制限が一度も働かない（実機確認で
+        // 最初に踏んだ既知の誤り）。`ResidentHost.EnqueueIntervene`自体はパイプ層を経由しない
+        // 素のメンバー呼出しなので、同じプロセス内からタイトループで直接何度も呼び、実際のレート
+        // 制限ロジック（1秒内の受理件数）をI/Oオーバーヘッド無しで検証する。
         let rateLimitTriggeredOk28 =
-            [ 1..30 ]
-            |> List.map (fun _ -> interveneViaClient28 (ClearOverrideDto(WindowId 1L)))
-            |> List.exists (function Some(InterveneRejectedDto "rate limit exceeded") -> true | _ -> false)
+            [ 1..50 ]
+            |> List.map (fun _ -> residentHost28.EnqueueIntervene(None, 0, "rate-limit-test", ClearOverrideDto(WindowId 1L)))
+            |> List.exists (function Error "rate limit exceeded" -> true | _ -> false)
 
         printfn
             "Round 28 float=%A (management=%A), reject(unknown window)=%A, clear=%A (management=%A), clientAttribution=%b, rateLimitTriggered=%b"
