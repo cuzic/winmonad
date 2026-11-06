@@ -386,8 +386,14 @@ let ``F36/F37(E-4):ボーダレス全画面として観測された窓はFullscr
 [<Fact>]
 let ``F36/F37(E-4):画面構成が安定済みなら全画面から退出した観測でFullscreen集合から外れ、以後は通常どおりタイル対象に復帰する(v2.141)`` () =
     let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
-    let bounds: PixelRect = (mkMonitor 0).Bounds
-    settleTopologyStable reducer [ mkMonitor 0 ] // checkFullscreenの退出方向はscreenPhaseIsStableを要求する(ルール4)
+    // タスクバー分だけWorkAreaをBoundsより狭くする(通常の`mkMonitor`はBounds=WorkAreaなので、全画面退出後の
+    // Monocleの再タイル先がたまたま全画面時のNativeRectと同じ値になり、`applyEffect`のSetRectが「既に
+    // 目標どおりの位置にいる窓への再発行は観測が一切来ない」(S22/S23、ファイル冒頭のVirtualWorld.fsコメント
+    // 参照)という既知のno-op扱いになってしまい、Satisfiedへ収束しない——このテストで検証したい「全画面から
+    // 戻れば通常どおり配置され続ける」ことそのものとは無関係な偶然の衝突なので、WorkAreaを変えて避ける)。
+    let monitor = { mkMonitor 0 with WorkArea = { X = 0; Y = 0; Width = 1920; Height = 1040 } }
+    let bounds: PixelRect = monitor.Bounds
+    settleTopologyStable reducer [ monitor ] // checkFullscreenの退出方向はscreenPhaseIsStableを要求する(ルール4)
     let w = WindowId 1L
     reducer.Submit 1000L "virtual-world" (visibleWindowObservedFullscreen w bounds) |> ignore
     Assert.True(Set.contains w reducer.State.Placement.Fullscreen)
@@ -405,7 +411,7 @@ let ``F36/F37(E-4):画面構成が安定済みなら全画面から退出した�
     let d2 = reducer.Submit 2500L "virtual-world" (visibleWindowObserved w2)
     let finalWorld = settle 2500L reducer world2 d2.Effects
     Assert.Empty(reducer.State.Placement.Pending)
-    Assert.True(Map.containsKey w finalWorld.Windows)
+    Assert.Equal(monitor.WorkArea, (Map.find w finalWorld.Windows).Rect)
 
 [<Fact>]
 let ``2つ目の窓が現れても、両方がMonocleで全画面に配置され両方Satisfiedになる`` () =
