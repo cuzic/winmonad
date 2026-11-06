@@ -104,6 +104,50 @@ let policyDtoOf (policy: PolicyIR) : PolicyDto =
         policy.WorkspaceAssignments
         |> List.map (fun (wid, sel) -> wid, monitorSelectorDtoOf sel) }
 
+/// `policyDtoOf`の逆方向（v2.148、§14「`PinnedPolicy.ofStored : PolicyDto -> ArtifactIdentity ->
+/// Result<PinnedPolicy, IntegrityError>`」が実際にcanonical hashを再計算するには、保存されていた
+/// `PolicyDto`から実際の`PolicyIR`を復元する必要がある）。`policyDtoOf`と対になる関数として
+/// 同じファイルに置く。
+let rec private windowPredicateOf (p: WindowPredicateDto) : WindowPredicate =
+    match p with
+    | AnyWindowDto -> AnyWindow
+    | AppIsDto (src, v) -> AppIs (src, v)
+    | TitleContainsDto v -> TitleContains v
+    | DialogIsDto v -> DialogIs v
+    | MinWidthAtLeastDto v -> MinWidthAtLeast v
+    | MovableIsDto v -> MovableIs v
+    | AllDto children -> All (children |> List.map windowPredicateOf)
+    | AnyOfDto children -> AnyOf (children |> List.map windowPredicateOf)
+    | NotDto child -> Not (windowPredicateOf child)
+
+let rec private layoutPredicateOf (p: LayoutPredicateDto) : LayoutPredicate =
+    match p with
+    | AlwaysDto -> Always
+    | TiledCountAtLeastDto v -> TiledCountAtLeast v
+    | MonitorWidthAtLeastDto v -> MonitorWidthAtLeast v
+    | BothDto children -> Both (children |> List.map layoutPredicateOf)
+
+let private monitorSelectorOf (s: MonitorSelectorDto) : MonitorSelector =
+    match s with
+    | PrimaryMonitorDto -> PrimaryMonitor
+    | MonitorKeyDto k -> MonitorKey k
+
+let policyIrOf (dto: PolicyDto) : PolicyIR =
+    { SchemaVersion = dto.SchemaVersion
+      WindowRules =
+        dto.WindowRules
+        |> List.map (fun (r: WindowRuleDto) ->
+            ({ Id = r.Id; Priority = r.Priority; When = windowPredicateOf r.When; Apply = r.Apply }: WindowRule))
+      DefaultManagement = dto.DefaultManagement
+      LayoutRules =
+        dto.LayoutRules
+        |> List.map (fun (r: LayoutRuleDto) ->
+            ({ Id = r.Id; Priority = r.Priority; When = layoutPredicateOf r.When; Use = r.Use }: LayoutRule))
+      DefaultLayout = dto.DefaultLayout
+      WorkspaceAssignments =
+        dto.WorkspaceAssignments
+        |> List.map (fun (wid, sel) -> wid, monitorSelectorOf sel) }
+
 /// `Wm.Layouts.LayoutRegistry.LayoutError`から`LayoutErrorDto`への射影（v2.147、Explain）。
 let private layoutErrorDtoOf (e: LayoutError) : LayoutErrorDto =
     match e with

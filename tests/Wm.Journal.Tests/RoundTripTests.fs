@@ -282,3 +282,20 @@ let ``PendingOutcomePayloadは往復しても一致する(PendingSatisfied/Pendi
 let ``ObservationReceivedはInputPayloadを再利用して往復しても一致する(v2.81)`` (w: int) (obs: Observation<bool>) =
     let entry = mkEntryWithKind ObservationReceived (InputPayload (MinimizedStateChanged (WindowId (int64 (abs w)), obs)))
     roundTrip entry = entry
+
+/// §14のPolicyArtifact採用記録（v2.148）。「以前に承認済み」の根拠はこのKind自身ではなく
+/// `JournalEntry.PolicyArtifactHash`（envelope自身が元から持つフィールド）に置く——`source`
+/// （"deploy"/"rollback"/"startup"）はPayload側で運ぶ補助情報。
+[<Property>]
+let ``PolicyActivatedPayloadは往復しても一致する(v2.148)`` (source: NonNull<string>) =
+    let (NonNull src) = source
+    let entry = mkEntryWithKind PolicyActivatedKind (PolicyActivatedPayload src)
+    roundTrip entry = entry
+
+/// 起動時/Rollback時の「報告のみモード」（v2.148）：採用はブロックせず、Analyzerの検出内容を
+/// 人間向けの要約文字列として記録する。
+[<Property>]
+let ``PolicyStaleAnalysisPayloadは任意件数の要約文字列でも往復しても一致する(v2.148)`` (issueSummaries: NonNull<string> list) =
+    let summaries = issueSummaries |> List.map (fun (NonNull s) -> s)
+    let entry = mkEntryWithKind PolicyStaleAnalysisKind (PolicyStaleAnalysisPayload summaries)
+    roundTrip entry = entry

@@ -90,6 +90,8 @@ open Wm.Contracts.Observation
 open Wm.Core.WmState
 open Wm.Policy.PolicyTypes
 open Wm.Policy.PolicyEvaluator
+open Wm.Policy.PolicyAnalyzer
+open Wm.Layouts.LayoutRegistry
 open Wm.Runtime.Reducer
 open Wm.Normalization.WindowEventNormalizer
 open Wm.Windows.Native
@@ -97,6 +99,7 @@ open Wm.Windows.RealObservation
 open Wm.Windows.EventHooks
 open Wm.Host.EffectHarness
 open Wm.Host.ResidentHost
+open Wm.Host.PolicyArtifact
 open Wm.Host.InspectPipeServer
 open Wm.DebugProtocol.Snapshot
 open Wm.DebugProtocol.SnapshotJson
@@ -1589,6 +1592,131 @@ let main argv =
         removeDiscoveryFile ()
         printfn "Round 23 PASSED (op=explain carries a real DecisionTrace(LayoutNotRegistered) through the real Named Pipe for a window using a misconfigured Policy): %b"
             (discoveryWriteOk23 && roundTripOk23 && receivedExplain23.IsSome && carriesLayoutNotRegistered23 && acceptStopped23 && loopStopped23)
+
+    // Round 24：§14 PolicyArtifact（PinnedPolicy/DeployablePolicy/link/Rollback/起動時の「報告のみ
+    // モード」、v2.148、ユーザー決定2026-11-06：§14をほぼ全部、一気に）。このRoundはNamed Pipeを
+    // 経由せず、`Wm.Host.PolicyArtifact`の各関数を直接呼ぶ——§14自身がIPC配線(op=deploy)を要求
+    // していない（Deployは今回あえてIPCへ未配線、ファイル冒頭コメント参照）ため、実機で確認すべきは
+    // この一式の判断ロジックとファイルI/O自体。
+    printfn "\n--- Round 24: PolicyArtifact (PinnedPolicy/DeployablePolicy/link/Rollback/report-only mode, §14) ---"
+    let baseDir24 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round24-%s" (Guid.NewGuid().ToString("N")))
+    let journalPath24 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round24-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    let sessionId24 = "phase-b-round24"
+    let coreBuildId24 = "wm-host-round24"
+
+    // (a) canonical hashが同じ入力から常に同じ値になる(実際にrecommendedWindowRulesという複数ルールの
+    // 現実的なPolicyで確認——空Policyだけだと符号化の取りこぼしを拾えない)。
+    let policy24 = { PolicyIR.defaults with WindowRules = PolicyIR.recommendedWindowRules }
+    let manifest24 = Registry.toManifest RuntimePolicy.defaults.LayoutRegistry
+    let identity24a = buildArtifactIdentity 1 policy24 manifest24 coreBuildId24 1 "v1"
+    let identity24b = buildArtifactIdentity 1 policy24 manifest24 coreBuildId24 1 "v1"
+    let hashReproducible24 =
+        identity24a.ArtifactHash = identity24b.ArtifactHash && identity24a.CanonicalPolicyIrHash = identity24b.CanonicalPolicyIrHash
+
+    // (b) PinnedPolicy構築→保存→読込みの往復(実際のPolicyIRが一致することまで確認)。
+    let pinnedResult24 = PinnedPolicy.ofStored (policyDtoOf policy24) identity24a
+    let savedAndLoadedOk24 =
+        match pinnedResult24 with
+        | Error _ -> false
+        | Ok pinned ->
+            savePinnedPolicy baseDir24 pinned
+            match tryLoadPinnedPolicy baseDir24 identity24a.ArtifactHash with
+            | Error _ -> false
+            | Ok loaded -> (PinnedPolicy.identity loaded).ArtifactHash = identity24a.ArtifactHash && PinnedPolicy.ir loaded = policy24
+
+    // (c) Deploy：クリーンなPolicyは成功し、現行Analyzerが実際に拒否するPolicy(重複RuleId)は
+    // DeployAnalysisFailedで失敗する——「クライアントの自己申告を信用しない」の実演。
+    let deployOk24 =
+        match deploy manifest24 (policyDtoOf policy24) identity24a with
+        | Ok _ -> true
+        | Error _ -> false
+
+    let duplicateRulePolicy24 =
+        { PolicyIR.defaults with
+            WindowRules =
+                [ { Id = PolicyRuleId "dup-round24"; Priority = 1; When = AnyWindow; Apply = Tiled }
+                  { Id = PolicyRuleId "dup-round24"; Priority = 2; When = AnyWindow; Apply = Floating } ] }
+    let duplicateIdentity24 = buildArtifactIdentity 1 duplicateRulePolicy24 manifest24 coreBuildId24 1 "v1"
+    let deployFailsOnDirtyAnalysis24 =
+        match deploy manifest24 (policyDtoOf duplicateRulePolicy24) duplicateIdentity24 with
+        | Error(DeployAnalysisFailed report) -> not (isClean report)
+        | _ -> false
+
+    // (d) link：登録済みLayout(既定のmonocle)は成功し、未登録Layoutは実際にLinkErrorで失敗する。
+    let linkOk24 =
+        match pinnedResult24 with
+        | Error _ -> false
+        | Ok pinned ->
+            match link manifest24 pinned with
+            | Ok _ -> true
+            | Error _ -> false
+
+    let unregisteredLayoutPolicy24 =
+        { PolicyIR.defaults with DefaultLayout = { Id = LayoutId "does-not-exist-round24"; ApiVersion = 1; Args = NoArgs } }
+    let unregisteredIdentity24 = buildArtifactIdentity 1 unregisteredLayoutPolicy24 manifest24 coreBuildId24 1 "v1"
+    let linkFailsOnUnregistered24 =
+        match PinnedPolicy.ofStored (policyDtoOf unregisteredLayoutPolicy24) unregisteredIdentity24 with
+        | Error _ -> false
+        | Ok pinned ->
+            match link manifest24 pinned with
+            | Error errs ->
+                errs
+                |> List.exists (function
+                    | UnregisteredLayoutInManifest(LayoutId "does-not-exist-round24", 1) -> true
+                    | _ -> false)
+            | Ok _ -> false
+
+    // (e) Rollback：Host自身の採用記録に無いhashは常に拒否し、記録した直後だけ成功する
+    // （ファイルを直接置いて「最後の正常版」を騙る迂回を塞ぐ、§14の設計そのもの）。
+    let rollbackBeforeActivation24 =
+        match rollback baseDir24 journalPath24 manifest24 identity24a.ArtifactHash with
+        | Error(NotPreviouslyActivated h) -> h = identity24a.ArtifactHash
+        | _ -> false
+
+    recordPolicyActivated journalPath24 sessionId24 coreBuildId24 identity24a.ArtifactHash "deploy" (liveNow ())
+
+    let rollbackAfterActivation24 =
+        match rollback baseDir24 journalPath24 manifest24 identity24a.ArtifactHash with
+        | Ok pinned -> (PinnedPolicy.identity pinned).ArtifactHash = identity24a.ArtifactHash
+        | Error _ -> false
+
+    // (f) 起動時/Rollback時の「報告のみモード」：再分析の結果が実際にErrorでも採用はブロックせず、
+    // PolicyStaleAnalysisとしてJournalへ記録されるだけであることを確認する。
+    match PinnedPolicy.ofStored (policyDtoOf duplicateRulePolicy24) duplicateIdentity24 with
+    | Error _ -> ()
+    | Ok dirtyPinned ->
+        let report24 = reportOnlyAnalysis manifest24 dirtyPinned
+        recordPolicyStaleAnalysis journalPath24 sessionId24 coreBuildId24 duplicateIdentity24.ArtifactHash report24 (liveNow ())
+
+    let staleAnalysisJournaled24 =
+        Wm.Journal.JournalWriter.readAll journalPath24
+        |> Seq.exists (fun e -> e.Kind = PolicyStaleAnalysisKind && e.PolicyArtifactHash = duplicateIdentity24.ArtifactHash)
+
+    let allPassed24 =
+        hashReproducible24
+        && savedAndLoadedOk24
+        && deployOk24
+        && deployFailsOnDirtyAnalysis24
+        && linkOk24
+        && linkFailsOnUnregistered24
+        && rollbackBeforeActivation24
+        && rollbackAfterActivation24
+        && staleAnalysisJournaled24
+
+    printfn
+        "Round 24 checks: hashReproducible=%b savedAndLoadedOk=%b deployOk=%b deployFailsOnDirtyAnalysis=%b linkOk=%b linkFailsOnUnregistered=%b rollbackBeforeActivation=%b rollbackAfterActivation=%b staleAnalysisJournaled=%b"
+        hashReproducible24
+        savedAndLoadedOk24
+        deployOk24
+        deployFailsOnDirtyAnalysis24
+        linkOk24
+        linkFailsOnUnregistered24
+        rollbackBeforeActivation24
+        rollbackAfterActivation24
+        staleAnalysisJournaled24
+    printfn
+        "Round 24 PASSED (§14 PolicyArtifact: canonical hash reproducible, save/load round-trip, Deploy accepts clean/rejects dirty via real Analyzer, link accepts registered/rejects unregistered Layout, Rollback trusts only Host's own activation record, report-only mode journals PolicyStaleAnalysis without blocking adoption): %b"
+        allPassed24
 
     printfn "\nDone."
     0

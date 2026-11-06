@@ -624,6 +624,16 @@ let private payloadToJson (payload: JournalPayload) : JsonNode =
         o.["requestId"] <- JsonValue.Create(rid)
         o.["satisfied"] <- JsonValue.Create(satisfied)
         o :> JsonNode
+    | PolicyActivatedPayload source ->
+        let o = JsonObject()
+        o.["source"] <- JsonValue.Create(source)
+        o :> JsonNode
+    | PolicyStaleAnalysisPayload issueSummaries ->
+        let o = JsonObject()
+        let arr = JsonArray()
+        for s in issueSummaries do arr.Add(JsonValue.Create(s))
+        o.["issueSummaries"] <- arr
+        o :> JsonNode
     | other -> JsonValue.Create(sprintf "%A" other) :> JsonNode // EffectDispatchPayload/EffectBatchReturnedPayload：Effect自体の符号化が無いため依然未対応
 
 let private kindTag (kind: JournalKind) : string =
@@ -639,6 +649,8 @@ let private kindTag (kind: JournalKind) : string =
     | ObservationReceived -> "observation-received"
     | PendingSatisfied -> "pending-satisfied"
     | PendingTimedOut -> "pending-timed-out"
+    | PolicyActivatedKind -> "policy-activated"
+    | PolicyStaleAnalysisKind -> "policy-stale-analysis"
 
 let private kindOfTag (tag: string) : JournalKind =
     match tag with
@@ -653,6 +665,8 @@ let private kindOfTag (tag: string) : JournalKind =
     | "observation-received" -> ObservationReceived
     | "pending-satisfied" -> PendingSatisfied
     | "pending-timed-out" -> PendingTimedOut
+    | "policy-activated" -> PolicyActivatedKind
+    | "policy-stale-analysis" -> PolicyStaleAnalysisKind
     | other -> failwithf "Replay: unrecognized JournalKind tag '%s'" other
 
 /// Phase C Journal Inspect（architecture.md §10.2、v2.147）が再利用するため公開する——Journalが
@@ -703,6 +717,9 @@ let private entryOfJson (node: JsonNode) : JournalEntry =
                 RequestId (node.["payload"].["requestId"].GetValue<int64>()),
                 node.["payload"].["satisfied"].GetValue<bool>()
             )
+        | PolicyActivatedKind -> PolicyActivatedPayload (node.["payload"].["source"].GetValue<string>())
+        | PolicyStaleAnalysisKind ->
+            PolicyStaleAnalysisPayload (node.["payload"].["issueSummaries"].AsArray() |> Seq.map (fun n -> n.GetValue<string>()) |> List.ofSeq)
         | EffectDispatchStarted
         | EffectBatchReturnedKind -> failwithf "Replay: このビルドはJournalKind '%A' のPayload復元に未対応" kind
     { SchemaVersion = node.["schemaVersion"].GetValue<int>()

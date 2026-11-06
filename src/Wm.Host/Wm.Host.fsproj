@@ -16,6 +16,7 @@
   <ItemGroup>
     <Compile Include="EffectHarness.fs" />
     <Compile Include="ResidentHost.fs" />
+    <Compile Include="PolicyArtifact.fs" />
     <Compile Include="InspectPipeServer.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
