@@ -26,6 +26,7 @@ open System.Security.Principal
 open System.Text
 open System.Text.Json
 open System.Threading
+open System.Threading.Tasks
 open Microsoft.Win32.SafeHandles
 open Wm.DebugProtocol.Snapshot
 open Wm.DebugProtocol.SnapshotJson
@@ -179,15 +180,34 @@ let generatePipeName () : string =
         with _ -> "unknown-session"
     sprintf "winmonad-repl-%s-%s" sessionId (Guid.NewGuid().ToString("N").Substring(0, 12))
 
+/// 1接続あたりの壁時計デッドライン(ms)。handshake(接続後最初の受信)・読取途中(送信の停滞)の
+/// どちらも、現行プロトコル(1接続=1リクエスト、`handleOneRequest`が1件処理して戻ったら
+/// `runAcceptLoop`が`Disconnect`する)では「このリクエストを読み切り応答を送り終えるまで」という
+/// 1本のデッドラインで等しく塞げる——送受信とも`PipeStream.ReadAsync`/`WriteAsync`＋
+/// `CancellationToken`を使う（`createRestrictedPipe`が`isAsync=true`でパイプを作成済みなので、
+/// キャンセルは実際に保留中のI/Oを中断できる）。opus-review-named-pipe-transport.md 5-E対応。
+/// 「アイドル」(1接続のまま複数リクエストを送れる持続的接続)は現行プロトコルにまだ存在しない概念
+/// なので今は作らない——無い機能を守るタイムアウトは書かない(grounded discipline)。
+let requestTimeoutMs = 5000
+
 /// サーバーは一切パイプインスタンスを`Dispose`しない——`Disconnect`→同じインスタンスで
 /// `WaitForConnectionAsync`を繰り返す（F40：全インスタンスを閉じた隙に別プロセスが同名＋
 /// `FIRST_PIPE_INSTANCE`で先取りできる、という実機確認済みの穴を作らない）。`ct`がキャンセルされる
-/// まで戻らない。`onClient`は接続のたびに呼ばれる（ワイヤプロトコルは後続のスライスでここに足す）。
-let runAcceptLoop (pipe: NamedPipeServerStream) (ct: CancellationToken) (onClient: NamedPipeServerStream -> Result<ClientPrincipal, string> -> unit) =
+/// まで戻らない。`onClient`は接続のたびに呼ばれ、接続ごとの(`ct`にリンクした)タイムアウト付き
+/// トークンを受け取る——接続だけして何も送らない・送信を途中で止めるクライアントがいても、
+/// `perConnectionTimeoutMs`後にこのトークンがキャンセルされ、保留中の`ReadAsync`/`WriteAsync`が
+/// 例外で中断される（呼び出し側の既存の`try ... with _ -> ()`がこれを飲み込み、次の接続へ進む）。
+/// シングルスレッドのこのループが1クライアントに無期限に塞がれる心配はもう無い。タイムアウト値を
+/// 外から指定できるようにしたのは、CIで本番の`requestTimeoutMs`(5秒)の実演を毎回待たされないよう、
+/// Program.fsの実演Roundから短い値を渡せるようにするため——本番経路は次の`runAcceptLoop`
+/// （既定`requestTimeoutMs`）を使う。
+let runAcceptLoopWithTimeout (pipe: NamedPipeServerStream) (ct: CancellationToken) (perConnectionTimeoutMs: int) (onClient: NamedPipeServerStream -> Result<ClientPrincipal, string> -> CancellationToken -> unit) =
     while not ct.IsCancellationRequested do
         try
             pipe.WaitForConnectionAsync(ct).GetAwaiter().GetResult()
-            onClient pipe (inspectConnectedClient pipe)
+            use requestCts = CancellationTokenSource.CreateLinkedTokenSource(ct)
+            requestCts.CancelAfter(perConnectionTimeoutMs)
+            onClient pipe (inspectConnectedClient pipe) requestCts.Token
         with
         | :? OperationCanceledException -> ()
         | _ -> ()
@@ -197,6 +217,9 @@ let runAcceptLoop (pipe: NamedPipeServerStream) (ct: CancellationToken) (onClien
                 pipe.Disconnect()
             with _ ->
                 ()
+
+let runAcceptLoop (pipe: NamedPipeServerStream) (ct: CancellationToken) (onClient: NamedPipeServerStream -> Result<ClientPrincipal, string> -> CancellationToken -> unit) =
+    runAcceptLoopWithTimeout pipe ct requestTimeoutMs onClient
 
 /// 1メッセージの最大バイト数（opus-review-named-pipe-transport.md 5-E対応）。
 let maxMessageBytes = 1 <<< 20 // 1 MiB
@@ -208,11 +231,21 @@ let private readExact (stream: PipeStream) (buf: byte[]) =
         if n = 0 then failwith "pipe closed before message complete"
         offset <- offset + n
 
+/// サーバー側のタイムアウト付き読み取りが使う（`ct`が`requestTimeoutMs`で期限切れになると、
+/// 保留中の`ReadAsync`が`OperationCanceledException`で中断される）。クライアント側（現行の
+/// テスト専用呼び出し元、Program.fsのRound 17）は接続自体に`NamedPipeClientStream.Connect(ms)`の
+/// タイムアウトを既に持っているため、同期版の`readExact`/`readFramedMessage`をそのまま使い続ける。
+let private readExactAsync (stream: PipeStream) (buf: byte[]) (ct: CancellationToken) : Task =
+    task {
+        let mutable offset = 0
+        while offset < buf.Length do
+            let! n = stream.ReadAsync(buf, offset, buf.Length - offset, ct)
+            if n = 0 then failwith "pipe closed before message complete"
+            offset <- offset + n
+    }
+
 /// 長さプレフィックス（4バイトリトルエンディアンUInt32）＋UTF8本体。長さを読んだ時点で上限を
-/// 超えていればバッファ確保前に例外を投げる（opus-review 1-5/5-E対応）。**既知の未実装点**：
-/// ハンドシェイク/読み取り途中/アイドルの3種タイムアウト（opus-review 5-E）はこのスライスでは
-/// まだ実装しない——今はテスト専用の呼び出し元しかおらず、スロウロリス対策は本番公開前の
-/// 別スライスで必須にする。
+/// 超えていればバッファ確保前に例外を投げる（opus-review 1-5/5-E対応）。
 let readFramedMessage (stream: PipeStream) : byte[] =
     let lenBuf = Array.zeroCreate<byte> 4
     readExact stream lenBuf
@@ -223,6 +256,19 @@ let readFramedMessage (stream: PipeStream) : byte[] =
     readExact stream buf
     buf
 
+/// サーバー側専用：`ct`の期限切れ（handshake/読取途中タイムアウト、5-E）で中断できる版。
+let readFramedMessageAsync (stream: PipeStream) (ct: CancellationToken) : Task<byte[]> =
+    task {
+        let lenBuf = Array.zeroCreate<byte> 4
+        do! readExactAsync stream lenBuf ct
+        let len = int (BitConverter.ToUInt32(lenBuf, 0))
+        if len > maxMessageBytes then
+            failwithf "incoming message (%d bytes) exceeds maxMessageBytes (%d)" len maxMessageBytes
+        let buf = Array.zeroCreate<byte> len
+        do! readExactAsync stream buf ct
+        return buf
+    }
+
 let writeFramedMessage (stream: PipeStream) (payload: byte[]) =
     if payload.Length > maxMessageBytes then
         failwithf "outgoing message (%d bytes) exceeds maxMessageBytes (%d)" payload.Length maxMessageBytes
@@ -230,6 +276,18 @@ let writeFramedMessage (stream: PipeStream) (payload: byte[]) =
     stream.Write(lenBuf, 0, 4)
     stream.Write(payload, 0, payload.Length)
     stream.Flush()
+
+/// サーバー側専用：応答をクライアントが読み切らず詰まるケースも同じ`ct`で中断できるようにする
+/// （読み取りだけでなく送信側も塞がれ得る、同じ5-Eの精神を書き込みにも及ぼす）。
+let writeFramedMessageAsync (stream: PipeStream) (payload: byte[]) (ct: CancellationToken) : Task =
+    task {
+        if payload.Length > maxMessageBytes then
+            failwithf "outgoing message (%d bytes) exceeds maxMessageBytes (%d)" payload.Length maxMessageBytes
+        let lenBuf = BitConverter.GetBytes(uint32 payload.Length)
+        do! stream.WriteAsync(lenBuf, 0, 4, ct)
+        do! stream.WriteAsync(payload, 0, payload.Length, ct)
+        do! stream.FlushAsync(ct)
+    }
 
 let private protocolVersion = 1
 
@@ -256,15 +314,20 @@ let private parseRequest (bytes: byte[]) : Result<InspectRequest, string> =
 /// 通過したはずの接続だが、ここでも「同一ユーザー・Host自身の整合性レベル以上」を再確認する）→
 /// 1件のリクエストを読む→`getSnapshot`を呼んで応答する、という最小の往復を実装する。Inspect
 /// （§10.2「Snapshot、Policy、Journal、Explain、Analyzerを見る」）のうちSnapshotだけがこの
-/// スライスの対象——Policy/Journal/Explain/Analyzerは後続。
-let handleOneRequest (pipe: NamedPipeServerStream) (principal: Result<ClientPrincipal, string>) (ownRid: int option) (getSnapshot: unit -> SnapshotDto) : unit =
-    let authorized =
-        match principal, ownRid with
-        | Ok p, Some own -> p.IntegrityRid >= own
-        | _ -> false
-    if authorized then
-        match parseRequest (readFramedMessage pipe) with
-        | Error _ -> ()
-        | Ok SnapshotRequest ->
-            let json = snapshotDtoToJson (getSnapshot ())
-            writeFramedMessage pipe (Encoding.UTF8.GetBytes(json.ToJsonString()))
+/// スライスの対象——Policy/Journal/Explain/Analyzerは後続。`ct`は`runAcceptLoop`が接続ごとに
+/// `requestTimeoutMs`で組み立てたデッドライン（5-E対応）：読取・応答送信どちらが詰まっても
+/// このトークンの期限切れで中断される。
+let handleOneRequestAsync (pipe: NamedPipeServerStream) (principal: Result<ClientPrincipal, string>) (ownRid: int option) (getSnapshot: unit -> SnapshotDto) (ct: CancellationToken) : Task =
+    task {
+        let authorized =
+            match principal, ownRid with
+            | Ok p, Some own -> p.IntegrityRid >= own
+            | _ -> false
+        if authorized then
+            let! requestBytes = readFramedMessageAsync pipe ct
+            match parseRequest requestBytes with
+            | Error _ -> ()
+            | Ok SnapshotRequest ->
+                let json = snapshotDtoToJson (getSnapshot ())
+                do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
+    }

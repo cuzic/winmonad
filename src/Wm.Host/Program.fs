@@ -974,7 +974,7 @@ let main argv =
         use cts16 = new CancellationTokenSource()
         let mutable observedPrincipal16: Result<ClientPrincipal, string> option = None
         let acceptThread16 =
-            Thread(fun () -> runAcceptLoop pipe16 cts16.Token (fun _ principal -> observedPrincipal16 <- Some principal))
+            Thread(fun () -> runAcceptLoop pipe16 cts16.Token (fun _ principal _ -> observedPrincipal16 <- Some principal))
         acceptThread16.IsBackground <- true
         acceptThread16.Start()
 
@@ -1033,9 +1033,9 @@ let main argv =
         let ownRid17 = ownIntegrityRid ()
         let acceptThread17 =
             Thread(fun () ->
-                runAcceptLoop pipe17 cts17.Token (fun p principal ->
+                runAcceptLoop pipe17 cts17.Token (fun p principal reqCt ->
                     try
-                        handleOneRequest p principal ownRid17 (fun () -> residentHost17.EnqueueSnapshotQuery().Result)
+                        (handleOneRequestAsync p principal ownRid17 (fun () -> residentHost17.EnqueueSnapshotQuery().Result) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread17.IsBackground <- true
         acceptThread17.Start()
@@ -1068,6 +1068,83 @@ let main argv =
         let loopStopped17 = loopThread17.Join(3000)
         printfn "Round 17 PASSED (real SnapshotDto delivered end-to-end over the actual Named Pipe, matches a direct ResidentHost query, both threads stopped cleanly): %b"
             (roundTripOk17 && matches17 && acceptStopped17 && loopStopped17)
+
+    // Round 18：接続ごとのリクエストタイムアウト（opus-review-named-pipe-transport.md 5-E対応、
+    // architecture.md v2.142）が実際にスロウロリスを防ぐことを実機で確認する。`runAcceptLoop`は
+    // シングルスレッドで1接続を処理し終えてから次を受け付けるため、接続だけして何も送らない
+    // クライアントがいると、タイムアウトが無ければ以後の全クライアントが永久に待たされる。
+    // `runAcceptLoopWithTimeout`に短いタイムアウトを渡して同じ挙動をCIで速く確認する——このパイプは
+    // `nMaxInstances=1`(`createRestrictedPipe`)なので、2人目のクライアントの`Connect`はサーバーが
+    // 1人目を切ってから次の`WaitForConnectionAsync`に戻るまで実際にブロックされる。タイムアウトが
+    // 機能していれば、1人目を開いたまま放置しても2人目が有限時間内に接続・応答を受け取れる。
+    printfn "\n--- Round 18: per-connection request timeout defeats a stuck (slowloris-style) client ---"
+    let journalPath18 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round18-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    let reducer18 = Reducer(RuntimePolicy.defaults, "phase-b-round18", "wm-host-round18", "no-policy-artifact", Some journalPath18)
+    let residentHost18 = ResidentHost(reducer18, liveNow)
+    let loopThread18 = Thread(fun () -> residentHost18.Run(tickMs = 1))
+    loopThread18.IsBackground <- true
+    loopThread18.Start()
+    Thread.Sleep(50)
+
+    let pipeName18 = generatePipeName ()
+    match createRestrictedPipe pipeName18 with
+    | Error e ->
+        printfn "Round 18 FAILED (createRestrictedPipe): %s" e
+        residentHost18.RequestStop()
+        loopThread18.Join(3000) |> ignore
+    | Ok pipe18 ->
+        use pipe18 = pipe18
+        use cts18 = new CancellationTokenSource()
+        let ownRid18 = ownIntegrityRid ()
+        let shortTimeoutMs18 = 800
+        let acceptThread18 =
+            Thread(fun () ->
+                runAcceptLoopWithTimeout pipe18 cts18.Token shortTimeoutMs18 (fun p principal reqCt ->
+                    try
+                        (handleOneRequestAsync p principal ownRid18 (fun () -> residentHost18.EnqueueSnapshotQuery().Result) reqCt).GetAwaiter().GetResult()
+                    with _ -> ()))
+        acceptThread18.IsBackground <- true
+        acceptThread18.Start()
+        Thread.Sleep(100)
+
+        // 1人目：接続だけして何も送らず、開いたまま放置する（stuck client）。
+        use stuckClient18 = new NamedPipeClientStream(".", pipeName18, PipeDirection.InOut, PipeOptions.None, TokenImpersonationLevel.Impersonation)
+        let stuckConnectOk18 =
+            try
+                stuckClient18.Connect(2000)
+                true
+            with _ -> false
+
+        // 2人目：1人目がまだ開いたままの状態で接続を試みる。パイプは1インスタンスしか無いので、
+        // サーバーが1人目をタイムアウトで切って次の`WaitForConnectionAsync`に戻るまでブロックされる
+        // ——`shortTimeoutMs18`より十分大きいが無限ではない`Connect`タイムアウトを与え、実際に
+        // 有限時間内に通ることを確認する。
+        let roundTripOk18, roundTripError18, receivedSnapshot18 =
+            try
+                use secondClient18 = new NamedPipeClientStream(".", pipeName18, PipeDirection.InOut, PipeOptions.None, TokenImpersonationLevel.Impersonation)
+                secondClient18.Connect(5000)
+                writeFramedMessage secondClient18 (Encoding.UTF8.GetBytes("""{"v":1,"op":"snapshot"}"""))
+                let responseBytes = readFramedMessage secondClient18
+                let json = JsonNode.Parse(Encoding.UTF8.GetString responseBytes)
+                true, "", Some(snapshotDtoOfJson json)
+            with ex ->
+                false, ex.Message, None
+
+        let directSnapshot18 = residentHost18.EnqueueSnapshotQuery().Result
+        let matches18 =
+            match receivedSnapshot18 with
+            | Some s -> s.Revision = directSnapshot18.Revision && s.Windows = directSnapshot18.Windows
+            | None -> false
+
+        printfn "Round 18 stuck client connected=%b, second client round-trip: ok=%b error=%s" stuckConnectOk18 roundTripOk18 roundTripError18
+        printfn "Round 18 received=%A" receivedSnapshot18
+
+        cts18.Cancel()
+        let acceptStopped18 = acceptThread18.Join(3000)
+        residentHost18.RequestStop()
+        let loopStopped18 = loopThread18.Join(3000)
+        printfn "Round 18 PASSED (a stuck first client that never sends anything does not block a well-behaved second client from connecting and getting a correct Snapshot within a bounded time, both threads stopped cleanly): %b"
+            (stuckConnectOk18 && roundTripOk18 && matches18 && acceptStopped18 && loopStopped18)
 
     printfn "\nDone."
     0
