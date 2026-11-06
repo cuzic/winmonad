@@ -62,8 +62,41 @@ let private visibleWindowObservedMaximized (w: WindowId) : InputEvent =
     | WindowObserved s -> WindowObserved { s with IsMaximized = Some { Value = Ok true; SampleSequence = 0L; MonotonicTime = 0L; Source = "virtual-world" } }
     | other -> other
 
+let private WS_CAPTION = 0x00C00000
+let private WS_THICKFRAME = 0x00040000
+
+/// F36/F37（E-4全画面検出、v2.128/129で実機確認済み）：ボーダレス（`WS_CAPTION`/`WS_THICKFRAME`無し）
+/// かつ矩形がモニタのBoundsと一致する観測。discoveryは常に手組み（このファイル冒頭、
+/// `visibleWindowObservedMaximized`と同じ理由——VirtualWorldのEffect応答ではなく、Shell側の
+/// 初回probe/再probeを模す）。
+let private visibleWindowObservedFullscreen (w: WindowId) (monitorBounds: PixelRect) : InputEvent =
+    match visibleWindowObserved w with
+    | WindowObserved s ->
+        WindowObserved
+            { s with
+                NativeRect = Some { Value = Ok monitorBounds; SampleSequence = 0L; MonotonicTime = 0L; Source = "virtual-world" }
+                Style = Some { Value = Ok 0; SampleSequence = 0L; MonotonicTime = 0L; Source = "virtual-world" } }
+    | other -> other
+
+/// 全画面から退出した観測（通常の有枠窓へ戻る、F36参照）。
+let private visibleWindowObservedWindowed (w: WindowId) (rect: PixelRect) : InputEvent =
+    match visibleWindowObserved w with
+    | WindowObserved s ->
+        WindowObserved
+            { s with
+                NativeRect = Some { Value = Ok rect; SampleSequence = 1L; MonotonicTime = 0L; Source = "virtual-world" }
+                Style = Some { Value = Ok (WS_CAPTION ||| WS_THICKFRAME); SampleSequence = 1L; MonotonicTime = 0L; Source = "virtual-world" } }
+    | other -> other
+
 let private settleTopology (reducer: Reducer) (monitors: MonitorSnapshot list) : unit =
     reducer.Submit 0L "virtual-world" (MonitorTopologyObserved monitors) |> ignore
+    reducer.AdvanceToNextTimer () |> ignore
+
+/// `settleTopology`はSettling→Grace止まり（ScreenSettleタイマーのみ消費）。`checkFullscreen`の退出方向
+/// （ファイル直前のコメント「ルール4」）は`screenPhaseIsStable`を要求するので、ScreenGraceタイマーも
+/// 消費してStableまで進める必要があるシナリオで使う。
+let private settleTopologyStable (reducer: Reducer) (monitors: MonitorSnapshot list) : unit =
+    settleTopology reducer monitors
     reducer.AdvanceToNextTimer () |> ignore
 
 [<Fact>]
@@ -332,6 +365,47 @@ let ``RefusesCloseの窓はCloseFocusedを送っても消えず、以後も通�
     let finalWorld2 = settle 2000L reducer world2 d2.Effects
     Assert.Empty(reducer.State.Placement.Pending)
     Assert.True(Map.containsKey w finalWorld2.Windows)
+
+/// F36/F37（E-4全画面検出、opus-review-fullscreen-detection(-round2).md、v2.128/129で実機確認済み）を
+/// VirtualWorld越しに再現する(v2.141)。Core側の判定(`checkFullscreen`)・ゲート(`GatedEffect.RFullscreen`)
+/// 自体は既にPlacementReconcileTests/GatedEffectTestsでmutation testing済みだが、「疑似OS側に実際に
+/// ボーダレス全画面アプリが存在し、本物のReducerパイプラインを通してもSetRectが届かない」ことを確認する
+/// 統合テストはこれまで無かった（実機ではPhase B Round 14で確認済み、Linux CIには回帰テストが無い
+/// ギャップだった）。
+[<Fact>]
+let ``F36/F37(E-4):ボーダレス全画面として観測された窓はFullscreen集合に入り、SetRectを受け取らない(v2.141)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    let bounds: PixelRect = (mkMonitor 0).Bounds
+    settleTopology reducer [ mkMonitor 0 ] // Grace中でも「入る」方向は信じてよい(checkFullscreenのルール3)
+    let w = WindowId 1L
+    let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObservedFullscreen w bounds)
+    Assert.True(Set.contains w reducer.State.Placement.Fullscreen)
+    let setRectEffects = discovery.Effects |> List.filter (fun g -> match GatedEffect.effect g with SetRect (_, w', _) -> w' = w | _ -> false)
+    Assert.Empty(setRectEffects)
+
+[<Fact>]
+let ``F36/F37(E-4):画面構成が安定済みなら全画面から退出した観測でFullscreen集合から外れ、以後は通常どおりタイル対象に復帰する(v2.141)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    let bounds: PixelRect = (mkMonitor 0).Bounds
+    settleTopologyStable reducer [ mkMonitor 0 ] // checkFullscreenの退出方向はscreenPhaseIsStableを要求する(ルール4)
+    let w = WindowId 1L
+    reducer.Submit 1000L "virtual-world" (visibleWindowObservedFullscreen w bounds) |> ignore
+    Assert.True(Set.contains w reducer.State.Placement.Fullscreen)
+
+    let world = empty |> addWindow w bounds Immediate |> withBorderless w
+    let windowedRect = { X = 100; Y = 100; Width = 400; Height = 300 }
+    let exitResult = reducer.Submit 2000L "virtual-world" (visibleWindowObservedWindowed w windowedRect)
+    Assert.False(Set.contains w reducer.State.Placement.Fullscreen)
+
+    // 以後も通常どおり配置され続けることの確認：2つ目の窓を追加すればMonocleで分割され、全画面から
+    // 戻ったばかりの窓も新しいSetRectを受け取って追従する。
+    let world' = settle 2000L reducer world exitResult.Effects
+    let w2 = WindowId 2L
+    let world2 = world' |> addWindow w2 { X = 0; Y = 0; Width = 10; Height = 10 } Immediate
+    let d2 = reducer.Submit 2500L "virtual-world" (visibleWindowObserved w2)
+    let finalWorld = settle 2500L reducer world2 d2.Effects
+    Assert.Empty(reducer.State.Placement.Pending)
+    Assert.True(Map.containsKey w finalWorld.Windows)
 
 [<Fact>]
 let ``2つ目の窓が現れても、両方がMonocleで全画面に配置され両方Satisfiedになる`` () =

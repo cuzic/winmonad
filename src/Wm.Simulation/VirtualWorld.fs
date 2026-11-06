@@ -43,6 +43,18 @@
 /// `onEffectCallReturned`分岐は存在しない（fire-and-forget）ため、このシナリオは「窓が消えずに残っても
 /// 何も壊れず、以後も通常どおり配置され続ける」ことを確認する回帰テストとして価値を持つ。
 ///
+/// **v2.141でボーダレス全画面アプリ(`IsBorderless`)を実装**：E-4全画面検出（`Wm.Core.Placement.checkFullscreen`、
+/// v2.128/129、opus-review-fullscreen-detection(-round2).md、F36/F37で実機確認済み）はCore側のゲート
+/// （`GatedEffect.RFullscreen`、`GatedEffectTests`/`PlacementReconcileTests`でmutation testing済み）
+/// までは既にテストされていたが、Wm.Simulationには「アプリ自身がボーダレス・モニタ全体の矩形になる」
+/// ことを模す手段が無く、実機(Phase B Round 14)でしか端から端まで通して確かめられなかった——Linux CI
+/// (`phase-a-build.yml`)にこの統合経路の回帰テストが無いギャップだった。`VirtualWindow`に
+/// `IsBorderless: bool`（既定`false`＝`WS_CAPTION|WS_THICKFRAME`を持つ通常の有枠窓）を追加し、
+/// `ObserveAll`の完全観測に`Style`（`checkFullscreen`が読む生のGWL_STYLE相当の値）を含めた——`IsMaximized`
+/// をv2.74で含めたのと同じ理由（全体再列挙はWMが持つ属性を全て運ぶ）。初回discoveryの観測自体は
+/// これまでの`IsMaximized`等と同じく疑似OS側のEffect応答ではなく呼び出し側（テスト）が手組みする
+/// ものなので、`VirtualWorld`側の変更は`IsBorderless`フィールドと`ObserveAll`配線だけで足りる。
+///
 /// **v2.74で`RestoreBeforeMove`を実装**：`Placement.dispatchPlacements`が最大化中のTiled窓への新しい
 /// `SetRect`の直前に発行するようになった（§6.2/§7.1の`NeedsRestore`、CIスパイクS6bで実機確認した
 /// `ShowWindowAsync(SW_RESTORE)`の効果）。`VirtualWindow`に`IsMaximized: bool`（既定`false`）を追加し、
@@ -110,7 +122,13 @@ type VirtualWindow =
       /// `RequestClose`を無視するアプリ（F30/S17で実機確認済み：`WM_CLOSE`を無視する`WndProc`へ
       /// `PostMessage(WM_CLOSE)`を送ると、呼出自体は非ブロッキングで即時`posted=true`に成功するが、
       /// 窓は生存し続ける）。既定`false`（既存のシナリオ・テストへの影響が無い）。v2.140で追加。
-      RefusesClose: bool }
+      RefusesClose: bool
+      /// ボーダレス（`WS_CAPTION`/`WS_THICKFRAME`無し）アプリ（E-4全画面検出、F36/F37で実機確認済み）。
+      /// 既定`false`（通常の有枠窓）。`true`でも`VirtualWindow.Rect`自体は変えない——「矩形がモニタの
+      /// Boundsと一致するボーダレス窓」という`checkFullscreen`の判定条件は、`addWindow`の`rect`引数を
+      /// モニタのBoundsに合わせて呼ぶかどうかでシナリオ側が決める（`IsMaximized`等と同じく、この
+      /// フィールド単体は見た目の属性でしかなく矩形そのものは別軸）。v2.141で追加。
+      IsBorderless: bool }
 
 /// §12.1「`ScheduledSimEvent`」の最小形：`DelayedByMs`な`SetRect`が、`FireAtMs`に達するまで積まれる
 /// 未発火の観測。`Seed`はまだ`WindowBehaviors`のどの挙動も使わないため持たない。
@@ -129,8 +147,18 @@ let addWindow (w: WindowId) (rect: PixelRect) (behavior: WindowBehavior) (world:
         Windows =
             Map.add
                 w
-                { Id = w; Rect = rect; Behavior = behavior; Shown = true; Integrity = NotHigher; IsMaximized = false; FrameInset = noFrameInset; RefusesClose = false }
+                { Id = w; Rect = rect; Behavior = behavior; Shown = true; Integrity = NotHigher; IsMaximized = false; FrameInset = noFrameInset; RefusesClose = false; IsBorderless = false }
                 world.Windows }
+
+/// Win32のウィンドウスタイルビット（E-4全画面検出、`Wm.Core.Placement`の同名プライベート定数と同じ値、
+/// winuser.hの公開済み定数）。Coreが`Wm.Windows.Native`に依存できないのと同じ理由（§17の依存方向）で、
+/// `Wm.Simulation`も`VirtualWorld.fs`自身は`Wm.Contracts`以外へ依存しない方針（ファイル冒頭参照）に
+/// 従い、ここでも複製する。
+let private WS_CAPTION = 0x00C00000
+let private WS_THICKFRAME = 0x00040000
+
+/// `IsBorderless`から`checkFullscreen`が読む生のGWL_STYLE相当の値を組み立てる。
+let private styleOf (isBorderless: bool) : int = if isBorderless then 0 else (WS_CAPTION ||| WS_THICKFRAME)
 
 /// `addWindow`呼び出し後に不可視リサイズ枠を模す窓へ上書きする（`Integrity`/`IsMaximized`と同じ要領、
 /// `VirtualWindow`の型直前のコメント参照）。対象窓が無ければ何もしない。
@@ -144,6 +172,13 @@ let withFrameInset (w: WindowId) (inset: FrameInset) (world: VirtualWorld) : Vir
 let withRefusesClose (w: WindowId) (world: VirtualWorld) : VirtualWorld =
     match Map.tryFind w world.Windows with
     | Some vw -> { world with Windows = Map.add w { vw with RefusesClose = true } world.Windows }
+    | None -> world
+
+/// `addWindow`呼び出し後にボーダレスアプリへ上書きする（同じ要領、E-4/F36/F37、`VirtualWindow`の型直前の
+/// コメント参照）。対象窓が無ければ何もしない。
+let withBorderless (w: WindowId) (world: VirtualWorld) : VirtualWorld =
+    match Map.tryFind w world.Windows with
+    | Some vw -> { world with Windows = Map.add w { vw with IsBorderless = true } world.Windows }
     | None -> world
 
 let private emptySnapshot (w: WindowId) : WindowSnapshot =
@@ -387,7 +422,8 @@ let applyEffect
                                 VisibleFrameRect = Some { Value = Ok vw.Rect; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" }
                                 Presence = Some { Value = Ok presence; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" }
                                 TargetIntegrity = Some { Value = Ok vw.Integrity; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" }
-                                IsMaximized = Some { Value = Ok vw.IsMaximized; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" } }
+                                IsMaximized = Some { Value = Ok vw.IsMaximized; SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" }
+                                Style = Some { Value = Ok (styleOf vw.IsBorderless); SampleSequence = sampleSeq; MonotonicTime = now; Source = "virtual-world" } }
                     acc @ [ ev ], sampleSeq + 1L)
                 ([], world.NextSampleSequence)
         { world with NextSampleSequence = nextSeq }, observed, []
