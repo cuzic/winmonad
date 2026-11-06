@@ -655,7 +655,11 @@ let private kindOfTag (tag: string) : JournalKind =
     | "pending-timed-out" -> PendingTimedOut
     | other -> failwithf "Replay: unrecognized JournalKind tag '%s'" other
 
-let private entryToJson (entry: JournalEntry) : JsonNode =
+/// Phase C Journal Inspect（architecture.md §10.2、v2.147）が再利用するため公開する——Journalが
+/// 運ぶ`InputEvent`/`Effect`等の全体を型安全なDTOへもう一度並行して写すのはこのスライスの範囲を
+/// 大きく超えるため、既存のオンディスクJSON形式（§9.2の規約）そのものを、人間がInspectで読むための
+/// 表現として再利用する。
+let entryToJson (entry: JournalEntry) : JsonNode =
     let o = JsonObject()
     o.["schemaVersion"] <- JsonValue.Create(entry.SchemaVersion)
     o.["sessionId"] <- JsonValue.Create(entry.SessionId)

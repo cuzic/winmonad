@@ -5,8 +5,16 @@ module Wm.Runtime.Reducer
 open System
 open Wm.Contracts.CoreCommand
 open Wm.Contracts.JournalTypes
+open Wm.Core.DecisionTrace
 open Wm.Core.WmState
 open Wm.Runtime.TimerExecutor
+
+/// 直近何件の`DecisionTrace`を蓄えておくか（Phase C Explain、architecture.md §10.2、v2.147）。
+/// JournalのInspect側（直近50〜100件、ユーザー決定2026-11-06）と同じ桁数に揃える——`DecisionTrace`
+/// 自体はJournalに永続化しない揮発性の値（`DecisionTrace.fs`の型直前のコメント「ExplainはReplayで
+/// 再構成する」参照）なので、この固定長バッファがその場しのぎの代替になる。将来Replayベースの
+/// 再構成（§18）を実装する際は、この固定長バッファ方式は不要になる可能性がある。
+let recentTraceCapacity = 64
 
 /// 最小のReducer：単一の入力キューを順に処理し、各ステップの前に入力をJournalへ書く。
 /// Simulation版のTimer実行器を内包し、外部入力が無い間は最も早い期限のタイマーを仮想時計で発火できる。
@@ -14,9 +22,20 @@ type Reducer(runtimePolicy: RuntimePolicy, sessionId: string, coreBuildId: strin
     let mutable state = initial runtimePolicy
     let mutable sequence = 0L
     let timers = SimulationTimerExecutor()
+    // 新しい順（先頭が最新）。`DecisionTrace`自体はウィンドウIDを運ばないケースが多い（`DecisionTrace.fs`
+    // 参照）ため、ここでは特定の窓へは絞らず、直近の全件をそのまま保持する——Explain呼び出し側
+    // （`Wm.Host/ResidentHost.fs`）が窓ごとに関係しそうなものを拾うかはそちら側の判断に委ねる。
+    let mutable recentTraces : DecisionTrace list = []
 
     member _.State = state
     member _.Timers = timers
+
+    /// Journal Inspect（architecture.md §10.2、v2.147）がJournalファイルを読むために必要なパス。
+    /// Hostの外からもファイルパスという不変の環境値を読むだけなので`Policy`と同じ理由で安全。
+    member _.JournalPath = journalPath
+
+    /// 直近の`DecisionTrace`（新しい順、最大`recentTraceCapacity`件）。Phase C Explain（v2.147）向け。
+    member _.RecentTrace = recentTraces
 
     /// Phase CのPolicy Inspect（architecture.md §10.2、v2.145）が読む採用中のPolicy。`runtimePolicy`は
     /// コンストラクタで渡されたまま一度も再代入されない不変の環境（`PolicyActivated`の配線は未実装、
@@ -70,6 +89,8 @@ type Reducer(runtimePolicy: RuntimePolicy, sessionId: string, coreBuildId: strin
         let result = step runtimePolicy state envelope
         state <- result.Next
         timers.Apply now result.Timers
+        if not (List.isEmpty result.Trace) then
+            recentTraces <- (List.rev result.Trace) @ recentTraces |> List.truncate recentTraceCapacity
         result
 
     /// Simulation駆動：次に発火すべきタイマーがあれば、仮想時計をその時刻へ進めてTimerElapsedを投入する。

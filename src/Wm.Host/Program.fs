@@ -86,6 +86,7 @@ open Wm.Contracts.ErrorTypes
 open Wm.Contracts.CoreCommand
 open Wm.Contracts.GatedEffect
 open Wm.Contracts.JournalTypes
+open Wm.Contracts.Observation
 open Wm.Core.WmState
 open Wm.Policy.PolicyTypes
 open Wm.Policy.PolicyEvaluator
@@ -99,6 +100,7 @@ open Wm.Host.ResidentHost
 open Wm.Host.InspectPipeServer
 open Wm.DebugProtocol.Snapshot
 open Wm.DebugProtocol.SnapshotJson
+open Wm.DebugProtocol.Explain
 open Wm.DebugProtocol.WireFraming
 open Wm.ReplClient.WmClient
 
@@ -1038,7 +1040,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe17 cts17.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid17 (fun () -> residentHost17.EnqueueSnapshotQuery().Result) (fun () -> residentHost17.Policy) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid17 (fun () -> residentHost17.EnqueueSnapshotQuery().Result) (fun () -> residentHost17.Policy) (fun () -> residentHost17.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost17.EnqueueExplainQuery(w)) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread17.IsBackground <- true
         acceptThread17.Start()
@@ -1104,7 +1106,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoopWithTimeout pipe18 cts18.Token shortTimeoutMs18 (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid18 (fun () -> residentHost18.EnqueueSnapshotQuery().Result) (fun () -> residentHost18.Policy) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid18 (fun () -> residentHost18.EnqueueSnapshotQuery().Result) (fun () -> residentHost18.Policy) (fun () -> residentHost18.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost18.EnqueueExplainQuery(w)) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread18.IsBackground <- true
         acceptThread18.Start()
@@ -1182,7 +1184,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe19 cts19.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid19 (fun () -> residentHost19.EnqueueSnapshotQuery().Result) (fun () -> residentHost19.Policy) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid19 (fun () -> residentHost19.EnqueueSnapshotQuery().Result) (fun () -> residentHost19.Policy) (fun () -> residentHost19.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost19.EnqueueExplainQuery(w)) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread19.IsBackground <- true
         acceptThread19.Start()
@@ -1261,7 +1263,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe20 cts20.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid20 (fun () -> residentHost20.EnqueueSnapshotQuery().Result) (fun () -> residentHost20.Policy) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid20 (fun () -> residentHost20.EnqueueSnapshotQuery().Result) (fun () -> residentHost20.Policy) (fun () -> residentHost20.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost20.EnqueueExplainQuery(w)) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread20.IsBackground <- true
         acceptThread20.Start()
@@ -1331,7 +1333,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe21 cts21.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid21 (fun () -> residentHost21.EnqueueSnapshotQuery().Result) (fun () -> residentHost21.Policy) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid21 (fun () -> residentHost21.EnqueueSnapshotQuery().Result) (fun () -> residentHost21.Policy) (fun () -> residentHost21.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost21.EnqueueExplainQuery(w)) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread21.IsBackground <- true
         acceptThread21.Start()
@@ -1366,6 +1368,227 @@ let main argv =
         removeDiscoveryFile ()
         printfn "Round 21 PASSED (op=policy carries the real recommendedWindowRules, including AppIs/DialogIs predicates, through the real Named Pipe and matches a direct query): %b"
             (discoveryWriteOk21 && roundTripOk21 && matches21 && carriesRealRules21 && acceptStopped21 && loopStopped21)
+
+    // Round 22：Journal Inspect操作（v2.147、memory `project_named_pipe_ipc_task_breakdown.md`の
+    // Tier 3の1項目目）。ユーザー決定2026-11-06：直近50〜100件だけ、シンプルに保つ。トポロジ確定
+    // （MonitorTopologyObserved→タイマー2本の発火）＋窓の発見という、意図的に複数のJournalEntryを
+    // 生む現実的なシナリオを使う——Reducerがまだ何も処理していない空のJournalだけを確認しても
+    // 「直近N件」の意味が検証できない。
+    printfn "\n--- Round 22: Journal Inspect op (op=journal) carries recent entries through the real Named Pipe ---"
+    let journalPath22 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round22-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    let reducer22 = Reducer(RuntimePolicy.defaults, "phase-b-round22", "wm-host-round22", "no-policy-artifact", Some journalPath22)
+    let residentHost22 = ResidentHost(reducer22, liveNow)
+    let loopThread22 = Thread(fun () -> residentHost22.Run(tickMs = 1))
+    loopThread22.IsBackground <- true
+    loopThread22.Start()
+    Thread.Sleep(50)
+
+    let testMonitor22: MonitorSnapshot =
+        { Id = MonitorId 0L
+          StableKey = "test-monitor-round22"
+          Bounds = { X = 0; Y = 0; Width = 1920; Height = 1080 }
+          WorkArea = { X = 0; Y = 0; Width = 1920; Height = 1080 }
+          Dpi = 96
+          IsPrimary = true }
+    let visibleWindowObserved22 (w: WindowId) : InputEvent =
+        WindowObserved
+            { Id = w
+              Process = None
+              AppIdentity = { Exe = None; HostExe = None; Aumid = None; CoreWindowExe = None }
+              Owner = None
+              IsDialog = None
+              NativeRect = None
+              VisibleFrameRect = None
+              IsVisible = Some { Value = Ok true; SampleSequence = 0L; MonotonicTime = 0L; Source = "round22" }
+              IsMinimized = None
+              IsMaximized = None
+              Style = None
+              Cloak = None
+              Monitor = None
+              MinWidthHint = None
+              TargetIntegrity = None
+              Responsiveness = None
+              Presence = None
+              DpiAwareness = None
+              TitleMatches = None }
+
+    residentHost22.Submit (liveNow ()) "round22" (MonitorTopologyObserved [ testMonitor22 ]) |> ignore
+    Thread.Sleep(900) // Settling(500ms)→Grace(250ms)が実時間で発火するのを待つ(TopologyConfig.defaults)
+    residentHost22.Submit (liveNow ()) "round22" (visibleWindowObserved22 (WindowId 1L)) |> ignore
+    residentHost22.Submit (liveNow ()) "round22" (visibleWindowObserved22 (WindowId 2L)) |> ignore
+    Thread.Sleep(100)
+
+    let pipeName22 = generatePipeName ()
+    match createRestrictedPipe pipeName22 with
+    | Error e ->
+        printfn "Round 22 FAILED (createRestrictedPipe): %s" e
+        residentHost22.RequestStop()
+        loopThread22.Join(3000) |> ignore
+    | Ok pipe22 ->
+        use pipe22 = pipe22
+        use cts22 = new CancellationTokenSource()
+        let ownRid22 = ownIntegrityRid ()
+
+        let discoveryWriteOk22 =
+            match writeDiscoveryFile pipeName22 with
+            | Ok () -> true
+            | Error _ -> false
+
+        let acceptThread22 =
+            Thread(fun () ->
+                runAcceptLoop pipe22 cts22.Token (fun p principal reqCt ->
+                    try
+                        (handleOneRequestAsync
+                            p
+                            principal
+                            ownRid22
+                            (fun () -> residentHost22.EnqueueSnapshotQuery().Result)
+                            (fun () -> residentHost22.Policy)
+                            (fun () -> residentHost22.RecentJournal(defaultJournalEntryCount))
+                            (fun w -> residentHost22.EnqueueExplainQuery(w))
+                            reqCt)
+                            .GetAwaiter()
+                            .GetResult()
+                    with _ -> ()))
+        acceptThread22.IsBackground <- true
+        acceptThread22.Start()
+        Thread.Sleep(100)
+
+        let roundTripOk22, receivedJournal22 =
+            match connectLocalAsync 2000 |> Async.AwaitTask |> Async.RunSynchronously with
+            | Error _ -> false, None
+            | Ok client ->
+                use client = client
+                match client.JournalAsync() |> Async.AwaitTask |> Async.RunSynchronously with
+                | Ok journal -> true, Some journal
+                | Error _ -> false, None
+
+        let hasMultipleEntries22 =
+            match receivedJournal22 with
+            | Some j -> List.length j.Entries > 1
+            | None -> false
+
+        printfn "Round 22 discovery write=%b, Journal round-trip: ok=%b, entryCount=%A" discoveryWriteOk22 roundTripOk22 (receivedJournal22 |> Option.map (fun j -> List.length j.Entries))
+
+        cts22.Cancel()
+        let acceptStopped22 = acceptThread22.Join(3000)
+        residentHost22.RequestStop()
+        let loopStopped22 = loopThread22.Join(3000)
+        removeDiscoveryFile ()
+        printfn "Round 22 PASSED (op=journal carries multiple recent JournalEntry through the real Named Pipe, reflecting a real multi-step scenario): %b"
+            (discoveryWriteOk22 && roundTripOk22 && hasMultipleEntries22 && acceptStopped22 && loopStopped22)
+
+    // Round 23：Explain操作（v2.147、Tier 3の2項目目）。ユーザー決定2026-11-06：DecisionTraceも含める。
+    // 実際にDecisionTraceを1件生む最小のシナリオとして、`DefaultLayout`が`LayoutRegistry`に登録されて
+    // いないPolicyを使う（`DecisionTrace.LayoutNotRegistered`の型直前コメント「Policy/Registryの
+    // 設定ミス」そのもの）——既定の空Policy（ルール無し）だけだと`DecisionTrace`が一度も生まれず、
+    // Explainの「DecisionTraceを含める」という決定自体を検証できない。
+    printfn "\n--- Round 23: Explain op (op=explain) carries a real DecisionTrace through the real Named Pipe ---"
+    let journalPath23 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round23-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    let policy23 = { PolicyIR.defaults with DefaultLayout = { Id = LayoutId "does-not-exist-round23"; ApiVersion = 1; Args = NoArgs } }
+    let runtimePolicy23 = { RuntimePolicy.defaults with Policy = policy23 }
+    let reducer23 = Reducer(runtimePolicy23, "phase-b-round23", "wm-host-round23", "no-policy-artifact", Some journalPath23)
+    let residentHost23 = ResidentHost(reducer23, liveNow)
+    let loopThread23 = Thread(fun () -> residentHost23.Run(tickMs = 1))
+    loopThread23.IsBackground <- true
+    loopThread23.Start()
+    Thread.Sleep(50)
+
+    let testMonitor23: MonitorSnapshot =
+        { Id = MonitorId 0L
+          StableKey = "test-monitor-round23"
+          Bounds = { X = 0; Y = 0; Width = 1920; Height = 1080 }
+          WorkArea = { X = 0; Y = 0; Width = 1920; Height = 1080 }
+          Dpi = 96
+          IsPrimary = true }
+    let visibleWindowObserved23 (w: WindowId) : InputEvent =
+        WindowObserved
+            { Id = w
+              Process = None
+              AppIdentity = { Exe = None; HostExe = None; Aumid = None; CoreWindowExe = None }
+              Owner = None
+              IsDialog = None
+              NativeRect = None
+              VisibleFrameRect = None
+              IsVisible = Some { Value = Ok true; SampleSequence = 0L; MonotonicTime = 0L; Source = "round23" }
+              IsMinimized = None
+              IsMaximized = None
+              Style = None
+              Cloak = None
+              Monitor = None
+              MinWidthHint = None
+              TargetIntegrity = None
+              Responsiveness = None
+              Presence = None
+              DpiAwareness = None
+              TitleMatches = None }
+
+    let w23 = WindowId 1L
+    residentHost23.Submit (liveNow ()) "round23" (MonitorTopologyObserved [ testMonitor23 ]) |> ignore
+    Thread.Sleep(900)
+    residentHost23.Submit (liveNow ()) "round23" (visibleWindowObserved23 w23) |> ignore
+    Thread.Sleep(100)
+
+    let pipeName23 = generatePipeName ()
+    match createRestrictedPipe pipeName23 with
+    | Error e ->
+        printfn "Round 23 FAILED (createRestrictedPipe): %s" e
+        residentHost23.RequestStop()
+        loopThread23.Join(3000) |> ignore
+    | Ok pipe23 ->
+        use pipe23 = pipe23
+        use cts23 = new CancellationTokenSource()
+        let ownRid23 = ownIntegrityRid ()
+
+        let discoveryWriteOk23 =
+            match writeDiscoveryFile pipeName23 with
+            | Ok () -> true
+            | Error _ -> false
+
+        let acceptThread23 =
+            Thread(fun () ->
+                runAcceptLoop pipe23 cts23.Token (fun p principal reqCt ->
+                    try
+                        (handleOneRequestAsync
+                            p
+                            principal
+                            ownRid23
+                            (fun () -> residentHost23.EnqueueSnapshotQuery().Result)
+                            (fun () -> residentHost23.Policy)
+                            (fun () -> residentHost23.RecentJournal(defaultJournalEntryCount))
+                            (fun w -> residentHost23.EnqueueExplainQuery(w))
+                            reqCt)
+                            .GetAwaiter()
+                            .GetResult()
+                    with _ -> ()))
+        acceptThread23.IsBackground <- true
+        acceptThread23.Start()
+        Thread.Sleep(100)
+
+        let roundTripOk23, receivedExplain23 =
+            match connectLocalAsync 2000 |> Async.AwaitTask |> Async.RunSynchronously with
+            | Error _ -> false, None
+            | Ok client ->
+                use client = client
+                match client.ExplainAsync(w23) |> Async.AwaitTask |> Async.RunSynchronously with
+                | Ok explain -> true, explain
+                | Error _ -> false, None
+
+        let carriesLayoutNotRegistered23 =
+            match receivedExplain23 with
+            | Some e -> e.RecentTrace |> List.exists (function LayoutNotRegisteredDto(LayoutId "does-not-exist-round23", _) -> true | _ -> false)
+            | None -> false
+
+        printfn "Round 23 discovery write=%b, Explain round-trip: ok=%b" discoveryWriteOk23 roundTripOk23
+        printfn "Round 23 received=%A" receivedExplain23
+
+        cts23.Cancel()
+        let acceptStopped23 = acceptThread23.Join(3000)
+        residentHost23.RequestStop()
+        let loopStopped23 = loopThread23.Join(3000)
+        removeDiscoveryFile ()
+        printfn "Round 23 PASSED (op=explain carries a real DecisionTrace(LayoutNotRegistered) through the real Named Pipe for a window using a misconfigured Policy): %b"
+            (discoveryWriteOk23 && roundTripOk23 && receivedExplain23.IsSome && carriesLayoutNotRegistered23 && acceptStopped23 && loopStopped23)
 
     printfn "\nDone."
     0

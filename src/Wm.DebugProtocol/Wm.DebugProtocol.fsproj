@@ -9,6 +9,10 @@
     <Compile Include="SnapshotJson.fs" />
     <Compile Include="Policy.fs" />
     <Compile Include="PolicyJson.fs" />
+    <Compile Include="Journal.fs" />
+    <Compile Include="JournalJson.fs" />
+    <Compile Include="Explain.fs" />
+    <Compile Include="ExplainJson.fs" />
     <Compile Include="WireFraming.fs" />
   </ItemGroup>
 

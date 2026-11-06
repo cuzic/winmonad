@@ -26,12 +26,22 @@ open Wm.Runtime.Reducer
 open Wm.Host.EffectHarness
 open Wm.DebugProtocol.Snapshot
 open Wm.DebugProtocol.Policy
+open Wm.DebugProtocol.Journal
+open Wm.DebugProtocol.Explain
 open Wm.Policy.PolicyTypes
 open Wm.Policy.MonitorSelector
+open Wm.Core.DecisionTrace
+open Wm.Layouts.LayoutRegistry
+open Wm.Layouts.PlanValidator
 
 /// 1件のSnapshot問い合わせ。`TaskCompletionSource`自体はスレッドセーフに`SetResult`できるため、
 /// 問い合わせ元スレッドはただ`Task`を待てばよい。
 type SnapshotQuery = TaskCompletionSource<SnapshotDto>
+
+/// 1件のExplain問い合わせ（v2.147）。`reducer.State`は可変の状態なので、`Policy`/`RecentJournal`と
+/// 違い——ADR-012の単一スレッドアクセス不変条件を厳密に守るため——Snapshotと同じキュー方式にする
+/// （対象のWindowIdを添えるだけの違い）。
+type ExplainQuery = Wm.Contracts.Identifiers.WindowId * TaskCompletionSource<ExplainDto option>
 
 /// `WmState`＋リビジョン番号から`SnapshotDto`を組み立てる純粋関数（FCIS、ADR-002）。分類の判断
 /// そのものは`Wm.Core.Windows.registryManagementSnapshot`（Functional Core）に閉じており、ここで
@@ -94,11 +104,71 @@ let policyDtoOf (policy: PolicyIR) : PolicyDto =
         policy.WorkspaceAssignments
         |> List.map (fun (wid, sel) -> wid, monitorSelectorDtoOf sel) }
 
+/// `Wm.Layouts.LayoutRegistry.LayoutError`から`LayoutErrorDto`への射影（v2.147、Explain）。
+let private layoutErrorDtoOf (e: LayoutError) : LayoutErrorDto =
+    match e with
+    | InvalidInput v -> InvalidInputDto v
+    | Unsatisfiable v -> UnsatisfiableDto v
+    | LayoutCrashed exnType -> LayoutCrashedDto exnType
+
+/// `Wm.Layouts.PlanValidator.ValidationError`から`ValidationErrorDto`への射影。
+let private validationErrorDtoOf (e: ValidationError) : ValidationErrorDto =
+    match e with
+    | UnmanagedOrDeadWindow w -> UnmanagedOrDeadWindowDto w
+    | DuplicateInPlan w -> DuplicateInPlanDto w
+    | NonPositiveSize (w, width, height) -> NonPositiveSizeDto (w, width, height)
+    | ArithmeticOverflow w -> ArithmeticOverflowDto w
+    | OutsideWorkArea (w, rect) -> OutsideWorkAreaDto (w, rect)
+    | ExcludedTarget w -> ExcludedTargetDto w
+    | MissingPlacement w -> MissingPlacementDto w
+
+/// `Wm.Core.DecisionTrace.DecisionTrace`から`DecisionTraceDto`への射影。
+let private decisionTraceDtoOf (t: DecisionTrace) : DecisionTraceDto =
+    match t with
+    | InconsistencySuspected (domain, detail) -> InconsistencySuspectedDto (domain, detail)
+    | LayoutNotRegistered (layoutId, apiVersion) -> LayoutNotRegisteredDto (layoutId, apiVersion)
+    | LayoutInvocationFailed (layoutId, error) -> LayoutInvocationFailedDto (layoutId, layoutErrorDtoOf error)
+    | PlanRejected (layoutId, errors) -> PlanRejectedDto (layoutId, errors |> List.map validationErrorDtoOf)
+    | FrameInsetApplied (requestId, desiredVisible, dispatchedNative) -> FrameInsetAppliedDto (requestId, desiredVisible, dispatchedNative)
+
+/// Journal Inspect（architecture.md §10.2、v2.147）：直近`n`件を新しい順で返す。ユーザー決定
+/// 2026-11-05：カーソル型APIやセッション全体ではなく、シンプルに直近N件だけ。ファイルの読み取りと
+/// 同時刻の書き込み（`Reducer.Submit`が別スレッドから`appendEntry`する可能性）が競合する稀なケースは
+/// 例外を飲んで空扱いにする——Inspectは最善努力の読み取りであり、強い一貫性を保証しない
+/// （grounded discipline：ここで排他制御を持ち込む必要性はまだ裏付けられていない）。
+let recentJournalOf (journalPath: string option) (n: int) : JournalDto =
+    match journalPath with
+    | None -> { Entries = [] }
+    | Some path ->
+        try
+            let all = Wm.Journal.JournalWriter.readAll path |> Seq.toArray
+            let start = max 0 (all.Length - n)
+            { Entries =
+                all.[start ..]
+                |> Array.rev
+                |> Array.map Wm.Journal.JournalWriter.entryToJson
+                |> Array.toList }
+        with _ ->
+            { Entries = [] }
+
+/// Explain（architecture.md §10.2、v2.147）：対象窓の現在の分類＋直近の`DecisionTrace`全件
+/// （`Explain.fs`冒頭コメントの既知の限界どおり、窓単位には絞らない）。対象窓がまだ知られていなければ
+/// `None`。
+let explainOf (registry: Wm.Core.Windows.WindowRegistry) (recentTrace: DecisionTrace list) (w: Wm.Contracts.Identifiers.WindowId) : ExplainDto option =
+    registryManagementSnapshot registry
+    |> List.tryFind (fun (wid, _, _) -> wid = w)
+    |> Option.map (fun (_, management, matchedRule) ->
+        { Window = w
+          Management = management
+          MatchedRule = matchedRule
+          RecentTrace = recentTrace |> List.map decisionTraceDtoOf })
+
 /// Reducerを1つ所有し、常駐ループとして回り続ける骨格。`Run()`を呼んだスレッドだけがReducer状態へ
 /// 触れる（ADR-012の単一スレッドアクセス不変条件をSnapshotクエリにも適用する）。
 type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
     let harness = EffectHarness(reducer, liveNow)
     let queries = ConcurrentQueue<SnapshotQuery>()
+    let explainQueries = ConcurrentQueue<ExplainQuery>()
     let cts = new CancellationTokenSource()
 
     let projectSnapshot () : SnapshotDto = snapshotOf reducer.State reducer.Sequence
@@ -107,11 +177,23 @@ type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
     /// キュー経由にせず、呼び出したスレッドから直接読んでよい。
     member _.Policy : PolicyDto = policyDtoOf reducer.Policy
 
+    /// Journal Inspect（v2.147）。`reducer.JournalPath`は不変の環境値（`Policy`と同じ理由）だが、
+    /// ファイル自体への読み取りはReducer所有スレッドが書き込み中のものと競合しうる——
+    /// `recentJournalOf`が例外を飲んで最善努力にしているので、キュー経由にせず直接読んでよい。
+    member _.RecentJournal(n: int) : JournalDto = recentJournalOf reducer.JournalPath n
+
     /// 他スレッド（将来のNamed Pipe接続スレッド）から呼ぶ。即座には解決しない——次の`Run`ループの
     /// イテレーションで、Reducer所有スレッドがキューを汲んで`SetResult`する。
     member _.EnqueueSnapshotQuery() : Task<SnapshotDto> =
         let tcs = SnapshotQuery(TaskCreationOptions.RunContinuationsAsynchronously)
         queries.Enqueue tcs
+        tcs.Task
+
+    /// Explain（v2.147）。`EnqueueSnapshotQuery`と同じキュー方式——`State`は可変なので、ADR-012の
+    /// 単一スレッドアクセス不変条件を厳密に守る。
+    member _.EnqueueExplainQuery(w: Wm.Contracts.Identifiers.WindowId) : Task<ExplainDto option> =
+        let tcs = TaskCompletionSource<ExplainDto option>(TaskCreationOptions.RunContinuationsAsynchronously)
+        explainQueries.Enqueue(w, tcs)
         tcs.Task
 
     /// 他スレッドから呼んでよい、スレッドセーフな停止要求。
@@ -139,5 +221,9 @@ type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
             let mutable q = Unchecked.defaultof<SnapshotQuery>
             while queries.TryDequeue(&q) do
                 q.SetResult(projectSnapshot ())
+            let mutable eq = Unchecked.defaultof<ExplainQuery>
+            while explainQueries.TryDequeue(&eq) do
+                let w, tcs = eq
+                tcs.SetResult(explainOf reducer.State.Windows reducer.RecentTrace w)
             Thread.Sleep(tickMs)
         harness.Stop()

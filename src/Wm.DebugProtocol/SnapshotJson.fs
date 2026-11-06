@@ -22,20 +22,22 @@ let managementOfTag (tag: string) : Management =
     | "excluded" -> Excluded
     | other -> failwithf "SnapshotJson: unrecognized Management tag '%s'" other
 
-let private managementOptionToJson (m: Management option) : JsonNode =
+/// `ExplainJson.fs`も同じ`Management option`/`PolicyRuleId option`の符号化に合意する必要があるため
+/// 公開する（v2.147）。
+let managementOptionToJson (m: Management option) : JsonNode =
     match m with
     | Some v -> JsonValue.Create(managementTag v) :> JsonNode
     | None -> null
 
-let private managementOptionOfJson (node: JsonNode) : Management option =
+let managementOptionOfJson (node: JsonNode) : Management option =
     if isNull node then None else Some (managementOfTag (node.GetValue<string>()))
 
-let private policyRuleIdOptionToJson (r: PolicyRuleId option) : JsonNode =
+let policyRuleIdOptionToJson (r: PolicyRuleId option) : JsonNode =
     match r with
     | Some (PolicyRuleId rid) -> JsonValue.Create(rid) :> JsonNode
     | None -> null
 
-let private policyRuleIdOptionOfJson (node: JsonNode) : PolicyRuleId option =
+let policyRuleIdOptionOfJson (node: JsonNode) : PolicyRuleId option =
     if isNull node then None else Some (PolicyRuleId (node.GetValue<string>()))
 
 let windowSnapshotDtoToJson (w: WindowSnapshotDto) : JsonNode =
