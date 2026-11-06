@@ -72,7 +72,9 @@ open System.Collections.Concurrent
 open System.Diagnostics
 open System.Drawing
 open System.IO
+open System.IO.Pipes
 open System.Runtime.InteropServices
+open System.Security.Principal
 open System.Threading
 open System.Threading.Tasks
 open System.Windows.Forms
@@ -91,6 +93,7 @@ open Wm.Windows.RealObservation
 open Wm.Windows.EventHooks
 open Wm.Host.EffectHarness
 open Wm.Host.ResidentHost
+open Wm.Host.InspectPipeServer
 
 /// Phase B ラウンド7：`RegisterHotKey`→`WM_HOTKEY`を受け取るためだけの、見えない専用窓。
 /// `WM_HOTKEY`は`RegisterHotKey`に渡したHWNDへ配送されるので、`Application.DoEvents()`で
@@ -950,6 +953,54 @@ let main argv =
     let stoppedInTime15 = loopThread15.Join(3000)
     printfn "Round 15 PASSED (cross-thread snapshot query answered by the owning loop thread, RequestStop() actually terminated the loop): %b"
         (snapshotOk15 && stoppedInTime15)
+
+    // Round 16：Named Pipeサーバー、最初の接続スライス（architecture.md v2.135/10.1、S31〜S36、
+    // opus-review-named-pipe-transport.md）。P/Invoke経由のCreateNamedPipe＋Host自身の整合性
+    // レベルへ動的設定したDACL/ラベル（S31/S32）、クライアントのImpersonationレベル接続＋
+    // RunAsClientによる実トークン検査（F41/F42、ユーザー決定2026-11-05）を初めて実際に1本の
+    // パイプとして組み合わせる。ワイヤプロトコル（長さプレフィックス＋JSON）・発見用ファイル配布・
+    // Snapshot本体の応答はまだ無い——このラウンドは「正しくACLされたパイプへImpersonationレベルで
+    // 接続したクライアントを、サーバーが実トークンまで検査して受け付けられるか」だけを確認する。
+    printfn "\n--- Round 16: Named Pipe server, first connection slice (dynamic ACL + RunAsClient check) ---"
+    let pipeName16 = generatePipeName ()
+    match createRestrictedPipe pipeName16 with
+    | Error e -> printfn "Round 16 FAILED (createRestrictedPipe): %s" e
+    | Ok pipe16 ->
+        use pipe16 = pipe16
+        use cts16 = new CancellationTokenSource()
+        let mutable observedPrincipal16: Result<ClientPrincipal, string> option = None
+        let acceptThread16 =
+            Thread(fun () -> runAcceptLoop pipe16 cts16.Token (fun _ principal -> observedPrincipal16 <- Some principal))
+        acceptThread16.IsBackground <- true
+        acceptThread16.Start()
+
+        // サーバーのaccept loopが実際にWaitForConnectionAsyncへ入る猶予。
+        Thread.Sleep(100)
+        let connectOk16, connectError16 =
+            try
+                use client16 = new NamedPipeClientStream(".", pipeName16, PipeDirection.InOut, PipeOptions.None, TokenImpersonationLevel.Impersonation)
+                client16.Connect(2000)
+                true, ""
+            with ex ->
+                false, ex.Message
+
+        // サーバー側のRunAsClient検査が終わるまでの猶予（別スレッドなので待つ必要がある）。
+        let deadline16 = Environment.TickCount64 + 2000L
+        while observedPrincipal16.IsNone && Environment.TickCount64 < deadline16 do
+            Thread.Sleep(10)
+
+        let ownRid16 = ownIntegrityRid ()
+        let principalMatchesOwnIntegrity16 =
+            match observedPrincipal16, ownRid16 with
+            | Some(Ok principal), Some ownRid -> principal.IntegrityRid = ownRid
+            | _ -> false
+        printfn "Round 16 client connect: ok=%b error=%s" connectOk16 connectError16
+        printfn "Round 16 server-observed client principal: %A (own integrity RID=%A)" observedPrincipal16 ownRid16
+
+        cts16.Cancel()
+        let stoppedInTime16 = acceptThread16.Join(3000)
+        printfn "Round 16 PASSED (Impersonation-level client connected to the dynamically-ACL'd pipe, server verified the real client token via RunAsClient matches this process's own integrity level, accept loop stopped cleanly): %b"
+            (connectOk16 && principalMatchesOwnIntegrity16 && stoppedInTime16)
 
     printfn "\nDone."
     0
