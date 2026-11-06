@@ -1146,5 +1146,83 @@ let main argv =
         printfn "Round 18 PASSED (a stuck first client that never sends anything does not block a well-behaved second client from connecting and getting a correct Snapshot within a bounded time, both threads stopped cleanly): %b"
             (stuckConnectOk18 && roundTripOk18 && matches18 && acceptStopped18 && loopStopped18)
 
+    // Round 19：パイプ名の発見用ファイル配布（opus-review-named-pipe-transport.md 5-C対応、
+    // architecture.md v2.143）。クライアントはこれまでのRoundと違い、パイプ名を直接渡されず、
+    // Hostが書いた発見用ファイルを読んで自分でパイプ名を知る——実際のクライアントプロセスが
+    // 起動時にどうやってパイプ名を知るかという、これまで素通りしていた経路を初めて通す。
+    printfn "\n--- Round 19: pipe-name discovery file (client doesn't know the pipe name in advance) ---"
+    let journalPath19 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round19-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    let reducer19 = Reducer(RuntimePolicy.defaults, "phase-b-round19", "wm-host-round19", "no-policy-artifact", Some journalPath19)
+    let residentHost19 = ResidentHost(reducer19, liveNow)
+    let loopThread19 = Thread(fun () -> residentHost19.Run(tickMs = 1))
+    loopThread19.IsBackground <- true
+    loopThread19.Start()
+    Thread.Sleep(50)
+
+    let pipeName19 = generatePipeName ()
+    match createRestrictedPipe pipeName19 with
+    | Error e ->
+        printfn "Round 19 FAILED (createRestrictedPipe): %s" e
+        residentHost19.RequestStop()
+        loopThread19.Join(3000) |> ignore
+    | Ok pipe19 ->
+        use pipe19 = pipe19
+        use cts19 = new CancellationTokenSource()
+        let ownRid19 = ownIntegrityRid ()
+
+        let discoveryWriteOk19 =
+            match writeDiscoveryFile pipeName19 with
+            | Ok () -> true
+            | Error _ -> false
+
+        let acceptThread19 =
+            Thread(fun () ->
+                runAcceptLoop pipe19 cts19.Token (fun p principal reqCt ->
+                    try
+                        (handleOneRequestAsync p principal ownRid19 (fun () -> residentHost19.EnqueueSnapshotQuery().Result) reqCt).GetAwaiter().GetResult()
+                    with _ -> ()))
+        acceptThread19.IsBackground <- true
+        acceptThread19.Start()
+        Thread.Sleep(100)
+
+        // クライアントはここで初めて発見用ファイルを読む。`pipeName19`を直接渡さず、本当に
+        // ファイル経由で知った名前だけを使って接続する。
+        let discovered19 = tryReadDiscoveryFile ()
+        let discoveredMatches19 =
+            match discovered19 with
+            | Ok info -> info.PipeName = pipeName19 && info.Pid = Process.GetCurrentProcess().Id
+            | Error _ -> false
+
+        let roundTripOk19, roundTripError19, receivedSnapshot19 =
+            match discovered19 with
+            | Error e -> false, e, None
+            | Ok info ->
+                try
+                    use client19 = new NamedPipeClientStream(".", info.PipeName, PipeDirection.InOut, PipeOptions.None, TokenImpersonationLevel.Impersonation)
+                    client19.Connect(2000)
+                    writeFramedMessage client19 (Encoding.UTF8.GetBytes("""{"v":1,"op":"snapshot"}"""))
+                    let responseBytes = readFramedMessage client19
+                    let json = JsonNode.Parse(Encoding.UTF8.GetString responseBytes)
+                    true, "", Some(snapshotDtoOfJson json)
+                with ex ->
+                    false, ex.Message, None
+
+        let directSnapshot19 = residentHost19.EnqueueSnapshotQuery().Result
+        let matches19 =
+            match receivedSnapshot19 with
+            | Some s -> s.Revision = directSnapshot19.Revision && s.Windows = directSnapshot19.Windows
+            | None -> false
+
+        printfn "Round 19 discovery write=%b, discovered=%A, round-trip: ok=%b error=%s" discoveryWriteOk19 discovered19 roundTripOk19 roundTripError19
+
+        cts19.Cancel()
+        let acceptStopped19 = acceptThread19.Join(3000)
+        residentHost19.RequestStop()
+        let loopStopped19 = loopThread19.Join(3000)
+        removeDiscoveryFile ()
+        let cleanedUp19 = not (File.Exists(discoveryFilePath ()))
+        printfn "Round 19 PASSED (a client with no prior knowledge of the pipe name discovers it from the Host-written file, connects, and gets a correct Snapshot; the file is removed on shutdown): %b"
+            (discoveryWriteOk19 && discoveredMatches19 && roundTripOk19 && matches19 && acceptStopped19 && loopStopped19 && cleanedUp19)
+
     printfn "\nDone."
     0

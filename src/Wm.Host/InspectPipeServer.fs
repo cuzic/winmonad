@@ -20,11 +20,13 @@ module Wm.Host.InspectPipeServer
 
 open System
 open System.Diagnostics
+open System.IO
 open System.IO.Pipes
 open System.Runtime.InteropServices
 open System.Security.Principal
 open System.Text
 open System.Text.Json
+open System.Text.Json.Nodes
 open System.Threading
 open System.Threading.Tasks
 open Microsoft.Win32.SafeHandles
@@ -171,14 +173,69 @@ let createRestrictedPipe (pipeName: string) : Result<NamedPipeServerStream, stri
             finally
                 if pSd <> IntPtr.Zero then LocalFree(pSd) |> ignore
 
-/// パイプ名にセッションID＋ランダム値を含める（名前乗っ取り対策の一部、§10.1）。発見用ファイルに
-/// よる配布（PID＋作成時刻を含める、opus-review 5-C）は後続のスライス——今は呼び出し側が生成した
-/// 名前を直接知っている前提でよい。
+/// パイプ名にセッションID＋ランダム値を含める（名前乗っ取り対策の一部、§10.1）。
 let generatePipeName () : string =
     let sessionId =
         try string (Process.GetCurrentProcess().SessionId)
         with _ -> "unknown-session"
     sprintf "winmonad-repl-%s-%s" sessionId (Guid.NewGuid().ToString("N").Substring(0, 12))
+
+/// パイプ名の発見用ファイル（opus-review-named-pipe-transport.md 5-C対応）。クライアントは起動時に
+/// パイプ名（`generatePipeName()`が作るランダムな名前）を直接知っている前提を置けないため、この
+/// 1つの既知の場所（`%TEMP%`、この呼び出しプロセス自身のユーザーに紐づく、既存の`journalPath17`等と
+/// 同じ既定ディレクトリ）に固定ファイル名で書く——ユーザーの実運用では常駐Hostは1つだけなので、
+/// 固定名で「現在稼働中のHost」を指す1枚のファイルという設計にできる。PID＋作成時刻を含める
+/// （§10.1の既定どおり）。**このファイルの内容自体の真正性は検証しない**：なりすまされても実害は
+/// 無い——偽の内容を信じて繋いだクライアントは、繋いだ先のパイプ自身のDACL/整合性ラベル＋
+/// `FILE_FLAG_FIRST_PIPE_INSTANCE`(F38-F40)・`RunAsClient`によるトークン検査(F41/F42)に阻まれる
+/// だけで、Hostへの偽装はこのファイルの内容だけでは成立しない（本当の安全境界はパイプ自身が持つ）。
+/// 古いHostが異常終了してファイルを消せなかった場合も、次に本物のHostが起動した時点で上書きされ
+/// 自己修復する——「ファイルが古いパイプを指している」ケースは、クライアントの`Connect`が単に
+/// 失敗する（既存の`Result<_, TransportError>`スタイルの失敗経路）だけで、追加のPID生存確認は
+/// このスライスでは作らない（grounded discipline：F38-F43が既に担保している安全性を、このファイル
+/// 側で重ねて検証する必要性はまだ裏付けられていない）。
+let discoveryFilePath () : string =
+    Path.Combine(Path.GetTempPath(), "winmonad-repl-discovery.json")
+
+type DiscoveryInfo = { PipeName: string; Pid: int; CreatedAtUtc: DateTime }
+
+/// Hostがパイプ作成直後に呼ぶ。書き込み失敗（権限等）はHost起動そのものを失敗させるほどの重大性
+/// ではないので`Result`で呼び出し側へ返すだけにする。
+let writeDiscoveryFile (pipeName: string) : Result<unit, string> =
+    try
+        let o = JsonObject()
+        o.["pipeName"] <- JsonValue.Create(pipeName)
+        o.["pid"] <- JsonValue.Create(Process.GetCurrentProcess().Id)
+        o.["createdAtUtc"] <- JsonValue.Create(DateTime.UtcNow.ToString("o"))
+        File.WriteAllText(discoveryFilePath (), o.ToJsonString())
+        Ok()
+    with ex ->
+        Error ex.Message
+
+/// Hostが正常終了時に呼ぶ（best-effort、無ければ何もしない）。
+let removeDiscoveryFile () : unit =
+    try
+        File.Delete(discoveryFilePath ())
+    with _ ->
+        ()
+
+/// クライアントがパイプ名を知るために読む。受信＝信頼境界の内側に入ってくる入力ではない
+/// （自分自身のHostが自分のために書いたファイルを自分で読むだけ）が、`parseRequest`と同じ標準
+/// パーサ（`System.Text.Json`）に揃えておく。
+let tryReadDiscoveryFile () : Result<DiscoveryInfo, string> =
+    try
+        let path = discoveryFilePath ()
+        if not (File.Exists path) then
+            Error "discovery file not found"
+        else
+            use doc = JsonDocument.Parse(File.ReadAllText path)
+            let root = doc.RootElement
+            Ok
+                { PipeName = root.GetProperty("pipeName").GetString()
+                  Pid = root.GetProperty("pid").GetInt32()
+                  CreatedAtUtc = root.GetProperty("createdAtUtc").GetDateTime() }
+    with ex ->
+        Error ex.Message
 
 /// 1接続あたりの壁時計デッドライン(ms)。handshake(接続後最初の受信)・読取途中(送信の停滞)の
 /// どちらも、現行プロトコル(1接続=1リクエスト、`handleOneRequest`が1件処理して戻ったら
