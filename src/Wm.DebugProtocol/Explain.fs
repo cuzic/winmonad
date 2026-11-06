@@ -39,6 +39,13 @@ type DecisionTraceDto =
     | LayoutInvocationFailedDto of layoutId: LayoutId * error: LayoutErrorDto
     | PlanRejectedDto of layoutId: LayoutId * errors: ValidationErrorDto list
     | FrameInsetAppliedDto of requestId: RequestId * desiredVisible: PixelRect * dispatchedNative: PixelRect
+    /// Intervene（architecture.md §10.2、v2.151）：`InterveneRequested`の前提検査(F-4)が不成立だった。
+    /// `Wm.DebugProtocol.Intervene.InterveneResultDto`の`InterveneRejectedDto`とは意図的に別名にする
+    /// ——両方の`open`が同じファイルに同時に現れる（`InspectPipeServer.fs`等）ため、同名のDU caseは
+    /// 曖昧になる。
+    | InterveneRejectedTraceDto of window: WindowId * reason: string
+    /// Intervene（v2.151）：前提検査を通過し実際に適用した場合の帰属記録。同じ理由で別名にする。
+    | InterveneAcceptedTraceDto of correlationId: string option * clientPid: int * clientImage: string
 
 /// 対象窓の現在の分類（`WindowSnapshotDto`と同じ情報）＋直近の`DecisionTrace`（上記の限界の通り、
 /// 窓単位には絞られていない）。

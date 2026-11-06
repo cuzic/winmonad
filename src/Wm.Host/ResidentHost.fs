@@ -21,6 +21,7 @@ open System.Threading
 open System.Threading.Tasks
 open System.Windows.Forms
 open Wm.Contracts.CoreCommand
+open Wm.Core.WmState
 open Wm.Core.Windows
 open Wm.Runtime.Reducer
 open Wm.Host.EffectHarness
@@ -29,6 +30,7 @@ open Wm.DebugProtocol.Policy
 open Wm.DebugProtocol.Journal
 open Wm.DebugProtocol.Explain
 open Wm.DebugProtocol.Analyzer
+open Wm.DebugProtocol.Intervene
 open Wm.Policy.PolicyTypes
 open Wm.Policy.MonitorSelector
 open Wm.Policy.PolicyAnalyzer
@@ -44,6 +46,32 @@ type SnapshotQuery = TaskCompletionSource<SnapshotDto>
 /// 違い——ADR-012の単一スレッドアクセス不変条件を厳密に守るため——Snapshotと同じキュー方式にする
 /// （対象のWindowIdを添えるだけの違い）。
 type ExplainQuery = Wm.Contracts.Identifiers.WindowId * TaskCompletionSource<ExplainDto option>
+
+/// 1件のIntervene要求（architecture.md §10.2/§10.3、v2.151）。`InterveneRequest`はHost自身が
+/// クライアントPID/イメージパスを埋めた後の値（`InspectPipeServer.fs`参照）。`Reducer.Submit`
+/// （正確には`EffectHarness.Submit`、Effectも実際に効果スレッドへ届くように）は書込みなので
+/// ADR-012の単一スレッドアクセス不変条件の対象——Snapshot/Explain/ActivatePolicyと同じキュー方式。
+type InterveneQueueRequest = InterveneRequest * TaskCompletionSource<InterveneResultDto>
+
+/// `InterveneCommandDto`（ワイヤ）から`InterveneCommand`（Core）への射影。`policyDtoOf`等と同じ配置
+/// 理由——`Wm.Contracts.CoreCommand`の内部型と`Wm.DebugProtocol.Intervene`のDTO型の両方へ依存する
+/// 必要がある。
+let private interveneCommandOf (dto: InterveneCommandDto) : InterveneCommand =
+    match dto with
+    | SetManagementToDto(w, m) -> SetManagementTo(w, m)
+    | ClearOverrideDto w -> ClearOverride w
+
+/// `StepResult.Trace`（`WmState.step`が`InterveneRequested`を処理した結果）から`InterveneResultDto`への
+/// 射影。`step`は`InterveneAccepted`/`InterveneRejected`のどちらかを必ずTraceの先頭に積む
+/// （`WmState.fs`の`step`型直前コメント参照）——見つからない場合は呼び出し側の不整合として
+/// 分かりやすく`InterveneRejectedDto`へ落とす（例外を投げて接続を落とさない、§7.1の規律）。
+let private interveneResultDtoOf (sequence: int64) (result: StepResult) : InterveneResultDto =
+    result.Trace
+    |> List.tryPick (function
+        | InterveneAccepted _ -> Some(InterveneAcceptedDto sequence)
+        | InterveneRejected(_, reason) -> Some(InterveneRejectedDto reason)
+        | _ -> None)
+    |> Option.defaultValue (InterveneRejectedDto "internal error: step produced no Intervene verdict")
 
 /// 1件のPolicy活性化要求（PolicyActivated実配線、vNext、architecture.md §14/§21）。
 /// `Reducer.ActivatePolicy`は書込みなのでADR-012の単一スレッドアクセス不変条件の対象——Snapshot/Explain
@@ -181,6 +209,8 @@ let private decisionTraceDtoOf (t: DecisionTrace) : DecisionTraceDto =
     | LayoutInvocationFailed (layoutId, error) -> LayoutInvocationFailedDto (layoutId, layoutErrorDtoOf error)
     | PlanRejected (layoutId, errors) -> PlanRejectedDto (layoutId, errors |> List.map validationErrorDtoOf)
     | FrameInsetApplied (requestId, desiredVisible, dispatchedNative) -> FrameInsetAppliedDto (requestId, desiredVisible, dispatchedNative)
+    | Wm.Core.DecisionTrace.InterveneRejected (w, reason) -> InterveneRejectedTraceDto (w, reason)
+    | Wm.Core.DecisionTrace.InterveneAccepted (correlationId, clientPid, clientImage) -> InterveneAcceptedTraceDto (correlationId, clientPid, clientImage)
 
 /// `Wm.Policy.PolicyAnalyzer.AnalyzerIssue`から`AnalyzerIssueDto`への射影（v2.149、Analyzer Inspect）。
 let private analyzerIssueDtoOf (issue: AnalyzerIssue) : AnalyzerIssueDto =
@@ -243,6 +273,12 @@ type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
     let queries = ConcurrentQueue<SnapshotQuery>()
     let explainQueries = ConcurrentQueue<ExplainQuery>()
     let activateRequests = ConcurrentQueue<ActivatePolicyRequest>()
+    let interveneRequests = ConcurrentQueue<InterveneQueueRequest>()
+    // Intervene（v2.151）のレート制限（Opus敵対的相談Q3「暴走した誤爆スクリプトがJournalの80件
+    // ウィンドウを溢れさせる」対策）。直近1秒のタイムスタンプだけを保持する素朴なスライディング
+    // ウィンドウ——`grounded discipline`どおり、裏付けの無い複雑な仕組みは作らない。
+    let interveneTimestampsMs = ConcurrentQueue<int64>()
+    let interveneRateLimitPerSecond = 20
     let cts = new CancellationTokenSource()
 
     let projectSnapshot () : SnapshotDto = snapshotOf reducer.State reducer.Sequence
@@ -284,6 +320,29 @@ type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
         activateRequests.Enqueue(policy, tcs)
         tcs.Task
 
+    /// Intervene（architecture.md §10.2/§10.3、v2.151）。`pid`/`image`はHost自身が接続済みパイプから
+    /// 取得した値を渡す想定（`InspectPipeServer.fs`参照、クライアントの自己申告ではない——§14
+    /// 「クライアントの自己申告を信用しない」と同じ原則）。`EnqueueSnapshotQuery`等と同じキュー方式
+    /// だが、積む前にレート制限を検査する点が異なる——引っかかったら`Error`を返し、キューにも
+    /// `Reducer`にも一切触れない（Journal監査の対象にもしない、単なる受付拒否）。
+    member _.EnqueueIntervene(correlationId: string option, pid: int, image: string, cmd: InterveneCommandDto) : Result<Task<InterveneResultDto>, string> =
+        let now = liveNow ()
+        interveneTimestampsMs.Enqueue now
+        let mutable oldest = 0L
+        while interveneTimestampsMs.TryPeek(&oldest) && now - oldest > 1000L do
+            interveneTimestampsMs.TryDequeue(&oldest) |> ignore
+        if interveneTimestampsMs.Count > interveneRateLimitPerSecond then
+            Error "rate limit exceeded"
+        else
+            let req: InterveneRequest =
+                { CorrelationId = correlationId
+                  ClientPid = pid
+                  ClientImage = image
+                  Command = interveneCommandOf cmd }
+            let tcs = TaskCompletionSource<InterveneResultDto>(TaskCreationOptions.RunContinuationsAsynchronously)
+            interveneRequests.Enqueue(req, tcs)
+            Ok tcs.Task
+
     /// 他スレッドから呼んでよい、スレッドセーフな停止要求。
     member _.RequestStop() = cts.Cancel()
 
@@ -318,5 +377,16 @@ type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
                 let policy, tcs = aq
                 reducer.ActivatePolicy policy
                 tcs.SetResult(())
+            // Intervene（v2.151）：`harness.Submit`（`reducer.Submit`ではない）を使う——Opus敵対的相談
+            // Q2-Bの推奨どおり、`SetManagement`/`ClearUserOverride`が生むEffectも（将来のコマンドが
+            // 増えた場合に備え）実際に効果スレッドへ届くようにする。`seq`は`Submit`が今回の入力へ
+            // 割り当てる直前のSequence値（`Reducer.Submit`は呼出し開始時点の`sequence`を使う、
+            // `Reducer.fs`参照）。
+            let mutable iq = Unchecked.defaultof<InterveneQueueRequest>
+            while interveneRequests.TryDequeue(&iq) do
+                let req, tcs = iq
+                let seq = reducer.Sequence
+                let result = harness.Submit (liveNow ()) "intervene" (InterveneRequested req)
+                tcs.SetResult(interveneResultDtoOf seq result)
             Thread.Sleep(tickMs)
         harness.Stop()

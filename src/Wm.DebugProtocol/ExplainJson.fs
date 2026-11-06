@@ -111,6 +111,15 @@ let private decisionTraceDtoToJson (t: DecisionTraceDto) : JsonNode =
         o.["requestId"] <- JsonValue.Create(rid)
         o.["desiredVisible"] <- pixelRectToJson desiredVisible
         o.["dispatchedNative"] <- pixelRectToJson dispatchedNative
+    | InterveneRejectedTraceDto (w, reason) ->
+        o.["tag"] <- JsonValue.Create("intervene-rejected")
+        o.["window"] <- windowIdToJson w
+        o.["reason"] <- JsonValue.Create(reason)
+    | InterveneAcceptedTraceDto (correlationId, clientPid, clientImage) ->
+        o.["tag"] <- JsonValue.Create("intervene-accepted")
+        o.["correlationId"] <- (correlationId |> Option.map JsonValue.Create<string> |> Option.defaultValue null)
+        o.["clientPid"] <- JsonValue.Create(clientPid)
+        o.["clientImage"] <- JsonValue.Create(clientImage)
     o :> JsonNode
 
 let private decisionTraceDtoOfJson (node: JsonNode) : DecisionTraceDto =
@@ -125,6 +134,10 @@ let private decisionTraceDtoOfJson (node: JsonNode) : DecisionTraceDto =
         )
     | "frame-inset-applied" ->
         FrameInsetAppliedDto(RequestId(node.["requestId"].GetValue<int64>()), pixelRectOfJson node.["desiredVisible"], pixelRectOfJson node.["dispatchedNative"])
+    | "intervene-rejected" -> InterveneRejectedTraceDto(windowIdOfJson node.["window"], node.["reason"].GetValue<string>())
+    | "intervene-accepted" ->
+        let correlationId = if isNull node.["correlationId"] then None else Some(node.["correlationId"].GetValue<string>())
+        InterveneAcceptedTraceDto(correlationId, node.["clientPid"].GetValue<int>(), node.["clientImage"].GetValue<string>())
     | other -> failwithf "ExplainJson: unrecognized DecisionTraceDto tag '%s'" other
 
 let explainDtoToJson (e: ExplainDto) : JsonNode =

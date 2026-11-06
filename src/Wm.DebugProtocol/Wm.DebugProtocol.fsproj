@@ -17,6 +17,8 @@
     <Compile Include="AnalyzerJson.fs" />
     <Compile Include="Deploy.fs" />
     <Compile Include="DeployJson.fs" />
+    <Compile Include="Intervene.fs" />
+    <Compile Include="InterveneJson.fs" />
     <Compile Include="WireFraming.fs" />
   </ItemGroup>
 

@@ -223,7 +223,11 @@ let private allocateAndEmit (mkEffect: RequestId -> Effect) (state: WmState) : W
 /// 配線している（v2.26で拡張済み。このコメントが長らくv2.11時点の「アクティブな1つだけ」のまま
 /// 更新されていなかった誤りをv2.47で訂正した。`StyleChanged`は依然未配線、Windows.fs/Placement.fsの
 /// ファイル冒頭コメント参照）。表どおりの8段パイプラインへの完全な組み直しは今後のラウンドへ持ち越す。
-let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelope<InputEvent>) : StepResult =
+///
+/// Intervene実配線（architecture.md §10.2/§10.3、vNext）：v2.151で`private`化し、本体はそのまま
+/// 一切変更していない（この関数の中身は以前の`step`そのもので、以後`InterveneRequested`の前提検査
+/// だけを担う新しい薄いラッパーが外側の`step`という名前を引き継ぐ、下記参照）。
+let private stepCore (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelope<InputEvent>) : StepResult =
     let now = envelope.MonotonicTime
     let focusedBefore = focused state
 
@@ -953,3 +957,36 @@ let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelop
         @ reconcileTimerCmds
         @ gateRejectionTimerCmds
       Trace = traces @ placementTraces @ reconcileTraces }
+
+/// Intervene（architecture.md §10.2/§10.3、v2.151）：ユーザー決定2026-11-06（Opus敵対的相談
+/// `opus-review-intervene-trust-boundary.md`を踏まえ、architecture.md §10.2/F-1のGate条件を改定して
+/// 今進める、という決定）。`InterveneRequested`だけをここで特別扱いし、他の入力は従来どおり
+/// `stepCore`へそのまま渡す——`stepCore`の中身（旧`step`そのもの）には一切触れない設計。
+///
+/// 前提検査（F-4/R2-25）は「対象WindowIdが依然`Windows.Records`に存在するか」だけ（Opusレビューの
+/// 推奨する最小スライス：`SetManagement(Tiled/Floating)`/`ClearUserOverride`限定なので、HWND再利用
+/// までを区別する実体識別子はまだ無い——既知のギャップとして残す、architecture.md §21参照）。
+/// 不成立なら`InterveneRejected`を記録するだけで状態は一切変えず、`stepCore`へは委譲しない
+/// （§7.1「前提検査は決定的でJournalに残るstepの内側で評価する」の要求どおり、TOCTOUを避ける）。
+/// 成立したら、等価な`UserCommand`へ書き換えて`stepCore`自身に委譲する——Opusレビューの推奨
+/// 「既存のSetManagement/ClearUserOverrideの経路をそのまま再利用する」ための設計で、Windows.fsの
+/// `onUserCommand`に一切新しいコードを書かずに済む。`stepCore`が返した`StepResult`に
+/// `InterveneAccepted`（誰が送ったかの帰属）を足して返す——ただし恒久的な監査記録はこの揮発性の
+/// `DecisionTrace`（Explain経由のみ可視）ではなく、`Reducer.Submit`が無条件に書くJournalの
+/// `InputReceived`/`InterveneRequested`エントリ自身（`ClientPid`/`ClientImage`/`CorrelationId`を
+/// 含む、`req`そのもの）が担う——`EventEnvelope.Source`はJournalに永続化されないことがOpusレビューで
+/// 判明したため、この帰属は`Source`ではなく`InterveneRequested`のPayload自体に乗せている。
+let step (runtimePolicy: RuntimePolicy) (state: WmState) (envelope: EventEnvelope<InputEvent>) : StepResult =
+    match envelope.Input with
+    | InterveneRequested req ->
+        let w = targetWindowOf req.Command
+        if not (Map.containsKey w state.Windows.Records) then
+            { Next = state
+              Effects = []
+              Timers = []
+              Trace = [ InterveneRejected(w, "window is not known/managed") ] }
+        else
+            let cmd = coreCommandOf req.Command
+            let result = stepCore runtimePolicy state { envelope with Input = UserCommand cmd }
+            { result with Trace = InterveneAccepted(req.CorrelationId, req.ClientPid, req.ClientImage) :: result.Trace }
+    | _ -> stepCore runtimePolicy state envelope

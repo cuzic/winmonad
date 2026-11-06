@@ -36,3 +36,16 @@ type DecisionTrace =
     /// `desiredVisible`を読んで初めて補正後も正しく動く（補正が無かった場合はこのTrace自体が
     /// 無いので、既存どおり`SetRect`の矩形引数をそのまま目標として使えばよい）。
     | FrameInsetApplied of requestId: RequestId * desiredVisible: PixelRect * dispatchedNative: PixelRect
+    /// Intervene（architecture.md §10.2、v2.151）：`InterveneRequested`の前提検査（F-4）が通らなかった
+    /// （対象の`window`が`Windows.Records`に存在しない等）場合に、`WmState.step`がstate不変で返す。
+    /// `reason`は人間向けの固定文字列——`WmClient.InterveneAsync`の応答には直接乗らない
+    /// （応答は`Queued of Sequence`のみ、§10.2「成否はJournal/Explain購読で確認する」）が、Explain
+    /// 操作（v2.147）がこの`DecisionTrace`をそのまま返すので「なぜ拒否されたか」はそこで見える。
+    | InterveneRejected of window: WindowId * reason: string
+    /// Intervene（v2.151）：前提検査を通過し、実際に`UserCommand`へ書き換えて適用した場合に記録する
+    /// 帰属情報。`EventEnvelope.Source`はJournalに永続化されない（Opus敵対的相談`opus-review-
+    /// intervene-trust-boundary.md`のQ2-Eで判明）ため、この`DecisionTrace`がIntervene経由であることと
+    /// 送信元プロセスの唯一の記録になる——`ClientPid`/`ClientImage`はクライアントの自己申告ではなく
+    /// Host自身が`GetNamedPipeClientProcessId`/`QueryFullProcessImageName`で取得した値
+    /// （`InspectPipeServer.fs`参照、§14「クライアントの自己申告を信用しない」と同じ原則）。
+    | InterveneAccepted of correlationId: string option * clientPid: int * clientImage: string

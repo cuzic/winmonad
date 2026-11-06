@@ -46,6 +46,8 @@ open Wm.DebugProtocol.Analyzer
 open Wm.DebugProtocol.AnalyzerJson
 open Wm.DebugProtocol.Deploy
 open Wm.DebugProtocol.DeployJson
+open Wm.DebugProtocol.Intervene
+open Wm.DebugProtocol.InterveneJson
 open Wm.DebugProtocol.WireFraming
 
 module private Native =
@@ -83,6 +85,17 @@ module private Native =
 
     [<DllImport("kernel32.dll")>]
     extern IntPtr GetCurrentThread()
+
+    /// Intervene（architecture.md §10.2、v2.151）がJournal/DecisionTraceの帰属記録に使う、接続済み
+    /// クライアント自身のPID（クライアントの自己申告ではない、§14と同じ原則）。
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern bool GetNamedPipeClientProcessId(IntPtr Pipe, uint32& ClientProcessId)
+
+    [<DllImport("kernel32.dll", SetLastError = true)>]
+    extern IntPtr OpenProcess(uint32 dwDesiredAccess, bool bInheritHandle, uint32 dwProcessId)
+
+    [<DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
+    extern bool QueryFullProcessImageNameW(IntPtr hProcess, uint32 dwFlags, System.Text.StringBuilder lpExeName, uint32& lpdwSize)
 
 open Native
 
@@ -148,6 +161,33 @@ let inspectConnectedClient (pipe: NamedPipeServerStream) : Result<ClientPrincipa
         result
     with ex ->
         Error(sprintf "RunAsClient failed: %s" ex.Message)
+
+/// Intervene（architecture.md §10.2、v2.151）がJournal/DecisionTraceの帰属記録（`InterveneAccepted`）
+/// に使うクライアントPID/イメージパスを、接続済みパイプ自身から取得する——クライアントが送る
+/// フィールドではない（§14「クライアントの自己申告を信用しない」と同じ原則）。取得に失敗しても
+/// 要求全体は失敗させない（診断目的の付加情報であり、これを理由に可用性を落とさない）——
+/// Opus敵対的相談`opus-review-intervene-trust-boundary.md`のQ5：この2つのWin32呼出しが制限付き
+/// SDDLパイプ・impersonation接続下で実際に動くかどうかはCIスパイクでの裏取りが要ると指摘されている
+/// （Round 28で検証する、失敗時は`(0, "unknown")`へ安全側に倒す）。
+let getClientAttribution (pipe: NamedPipeServerStream) : int * string =
+    let mutable pid = 0u
+    if not (GetNamedPipeClientProcessId(pipe.SafePipeHandle.DangerousGetHandle(), &pid)) then
+        0, "unknown"
+    else
+        let PROCESS_QUERY_LIMITED_INFORMATION = 0x1000u
+        let hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+        if hProcess = IntPtr.Zero then
+            int pid, "unknown"
+        else
+            try
+                let sb = StringBuilder(1024)
+                let mutable size = uint32 sb.Capacity
+                if QueryFullProcessImageNameW(hProcess, 0u, sb, &size) then
+                    int pid, sb.ToString()
+                else
+                    int pid, "unknown"
+            finally
+                CloseHandle(hProcess) |> ignore
 
 /// S32で実機確認済みの経路でパイプを1本作る：生`CreateNamedPipe`＋SDDL（現在ユーザー＋Host自身の
 /// 整合性レベル以上のみ許可、NETWORKは明示Deny）。`FILE_FLAG_FIRST_PIPE_INSTANCE`＋
@@ -266,6 +306,10 @@ type InspectRequest =
     | ExplainRequest of WindowId
     | AnalyzeRequest of PolicyDto
     | DeployRequest of PolicyDto
+    /// Intervene（architecture.md §10.2、v2.151）。名前を`InterveneRequest`にしないのは、
+    /// `Wm.Contracts.CoreCommand.InterveneRequest`（Host自身がPID/イメージパスを埋めた後のCore向け型）
+    /// と紛れないようにするため——ワイヤから受け取る段階ではまだその型にはなっていない。
+    | InterveneOp of InterveneRequestDto
 
 /// Journal Inspect（v2.147）が返す直近件数。ユーザー決定2026-11-06：直近50〜100件、ここでは
 /// その中央寄りの値を既定にする。
@@ -296,6 +340,15 @@ let private parseRequest (bytes: byte[]) : Result<InspectRequest, string> =
             | "deploy" ->
                 let policyNode = JsonNode.Parse(root.GetProperty("policy").GetRawText())
                 Ok(DeployRequest(policyDtoOfJson policyNode))
+            | "intervene" ->
+                let commandNode = JsonNode.Parse(root.GetProperty("command").GetRawText())
+                let mutable correlationIdProp = Unchecked.defaultof<JsonElement>
+                let correlationId =
+                    if root.TryGetProperty("correlationId", &correlationIdProp) && correlationIdProp.ValueKind <> JsonValueKind.Null then
+                        Some(correlationIdProp.GetString())
+                    else
+                        None
+                Ok(InterveneOp { CorrelationId = correlationId; Command = interveneCommandDtoOfJson commandNode })
             | other -> Error(sprintf "unknown op '%s'" other)
     with ex ->
         Error(sprintf "malformed request: %s" ex.Message)
@@ -331,8 +384,13 @@ let private drainUntilClientClosesAsync (pipe: NamedPipeServerStream) (ct: Cance
 /// 返すようになったのはこのためで、応答を書く前にライブ反映の完了まで待つ。`explainWindow`も同様に
 /// `Task`を返す——`ResidentHost.EnqueueExplainQuery`/`EnqueueActivatePolicy`がADR-012の単一スレッド
 /// アクセス不変条件を守るためキュー経由にしているため（`getSnapshot`/`getPolicy`/`getJournal`/
-/// `analyzeCandidate`は不変の環境値または最善努力の読み取りで、キュー不要）。`ct`は
-/// `runAcceptLoop`が接続ごとに`requestTimeoutMs`で組み立てたデッドライン（5-E対応）：読取・応答
+/// `analyzeCandidate`は不変の環境値または最善努力の読み取りで、キュー不要）。v2.151で`op=intervene`
+/// （§10.2のIntervene、ユーザー決定2026-11-06：Opus敵対的相談`opus-review-intervene-trust-boundary.md`
+/// を踏まえ、architecture.md §10.2/F-1のGate条件を改定して進める）を追加——`intervene`は
+/// `(correlationId, pid, image, cmd) -> Result<Task<InterveneResultDto>, string>`で、PID/イメージパスは
+/// このハンドラが`getClientAttribution pipe`で接続自身から取得して渡す（クライアントの自己申告では
+/// ない）。`Error`（レート制限）はキュー/Reducerに一切触れず`InterveneRejectedDto`へそのまま落とす。
+/// `ct`は`runAcceptLoop`が接続ごとに`requestTimeoutMs`で組み立てたデッドライン（5-E対応）：読取・応答
 /// 送信どちらが詰まってもこのトークンの期限切れで中断される。
 let handleOneRequestAsync
     (pipe: NamedPipeServerStream)
@@ -344,6 +402,7 @@ let handleOneRequestAsync
     (explainWindow: WindowId -> Task<ExplainDto option>)
     (analyzeCandidate: PolicyDto -> AnalyzerReportDto)
     (deployCandidate: PolicyDto -> Task<DeployResultDto>)
+    (intervene: string option -> int -> string -> InterveneCommandDto -> Result<Task<InterveneResultDto>, string>)
     (ct: CancellationToken)
     : Task =
     task {
@@ -379,6 +438,15 @@ let handleOneRequestAsync
             | Ok(DeployRequest candidate) ->
                 let! deployResult = deployCandidate candidate
                 let json = deployResultDtoToJson deployResult
+                do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
+                do! drainUntilClientClosesAsync pipe ct
+            | Ok(InterveneOp dto) ->
+                let pid, image = getClientAttribution pipe
+                let! interveneResult =
+                    match intervene dto.CorrelationId pid image dto.Command with
+                    | Error msg -> Task.FromResult(InterveneRejectedDto msg)
+                    | Ok t -> t
+                let json = interveneResultDtoToJson interveneResult
                 do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
                 do! drainUntilClientClosesAsync pipe ct
     }

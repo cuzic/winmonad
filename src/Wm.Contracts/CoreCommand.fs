@@ -23,6 +23,47 @@ type CoreCommand =
     | SetManagement of WindowId * Management
     | ClearUserOverride of WindowId
 
+/// Intervene（architecture.md §10.2、v2.151）が運ぶ、Named Pipe越しに受け付ける命令の閉じた集合。
+/// `CoreCommand`そのものを再利用しない——`CoreCommand`には`CloseFocused`/`FocusNext`等、Opus敵対的
+/// 相談`opus-review-intervene-trust-boundary.md`のQ3で「REPLクライアント自身の端末を操作してしまう
+/// （`focused`はフォアグラウンド窓の信念であり、コマンド送信時にフォアグラウンドなのはREPLの端末
+/// 自身）」「破壊的（`CloseFocused`）でHost UIによる人間の確認が無いまま実行されるのは正当化できない」
+/// と指摘された危険なケースを含む——この型自体がワイヤ上で送れる命令の許可リストそのものになる
+/// ことで、`CloseFocused`等が決して配線に乗らないことを型で保証する。最初のスライスは同レビューの
+/// 推奨どおり、明示的な対象窓を取り・冪等・可逆・無言のフォーカス変更が無い2命令だけに限定する
+/// （`ToggleFloating`は非冪等——タイムアウト後の再送が直前の適用を元に戻してしまう、同レビューの
+/// Q2-C参照——なので対象外、`SetManagement`で代替できる）。
+type InterveneCommand =
+    | SetManagementTo of WindowId * Management
+    | ClearOverride of WindowId
+
+/// Intervene 1件の要求（v2.151）。`ClientPid`/`ClientImage`はクライアントが送るフィールドではない
+/// ——Host自身が接続済みパイプから`GetNamedPipeClientProcessId`/`QueryFullProcessImageName`で
+/// 取得する（`InspectPipeServer.fs`参照、§14「クライアントの自己申告を信用しない」と同じ原則）。
+/// `CorrelationId`はクライアントが付け、タイムアウト後に結果をJournal/Explainで追跡するためだけに
+/// 使う（同レビューQ2-C：5秒の接続タイムアウトが`step`適用後に切れると、クライアントは`Timeout`を見るが
+/// コマンド自体は適用済みなので、再送での復元判定にこのIdが要る）。
+type InterveneRequest = {
+    CorrelationId: string option
+    ClientPid: int
+    ClientImage: string
+    Command: InterveneCommand
+}
+
+/// `InterveneCommand`が運ぶ対象`WindowId`（前提検査・Journal記録の両方が使う）。
+let targetWindowOf (cmd: InterveneCommand) : WindowId =
+    match cmd with
+    | SetManagementTo(w, _) -> w
+    | ClearOverride w -> w
+
+/// 前提検査（`WmState.step`、F-4）が通った後、既存の`CoreCommand`経路（`Windows.onUserCommand`の
+/// `SetManagement`/`ClearUserOverride`分岐、v2.151時点で新規コードを一切要さない）へそのまま
+/// 委譲するための変換。
+let coreCommandOf (cmd: InterveneCommand) : CoreCommand =
+    match cmd with
+    | SetManagementTo(w, m) -> SetManagement(w, m)
+    | ClearOverride w -> ClearUserOverride w
+
 /// Shellへ渡す意図のIR（§7.1）。GatedEffect.gateを通さないと実際には発行されない。
 type Effect =
     | SetRect of RequestId * WindowId * PixelRect
@@ -63,6 +104,10 @@ type InputEvent =
     | ScreenReconfigurationInProgress of bool
     | PolicyActivated of string
     | MembershipHintsLoaded of (WindowId * WorkspaceId * Management option) list
+    /// Intervene（architecture.md §10.2、v2.151）：Named Pipe越しに受け付けた`InterveneRequest`。
+    /// `WmState.step`（新設の薄いラッパー、`WmState.fs`の`step`型直前コメント参照）がこれだけを
+    /// 特別扱いし、前提検査（F-4）を通れば等価な`UserCommand`へ書き換えて既存経路へ委譲する。
+    | InterveneRequested of InterveneRequest
 
 /// Reducerへ投入したSequence、論理/単調時刻、入力の発生元、SessionId等を持つ（§7.1/§9.3）。
 type EventEnvelope<'Input> = {

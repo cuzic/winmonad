@@ -299,3 +299,39 @@ let ``PolicyStaleAnalysisPayloadは任意件数の要約文字列でも往復し
     let summaries = issueSummaries |> List.map (fun (NonNull s) -> s)
     let entry = mkEntryWithKind PolicyStaleAnalysisKind (PolicyStaleAnalysisPayload summaries)
     roundTrip entry = entry
+
+/// Intervene（architecture.md §10.2、v2.151）：`InterveneRequested`が`WmState.step`の新しい分岐対象
+/// になったので、§9.2「stepの入力分岐 ⊆ Journalの往復可能集合」を満たすため同じラウンドでJournal
+/// 往復対応も追加した——`SetManagementTo`（Managementの全ケース）・`ClearOverride`の両方と、
+/// `CorrelationId`のSome/Noneを検査する。
+[<Property>]
+let ``InterveneRequested(SetManagementTo)は任意のCorrelationId(Some/None)・Managementでも往復しても一致する(v2.151)``
+    (w: int)
+    (management: Management)
+    (correlationId: NonNull<string> option)
+    (clientPid: int)
+    (clientImage: NonNull<string>)
+    =
+    let (NonNull image) = clientImage
+    let req: InterveneRequest =
+        { CorrelationId = correlationId |> Option.map (fun (NonNull s) -> s)
+          ClientPid = clientPid
+          ClientImage = image
+          Command = SetManagementTo (WindowId (int64 (abs w)), management) }
+    let entry = mkEntry (InputPayload (InterveneRequested req))
+    roundTrip entry = entry
+
+[<Property>]
+let ``InterveneRequested(ClearOverride)は往復しても一致する(v2.151)``
+    (w: int)
+    (clientPid: int)
+    (clientImage: NonNull<string>)
+    =
+    let (NonNull image) = clientImage
+    let req: InterveneRequest =
+        { CorrelationId = None
+          ClientPid = clientPid
+          ClientImage = image
+          Command = ClearOverride (WindowId (int64 (abs w))) }
+    let entry = mkEntry (InputPayload (InterveneRequested req))
+    roundTrip entry = entry

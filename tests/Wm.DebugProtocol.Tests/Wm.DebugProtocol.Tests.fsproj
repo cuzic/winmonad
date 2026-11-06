@@ -12,6 +12,7 @@
     <Compile Include="ExplainJsonTests.fs" />
     <Compile Include="AnalyzerJsonTests.fs" />
     <Compile Include="DeployJsonTests.fs" />
+    <Compile Include="InterveneJsonTests.fs" />
     <Compile Include="WireFramingTests.fs" />
   </ItemGroup>
 

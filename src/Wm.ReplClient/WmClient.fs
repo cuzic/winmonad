@@ -7,8 +7,9 @@
 /// §10.3の概念コード（`let! wm = WmClient.connectLocalAsync ()`、`let! snapshot = wm.SnapshotAsync()`、
 /// `let! diagnostics = wm.AnalyzeAsync(rules)`）のうち、Inspectの5操作（Snapshot/Policy/Journal/
 /// Explain/Analyzer、v2.145/v2.147/v2.149）とDeploy（v2.150、§14のPolicyArtifact検証＋保存＋
-/// Journal記録に加え、vNextでReducerの実行中Policyの実際のswapまで、PolicyActivated実配線）を
-/// 実装済み——Fork/Probe/Interveneは後続のスライス（memory `project_named_pipe_ipc_task_breakdown.md`参照）。
+/// Journal記録に加え、vNextでReducerの実行中Policyの実際のswapまで、PolicyActivated実配線）、
+/// Intervene（v2.151、`SetManagement`/`ClearUserOverride`限定の最初のスライス）を実装済み——
+/// Fork/Probeは後続のスライス（memory `project_named_pipe_ipc_task_breakdown.md`参照）。
 module Wm.ReplClient.WmClient
 
 open System
@@ -32,6 +33,8 @@ open Wm.DebugProtocol.Analyzer
 open Wm.DebugProtocol.AnalyzerJson
 open Wm.DebugProtocol.Deploy
 open Wm.DebugProtocol.DeployJson
+open Wm.DebugProtocol.Intervene
+open Wm.DebugProtocol.InterveneJson
 open Wm.DebugProtocol.WireFraming
 
 /// 接続済みのクライアント。コンストラクタは`internal`——`connectAsync`/`connectLocalAsync`
@@ -103,6 +106,23 @@ type WmClient internal (pipe: NamedPipeClientStream) =
     /// しない」）——新Policyは以後に観測される窓の初回分類からだけ効く。
     member this.DeployAsync(candidate: PolicyDto) : Task<Result<DeployResultDto, TransportError>> =
         this.RequestAsync "deploy" (fun req -> req.["policy"] <- policyDtoToJson candidate) deployResultDtoOfJson
+
+    /// Intervene（architecture.md §10.2/§10.3、v2.151）。ユーザー決定2026-11-06（Opus敵対的相談
+    /// `opus-review-intervene-trust-boundary.md`を踏まえ、architecture.md §10.2/F-1のGate条件を
+    /// 改定して進める決定）。送るのは`CorrelationId`（任意）と`InterveneCommandDto`（`SetManagementTo`/
+    /// `ClearOverride`の2ケースだけに限定された閉じた許可リスト）だけ——`CloseFocused`等の危険な
+    /// `CoreCommand`はこの型自体に存在しないため送れない。`ClientPid`/`ClientImage`はここでは送らない
+    /// ——Host自身が接続済みパイプから取得する（§14と同じ「クライアントの自己申告を信用しない」原則）。
+    /// 応答は同期（Opusレビュー2-B）：`InterveneAcceptedDto`が返った時点で前提検査(F-4)を通過し
+    /// `step`が実際に適用済み。`InterveneRejectedDto`はレート制限、または前提検査不成立（対象窓が
+    /// 既に不明/未管理）のいずれか。
+    member this.InterveneAsync(correlationId: string option, command: InterveneCommandDto) : Task<Result<InterveneResultDto, TransportError>> =
+        this.RequestAsync
+            "intervene"
+            (fun req ->
+                req.["correlationId"] <- (correlationId |> Option.map JsonValue.Create<string> |> Option.defaultValue null)
+                req.["command"] <- interveneCommandDtoToJson command)
+            interveneResultDtoOfJson
 
 /// パイプ名を直接知っている場合に使う経路。§10.1「クライアントは`TokenImpersonationLevel.Impersonation`
 /// で接続する」（F42、ユーザー決定2026-11-05——サーバーが`RunAsClient`で実トークンを読むにはこれが

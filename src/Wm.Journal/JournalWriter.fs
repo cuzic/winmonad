@@ -464,6 +464,43 @@ let private coreCommandOfJson (node: JsonNode) : CoreCommand =
     | "clear-user-override" -> ClearUserOverride (WindowId (node.["windowId"].GetValue<int64>()))
     | other -> failwithf "Replay: unrecognized CoreCommand tag '%s' — このJournalはより新しいスキーマで書かれている" other
 
+/// Intervene（architecture.md §10.2、v2.151）が運ぶ`InterveneCommand`/`InterveneRequest`の往復対応。
+/// `coreCommandToJson`/`OfJson`とは別に書く——`InterveneCommand`は`CoreCommand`を再利用しない閉じた
+/// 許可リストであり（`CoreCommand.fs`の`InterveneCommand`型直前コメント参照）、Journal側のタグ付けも
+/// この区別をそのまま保つ。
+let private interveneCommandToJson (cmd: InterveneCommand) : JsonNode =
+    let o = JsonObject()
+    match cmd with
+    | SetManagementTo (WindowId w, m) ->
+        o.["tag"] <- JsonValue.Create("set-management-to")
+        o.["windowId"] <- JsonValue.Create(w)
+        o.["management"] <- JsonValue.Create(managementToJson m)
+    | ClearOverride (WindowId w) ->
+        o.["tag"] <- JsonValue.Create("clear-override")
+        o.["windowId"] <- JsonValue.Create(w)
+    o :> JsonNode
+
+let private interveneCommandOfJson (node: JsonNode) : InterveneCommand =
+    match node.["tag"].GetValue<string>() with
+    | "set-management-to" ->
+        SetManagementTo (WindowId (node.["windowId"].GetValue<int64>()), managementOfJson (node.["management"].GetValue<string>()))
+    | "clear-override" -> ClearOverride (WindowId (node.["windowId"].GetValue<int64>()))
+    | other -> failwithf "Replay: unrecognized InterveneCommand tag '%s' — このJournalはより新しいスキーマで書かれている" other
+
+let private interveneRequestToJson (req: InterveneRequest) : JsonNode =
+    let o = JsonObject()
+    o.["correlationId"] <- (req.CorrelationId |> Option.map JsonValue.Create<string> |> Option.defaultValue null)
+    o.["clientPid"] <- JsonValue.Create(req.ClientPid)
+    o.["clientImage"] <- JsonValue.Create(req.ClientImage)
+    o.["command"] <- interveneCommandToJson req.Command
+    o :> JsonNode
+
+let private interveneRequestOfJson (node: JsonNode) : InterveneRequest =
+    { CorrelationId = if isNull node.["correlationId"] then None else Some (node.["correlationId"].GetValue<string>())
+      ClientPid = node.["clientPid"].GetValue<int>()
+      ClientImage = node.["clientImage"].GetValue<string>()
+      Command = interveneCommandOfJson node.["command"] }
+
 /// このスライスで対応するInputEventのタグ（§9.2のDTOタグ付け規約）。`step`が分岐に使う入力
 /// （MonitorTopologyObserved/ScreenReconfigurationInProgress/TimerElapsed/ForegroundObserved/
 /// WindowRemoved/UserCommand）は全て対応する（Opusレビュー5-4）。**v2.57で`WindowObserved`/
@@ -540,6 +577,9 @@ let private inputEventToJson (input: InputEvent) : JsonNode =
             h.["management"] <- managementOptionToJson mgmt
             arr.Add(h)
         o.["hints"] <- arr
+    | InterveneRequested req ->
+        o.["tag"] <- JsonValue.Create("intervene-requested")
+        o.["request"] <- interveneRequestToJson req
     | other ->
         // 本ビルドで未対応のInputEvent（`EffectBatchReturned`等）。表示専用（Replayはこのタグに
         // 出会うとfail-fastする、§9.2）。
@@ -573,6 +613,7 @@ let private inputEventOfJson (node: JsonNode) : InputEvent =
             |> Seq.map (fun h -> WindowId (h.["windowId"].GetValue<int64>()), WorkspaceId (h.["workspaceId"].GetValue<int>()), managementOptionOfJson h.["management"])
             |> List.ofSeq
         MembershipHintsLoaded hints
+    | "intervene-requested" -> InterveneRequested (interveneRequestOfJson node.["request"])
     | other -> failwithf "Replay: unrecognized InputEvent tag '%s' — このJournalはより新しいスキーマで書かれている" other
 
 /// v2.81で`InputPayload`以外の往復対応を追加した：`JournalKind`の11種は全てPhase A範囲内として
