@@ -4,6 +4,7 @@ module Wm.DebugProtocol.AnalyzerJson
 
 open System.Text.Json.Nodes
 open Wm.Contracts.Identifiers
+open Wm.Contracts.SharedVocabulary
 open Wm.DebugProtocol.Analyzer
 open Wm.DebugProtocol.SnapshotJson
 
