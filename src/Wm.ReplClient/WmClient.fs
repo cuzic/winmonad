@@ -45,10 +45,10 @@ type WmClient internal (pipe: NamedPipeClientStream) =
                 let! responseBytes = readFramedMessageAsync pipe CancellationToken.None
                 let json = JsonNode.Parse(Encoding.UTF8.GetString responseBytes)
                 return Ok(parse json)
-            with
-            | :? IOException -> return Error ConnectionLost
-            | :? ObjectDisposedException -> return Error ConnectionLost
-            | _ -> return Error ConnectionLost
+            with ex ->
+                // TODO(診断用、v2.145のRound 20回帰調査): 原因が分かったら通常のError畳み込みへ戻す。
+                printfn "WmClient.RequestAsync(op=%s) exception: %s" op (ex.ToString())
+                return Error ConnectionLost
         }
 
     /// §10.2「Inspect：Snapshot、Policy、Journal、Explain、Analyzerを見る」のうちSnapshot。
@@ -72,7 +72,9 @@ let connectAsync (pipeName: string) (timeoutMs: int) : Task<Result<WmClient, Tra
         | :? TimeoutException ->
             pipe.Dispose()
             return Error(Timeout timeoutMs)
-        | _ ->
+        | ex ->
+            // TODO(診断用、v2.145のRound 20回帰調査): 原因が分かったら通常のError畳み込みへ戻す。
+            printfn "WmClient.connectAsync(pipeName=%s) exception: %s" pipeName (ex.ToString())
             pipe.Dispose()
             return Error ConnectionLost
     }
