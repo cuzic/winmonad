@@ -35,6 +35,14 @@
 /// `ApplyBatch`/`ObserveWindow`は依然`[]`のまま（前者は子Effectの集約規則が要る、後者はCoreがまだ
 /// 一度も発行していないため消費者が無い）。
 ///
+/// **v2.140でRequestClose拒否アプリ(`RefusesClose`)を実装**：v2.51時点で「アプリが`WM_CLOSE`を拒否する
+/// 側（S17/F30で実機確認済み）を模す`WindowBehavior`はまだ無い」と明記していたギャップを塞いだ。
+/// `VirtualWindow`に`RefusesClose: bool`（既定`false`）を追加し、`true`なら`RequestClose`の
+/// `EffectCallReturned`は`Ok`のまま（`PostMessage`自体は非ブロッキングで成功する、F30の実測通り）
+/// 窓を取り除かず`WindowRemoved`も出さない。`Wm.Core`側に`RequestClose`の結果を消費する
+/// `onEffectCallReturned`分岐は存在しない（fire-and-forget）ため、このシナリオは「窓が消えずに残っても
+/// 何も壊れず、以後も通常どおり配置され続ける」ことを確認する回帰テストとして価値を持つ。
+///
 /// **v2.74で`RestoreBeforeMove`を実装**：`Placement.dispatchPlacements`が最大化中のTiled窓への新しい
 /// `SetRect`の直前に発行するようになった（§6.2/§7.1の`NeedsRestore`、CIスパイクS6bで実機確認した
 /// `ShowWindowAsync(SW_RESTORE)`の効果）。`VirtualWindow`に`IsMaximized: bool`（既定`false`）を追加し、
@@ -98,7 +106,11 @@ type VirtualWindow =
       Shown: bool
       Integrity: IntegrityRelation
       IsMaximized: bool
-      FrameInset: FrameInset }
+      FrameInset: FrameInset
+      /// `RequestClose`を無視するアプリ（F30/S17で実機確認済み：`WM_CLOSE`を無視する`WndProc`へ
+      /// `PostMessage(WM_CLOSE)`を送ると、呼出自体は非ブロッキングで即時`posted=true`に成功するが、
+      /// 窓は生存し続ける）。既定`false`（既存のシナリオ・テストへの影響が無い）。v2.140で追加。
+      RefusesClose: bool }
 
 /// §12.1「`ScheduledSimEvent`」の最小形：`DelayedByMs`な`SetRect`が、`FireAtMs`に達するまで積まれる
 /// 未発火の観測。`Seed`はまだ`WindowBehaviors`のどの挙動も使わないため持たない。
@@ -117,7 +129,7 @@ let addWindow (w: WindowId) (rect: PixelRect) (behavior: WindowBehavior) (world:
         Windows =
             Map.add
                 w
-                { Id = w; Rect = rect; Behavior = behavior; Shown = true; Integrity = NotHigher; IsMaximized = false; FrameInset = noFrameInset }
+                { Id = w; Rect = rect; Behavior = behavior; Shown = true; Integrity = NotHigher; IsMaximized = false; FrameInset = noFrameInset; RefusesClose = false }
                 world.Windows }
 
 /// `addWindow`呼び出し後に不可視リサイズ枠を模す窓へ上書きする（`Integrity`/`IsMaximized`と同じ要領、
@@ -125,6 +137,13 @@ let addWindow (w: WindowId) (rect: PixelRect) (behavior: WindowBehavior) (world:
 let withFrameInset (w: WindowId) (inset: FrameInset) (world: VirtualWorld) : VirtualWorld =
     match Map.tryFind w world.Windows with
     | Some vw -> { world with Windows = Map.add w { vw with FrameInset = inset } world.Windows }
+    | None -> world
+
+/// `addWindow`呼び出し後に`RequestClose`を無視するアプリへ上書きする（同じ要領、F30/S17、
+/// `VirtualWindow`の型直前のコメント参照）。対象窓が無ければ何もしない。
+let withRefusesClose (w: WindowId) (world: VirtualWorld) : VirtualWorld =
+    match Map.tryFind w world.Windows with
+    | Some vw -> { world with Windows = Map.add w { vw with RefusesClose = true } world.Windows }
     | None -> world
 
 let private emptySnapshot (w: WindowId) : WindowSnapshot =
@@ -375,10 +394,13 @@ let applyEffect
     | RequestClose (rid, w) ->
         match Map.tryFind w world.Windows with
         | None -> world, [], [ rid, Error { Api = "PostMessage"; Space = Win32LastError; Code = 1400; ElapsedUs = 0L }, None ]
+        | Some vw when vw.RefusesClose ->
+            // F30/S17（実機確認済み）：`PostMessage(WM_CLOSE)`の呼出自体は非ブロッキングで即時
+            // `posted=true`に成功するが、`WM_CLOSE`を無視する`WndProc`の窓は生存し続ける——
+            // `EffectCallReturned`は`Ok`のまま、`WindowRemoved`は出さない（v2.140で実装）。
+            world, [], [ rid, Ok (), None ]
         | Some _ ->
-            // 既定は常に成功する（窓が閉じる）という最も単純な形だけを実装する。アプリが`WM_CLOSE`を
-            // 拒否する側（S17で実機確認済みの非blocking拒否）を模す`WindowBehavior`はまだ無いため、
-            // 拒否のシナリオは専用のラウンドへ持ち越す（ファイル冒頭コメント参照）。
+            // 既定は常に成功する（窓が閉じる）という最も単純な形。
             { world with Windows = Map.remove w world.Windows }, [ WindowRemoved w ], [ rid, Ok (), None ]
     | _ -> world, [], [] // このラウンドで対象外のEffect種別（ファイル冒頭参照）
 

@@ -299,6 +299,40 @@ let ``CloseFocusedが出すRequestCloseはVirtualWorldから窓を取り除きWi
     // VirtualWorldが返したWindowRemovedが実際にCoreへ戻り、消滅のクリーンアップが走っている。
     Assert.False(Map.containsKey w reducer.State.Windows.Records)
 
+/// F30/S17（実機確認済み：`WM_CLOSE`を無視する`WndProc`へ`PostMessage(WM_CLOSE)`を送ると、呼出自体は
+/// 非ブロッキングで即時`posted=true`に成功するが窓は生存し続ける）を模す`RefusesClose`（v2.140）。
+/// `CloseFocused`→`RequestClose`の`EffectCallReturned`は`Ok`のまま、`WindowRemoved`は出ない——
+/// `Wm.Core`側にこの結果を消費する`onEffectCallReturned`分岐が無い(fire-and-forget)ことを踏まえ、
+/// 「窓が消えずに残っても何も壊れず、以後も通常どおり配置され続ける」ことを確認する。
+[<Fact>]
+let ``RefusesCloseの窓はCloseFocusedを送っても消えず、以後も通常どおり配置され続ける(v2.140)`` () =
+    let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
+    settleTopology reducer [ mkMonitor 0 ]
+    let w = WindowId 1L
+    let world = empty |> addWindow w { X = 0; Y = 0; Width = 10; Height = 10 } Immediate |> withRefusesClose w
+    let discovery = reducer.Submit 1000L "virtual-world" (visibleWindowObserved w)
+    let world' = settle 1000L reducer world discovery.Effects
+    let fg: Observation<WindowId option> = { Value = Ok (Some w); SampleSequence = 100L; MonotonicTime = 1500L; Source = "test" }
+    reducer.Submit 1500L "virtual-world" (ForegroundObserved fg) |> ignore
+
+    let closeResult = reducer.Submit 1600L "virtual-world" (UserCommand CloseFocused)
+    let requestCloseEffects = closeResult.Effects |> List.filter (fun g -> match GatedEffect.effect g with RequestClose (_, w') -> w' = w | _ -> false)
+    Assert.Equal(1, List.length requestCloseEffects)
+
+    let finalWorld = settle 1600L reducer world' closeResult.Effects
+    // 窓は疑似OS・Core双方で生存し続ける(WindowRemovedが出ていない)。
+    Assert.True(Map.containsKey w finalWorld.Windows)
+    Assert.True(Map.containsKey w reducer.State.Windows.Records)
+
+    // 以後も通常どおり配置され続けることの確認：2つ目の窓を追加するとMonocleで分割（2窓とも
+    // WorkAreaへ、v2.6既定）され、RefusesCloseの窓も新しいSetRectを受け取って追従する。
+    let w2 = WindowId 2L
+    let world2 = finalWorld |> addWindow w2 { X = 0; Y = 0; Width = 10; Height = 10 } Immediate
+    let d2 = reducer.Submit 2000L "virtual-world" (visibleWindowObserved w2)
+    let finalWorld2 = settle 2000L reducer world2 d2.Effects
+    Assert.Empty(reducer.State.Placement.Pending)
+    Assert.True(Map.containsKey w finalWorld2.Windows)
+
 [<Fact>]
 let ``2つ目の窓が現れても、両方がMonocleで全画面に配置され両方Satisfiedになる`` () =
     let reducer = Reducer(RuntimePolicy.defaults, "scenario-session", "test-build", "test-policy-hash", None)
