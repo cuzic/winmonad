@@ -272,6 +272,28 @@ let private parseRequest (bytes: byte[]) : Result<InspectRequest, string> =
     with ex ->
         Error(sprintf "malformed request: %s" ex.Message)
 
+/// 応答を書き終えた直後に`runAcceptLoop`が`Disconnect`すると、クライアントがまだ読み切っていない
+/// データがパイプのバッファから失われることがある——Win32の`DisconnectNamedPipe`の既知の挙動
+/// （未読のバッファ内容は破棄される）。`WriteAsync`の完了は「OSに書き込みを受理させた」ことしか
+/// 保証せず、「クライアントが読み終えた」ことまでは保証しない（v2.145実装直後に実機で再現：Round 20
+/// がこの競合に初めて引っかかり「pipe closed before message complete」で失敗、Round 17-19/21は
+/// たまたまタイミングで競合を踏まなかっただけだった——書き込み後すぐ切断する設計そのものが
+/// 元から持っていた既存の穴で、Policy操作追加そのものが原因ではない）。応答送信後、クライアントが
+/// 読み終えて自分側のハンドルを閉じる（`WmClient.Dispose`/`use`のスコープ終了、またはRound 17-19の
+/// 生クライアントの`use`終了）までの0バイト読み取り（＝EOFが来るまで待つだけ）でブロックしてから
+/// 戻ることで、`runAcceptLoop`の`Disconnect`が常にクライアントの読み取り完了後にしか起きないように
+/// する。クライアントが(プロトコル違反で)追加の何かを送ってきた場合は無視する——ここは「切断前に
+/// 読み取り終了を待つ」ためだけの用途であり、追加データの処理は対象外。
+let private drainUntilClientClosesAsync (pipe: NamedPipeServerStream) (ct: CancellationToken) : Task =
+    task {
+        let buf = Array.zeroCreate<byte> 1
+        try
+            let! (_: int) = pipe.ReadAsync(buf, 0, 1, ct)
+            ()
+        with _ ->
+            ()
+    }
+
 /// 1接続ぶんのInspectハンドラ本体。`principal`/`ownRid`による多層防御（カーネルのDACL/ラベルを
 /// 通過したはずの接続だが、ここでも「同一ユーザー・Host自身の整合性レベル以上」を再確認する）→
 /// 1件のリクエストを読む→`getSnapshot`/`getPolicy`を呼んで応答する、という最小の往復を実装する。
@@ -292,28 +314,16 @@ let handleOneRequestAsync
             match principal, ownRid with
             | Ok p, Some own -> p.IntegrityRid >= own
             | _ -> false
-        // TODO(診断用、v2.145のRound 20回帰調査): 原因が分かったら削除する。
-        printfn "handleOneRequestAsync: principal=%A ownRid=%A authorized=%b" principal ownRid authorized
         if authorized then
             let! requestBytes = readFramedMessageAsync pipe ct
-            printfn "handleOneRequestAsync: requestBytes.Length=%d" requestBytes.Length
             match parseRequest requestBytes with
-            | Error e ->
-                printfn "handleOneRequestAsync: parseRequest Error %s" e
+            | Error _ -> ()
             | Ok SnapshotRequest ->
-                printfn "handleOneRequestAsync: parsed SnapshotRequest, writing response"
                 let json = snapshotDtoToJson (getSnapshot ())
-                try
-                    do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
-                    printfn "handleOneRequestAsync: wrote SnapshotRequest response successfully"
-                with ex ->
-                    printfn "handleOneRequestAsync: writeFramedMessageAsync(Snapshot) exception: %s" (ex.ToString())
+                do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
+                do! drainUntilClientClosesAsync pipe ct
             | Ok PolicyRequest ->
-                printfn "handleOneRequestAsync: parsed PolicyRequest, writing response"
                 let json = policyDtoToJson (getPolicy ())
-                try
-                    do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
-                    printfn "handleOneRequestAsync: wrote PolicyRequest response successfully"
-                with ex ->
-                    printfn "handleOneRequestAsync: writeFramedMessageAsync(Policy) exception: %s" (ex.ToString())
+                do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
+                do! drainUntilClientClosesAsync pipe ct
     }
