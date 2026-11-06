@@ -296,13 +296,24 @@ let handleOneRequestAsync
         printfn "handleOneRequestAsync: principal=%A ownRid=%A authorized=%b" principal ownRid authorized
         if authorized then
             let! requestBytes = readFramedMessageAsync pipe ct
+            printfn "handleOneRequestAsync: requestBytes.Length=%d" requestBytes.Length
             match parseRequest requestBytes with
             | Error e ->
                 printfn "handleOneRequestAsync: parseRequest Error %s" e
             | Ok SnapshotRequest ->
+                printfn "handleOneRequestAsync: parsed SnapshotRequest, writing response"
                 let json = snapshotDtoToJson (getSnapshot ())
-                do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
+                try
+                    do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
+                    printfn "handleOneRequestAsync: wrote SnapshotRequest response successfully"
+                with ex ->
+                    printfn "handleOneRequestAsync: writeFramedMessageAsync(Snapshot) exception: %s" (ex.ToString())
             | Ok PolicyRequest ->
+                printfn "handleOneRequestAsync: parsed PolicyRequest, writing response"
                 let json = policyDtoToJson (getPolicy ())
-                do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
+                try
+                    do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
+                    printfn "handleOneRequestAsync: wrote PolicyRequest response successfully"
+                with ex ->
+                    printfn "handleOneRequestAsync: writeFramedMessageAsync(Policy) exception: %s" (ex.ToString())
     }
