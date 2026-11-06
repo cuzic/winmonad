@@ -7,8 +7,8 @@
 /// §10.3の概念コード（`let! wm = WmClient.connectLocalAsync ()`、`let! snapshot = wm.SnapshotAsync()`、
 /// `let! diagnostics = wm.AnalyzeAsync(rules)`）のうち、Inspectの5操作（Snapshot/Policy/Journal/
 /// Explain/Analyzer、v2.145/v2.147/v2.149）とDeploy（v2.150、§14のPolicyArtifact検証＋保存＋
-/// Journal記録まで。Reducerの実行中Policyはswapしない）を実装済み——Fork/Probe/Interveneは後続の
-/// スライス（memory `project_named_pipe_ipc_task_breakdown.md`参照）。
+/// Journal記録に加え、vNextでReducerの実行中Policyの実際のswapまで、PolicyActivated実配線）を
+/// 実装済み——Fork/Probe/Interveneは後続のスライス（memory `project_named_pipe_ipc_task_breakdown.md`参照）。
 module Wm.ReplClient.WmClient
 
 open System
@@ -94,9 +94,13 @@ type WmClient internal (pipe: NamedPipeClientStream) =
 
     /// §10.2「Inspect」のうちDeploy（v2.150で追加、§14完成により前提解消）。候補`PolicyDto`を送る
     /// だけで、`ArtifactIdentity`はクライアントからは渡さない——Hostが自分自身のRegistry/CoreBuildId
-    /// から組み立てる（§14と同じ「クライアントの自己申告を信用しない」原則）。このスライスは
-    /// 検証＋`artifacts/policy/`への保存＋Journal記録までで、Reducerの実行中Policyはswapしない
-    /// （ユーザー決定2026-11-06、ライブ切替には現時点でHost再起動が必要）。
+    /// から組み立てる（§14と同じ「クライアントの自己申告を信用しない」原則）。検証＋
+    /// `artifacts/policy/`への保存＋Journal記録に加え、vNext（PolicyActivated実配線、
+    /// ユーザー決定2026-11-06）でReducerの実行中Policyの実際のswapまで行うようになった——
+    /// この呼び出しが`Ok(DeploySucceededDto _)`を返した時点で、ライブ反映は既に完了している
+    /// （Host側が`activatePolicy`の完了を待ってから応答する、`PolicyArtifact.deployCandidateOf`
+    /// 参照）。既に`ByPolicy`で確定済みの窓は遡って再評価されない（同日のユーザー決定「再評価
+    /// しない」）——新Policyは以後に観測される窓の初回分類からだけ効く。
     member this.DeployAsync(candidate: PolicyDto) : Task<Result<DeployResultDto, TransportError>> =
         this.RequestAsync "deploy" (fun req -> req.["policy"] <- policyDtoToJson candidate) deployResultDtoOfJson
 

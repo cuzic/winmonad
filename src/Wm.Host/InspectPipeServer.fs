@@ -326,11 +326,12 @@ let private drainUntilClientClosesAsync (pipe: NamedPipeServerStream) (ct: Cance
 /// 通過したはずの接続だが、ここでも「同一ユーザー・Host自身の整合性レベル以上」を再確認する）→
 /// 1件のリクエストを読む→各`get*`/`explainWindow`を呼んで応答する、という最小の往復を実装する。
 /// Inspect（§10.2「Snapshot、Policy、Journal、Explain、Analyzerを見る」）の全5操作に加え、v2.150で
-/// `op=deploy`（§14のDeploy、PolicyArtifactの検証＋保存＋Journal記録。Reducerの実行中Policyは
-/// swapしない——`PolicyArtifact.fs`冒頭コメント参照）もこのスライスで追加した。`explainWindow`は
-/// `Task`を返す——`ResidentHost.EnqueueExplainQuery`がADR-012の単一スレッドアクセス不変条件を守る
-/// ためキュー経由にしているため（`getSnapshot`/`getPolicy`/`getJournal`/`analyzeCandidate`/
-/// `deployCandidate`は不変の環境値または最善努力の読み取り・書き込みで、キュー不要）。`ct`は
+/// `op=deploy`（§14のDeploy、PolicyArtifactの検証＋保存＋Journal記録）を追加し、vNext（PolicyActivated
+/// 実配線）で実際にReducerの実行中Policyをswapするところまで拡張した——`deployCandidate`が`Task`を
+/// 返すようになったのはこのためで、応答を書く前にライブ反映の完了まで待つ。`explainWindow`も同様に
+/// `Task`を返す——`ResidentHost.EnqueueExplainQuery`/`EnqueueActivatePolicy`がADR-012の単一スレッド
+/// アクセス不変条件を守るためキュー経由にしているため（`getSnapshot`/`getPolicy`/`getJournal`/
+/// `analyzeCandidate`は不変の環境値または最善努力の読み取りで、キュー不要）。`ct`は
 /// `runAcceptLoop`が接続ごとに`requestTimeoutMs`で組み立てたデッドライン（5-E対応）：読取・応答
 /// 送信どちらが詰まってもこのトークンの期限切れで中断される。
 let handleOneRequestAsync
@@ -342,7 +343,7 @@ let handleOneRequestAsync
     (getJournal: unit -> JournalDto)
     (explainWindow: WindowId -> Task<ExplainDto option>)
     (analyzeCandidate: PolicyDto -> AnalyzerReportDto)
-    (deployCandidate: PolicyDto -> DeployResultDto)
+    (deployCandidate: PolicyDto -> Task<DeployResultDto>)
     (ct: CancellationToken)
     : Task =
     task {
@@ -376,7 +377,8 @@ let handleOneRequestAsync
                 do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
                 do! drainUntilClientClosesAsync pipe ct
             | Ok(DeployRequest candidate) ->
-                let json = deployResultDtoToJson (deployCandidate candidate)
+                let! deployResult = deployCandidate candidate
+                let json = deployResultDtoToJson deployResult
                 do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
                 do! drainUntilClientClosesAsync pipe ct
     }

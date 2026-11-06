@@ -4,11 +4,21 @@
 /// `PolicyArtifactHash`フィールドに実際のhashを載せる）・Rollback・起動時の「報告のみモード」を
 /// まとめて実装する（ユーザー決定2026-11-06：§14をほぼ全部、一気に）。
 ///
-/// `op=deploy`のNamed Pipe配線は`deployCandidateOf`（v2.150）としてこのファイルに実装済み——ユーザー
-/// 決定2026-11-06：このスライスは「検証＋保存＋Journal記録」までで、Reducerの実行中Policyは
-/// swapしない。`InputEvent.PolicyActivated`は`WmState.step`で一切パターンマッチされておらず
-/// （正規の`| _ ->`に落ちる）、ライブ切替自体は§21の未決事項のまま——新Policyを実際に有効化するには
-/// 現時点ではHost再起動が必要（§21にその旨を明記する）。`ArtifactIdentity`はクライアントから受け取らず
+/// `op=deploy`のNamed Pipe配線は`deployCandidateOf`（v2.150）としてこのファイルに実装済み。vNext
+/// （PolicyActivated実配線、architecture.md §14/§21、ユーザー決定2026-11-06「次のゴール」）で、
+/// 検証・保存・Journal記録に成功した後、実際にReducerの実行中Policyをswapするところまで拡張した。
+/// `deployCandidateOf`が受け取る`activatePolicy: PolicyIR -> Task<unit>`は呼び出し側
+/// （`ResidentHost.EnqueueActivatePolicy`）が渡すコールバック——この関数自体は具体的な`ResidentHost`
+/// 型を知らないままでいられる。`InputEvent.PolicyActivated`（`WmState.step`では一切パターンマッチ
+/// されず正規の`| _ ->`に落ちる、未使用のまま）は使わない——実際の「採用記録」は既存の
+/// `recordPolicyActivated`（Reducerの`step`を経由しない直接のJournal書込み、下記の型直前コメント
+/// 参照）がそのまま担い、「ライブ反映」は`Reducer.ActivatePolicy`という別の、環境
+/// （`RuntimePolicy`）だけを書き換える経路が担う——`step`の純粋な署名（環境を返り値に含まない）を
+/// 変えない設計（Reducer.fsの`ActivatePolicy`型直前コメント参照）。ユーザー決定2026-11-06
+/// （v2.150のスコープ決定時）「再評価しない」どおり、既に`ByPolicy`で確定済みの窓は遡って再評価
+/// しない——新Policyは以後に観測される窓の初回分類からだけ効く（`Windows.fs`の`reconsider`が元から
+/// `Classified (_, ByPolicy _)`を増分再分類の対象外にしているため、追加の実装は不要）。
+/// `ArtifactIdentity`はクライアントから受け取らず
 /// Host自身が`buildArtifactIdentity`で組み立てる（§14「クライアントの自己申告を信用しない」の実演、
 /// v2.149のAnalyzerと同じ原則）。architecture.md §14自身が言う「トレイ通知」は依然対象外——`Wm.Host`
 /// にはトレイUIが無いという
@@ -28,6 +38,7 @@ open System.IO
 open System.Security.Cryptography
 open System.Text
 open System.Text.Json.Nodes
+open System.Threading.Tasks
 open Wm.Contracts.Identifiers
 open Wm.Contracts.SharedVocabulary
 open Wm.Contracts.JournalTypes
@@ -329,12 +340,15 @@ let private deployPolicySchemaVersion = 1
 let private deployNormalizerSchemaVersion = 1
 let private deployAnalyzerVersion = "v1"
 
-/// `op=deploy`（architecture.md §10.2、v2.150）。クライアントは候補`PolicyDto`だけを送り、
-/// `ArtifactIdentity`はHost自身が自分の採用中Registry/CoreBuildIdから`buildArtifactIdentity`で
-/// 組み立てる（§14「クライアントの自己申告を信用しない」、v2.149のAnalyzerと同じ原則）。成功時は
-/// `savePinnedPolicy`で`artifacts/policy/`へ保存し、`journalPath`があれば`recordPolicyActivated`で
-/// `PolicyActivatedKind`を記録する。ユーザー決定2026-11-06：このスライスはここまでで、Reducerの
-/// 実行中Policyはswapしない（ファイル冒頭コメント参照、ライブ切替には現時点でHost再起動が必要）。
+/// `op=deploy`（architecture.md §10.2、v2.150、PolicyActivated実配線はvNext）。クライアントは候補
+/// `PolicyDto`だけを送り、`ArtifactIdentity`はHost自身が自分の採用中Registry/CoreBuildIdから
+/// `buildArtifactIdentity`で組み立てる（§14「クライアントの自己申告を信用しない」、v2.149のAnalyzerと
+/// 同じ原則）。成功時は`savePinnedPolicy`で`artifacts/policy/`へ保存し、`journalPath`があれば
+/// `recordPolicyActivated`で`PolicyActivatedKind`を記録し、最後に`activatePolicy`（呼び出し側が渡す
+/// `Reducer.ActivatePolicy`への配線、ファイル冒頭コメント参照）を呼んで実際にReducerの実行中Policyを
+/// swapする——この`await`が完了するまで`DeploySucceededDto`を返さないので、クライアントが応答を
+/// 受け取った時点で「本当にライブ反映が終わっている」ことを保証する（§14「自己申告を信用しない」と
+/// 対になる、「応答を先走って返さない」という同じ精神）。
 let deployCandidateOf
     (baseDir: string)
     (registry: Registry)
@@ -342,16 +356,20 @@ let deployCandidateOf
     (sessionId: string)
     (coreBuildId: string)
     (now: int64)
+    (activatePolicy: PolicyIR -> Task<unit>)
     (candidate: PolicyDto)
-    : DeployResultDto =
-    let manifest = Registry.toManifest registry
-    let ir = policyIrOf candidate
-    let identity =
-        buildArtifactIdentity deployPolicySchemaVersion ir manifest coreBuildId deployNormalizerSchemaVersion deployAnalyzerVersion
-    match deploy manifest candidate identity with
-    | Error(DeployIntegrityFailed(HashMismatch(expected, actual))) -> DeployIntegrityFailedDto(expected, actual)
-    | Error(DeployAnalysisFailed report) -> DeployAnalysisFailedDto(analyzerReportDtoOf report)
-    | Ok deployable ->
-        savePinnedPolicy baseDir (DeployablePolicy.pinned deployable)
-        journalPath |> Option.iter (fun path -> recordPolicyActivated path sessionId coreBuildId identity.ArtifactHash "deploy" now)
-        DeploySucceededDto identity.ArtifactHash
+    : Task<DeployResultDto> =
+    task {
+        let manifest = Registry.toManifest registry
+        let ir = policyIrOf candidate
+        let identity =
+            buildArtifactIdentity deployPolicySchemaVersion ir manifest coreBuildId deployNormalizerSchemaVersion deployAnalyzerVersion
+        match deploy manifest candidate identity with
+        | Error(DeployIntegrityFailed(HashMismatch(expected, actual))) -> return DeployIntegrityFailedDto(expected, actual)
+        | Error(DeployAnalysisFailed report) -> return DeployAnalysisFailedDto(analyzerReportDtoOf report)
+        | Ok deployable ->
+            savePinnedPolicy baseDir (DeployablePolicy.pinned deployable)
+            journalPath |> Option.iter (fun path -> recordPolicyActivated path sessionId coreBuildId identity.ArtifactHash "deploy" now)
+            do! activatePolicy ir
+            return DeploySucceededDto identity.ArtifactHash
+    }

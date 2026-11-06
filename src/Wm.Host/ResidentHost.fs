@@ -45,6 +45,11 @@ type SnapshotQuery = TaskCompletionSource<SnapshotDto>
 /// （対象のWindowIdを添えるだけの違い）。
 type ExplainQuery = Wm.Contracts.Identifiers.WindowId * TaskCompletionSource<ExplainDto option>
 
+/// 1件のPolicy活性化要求（PolicyActivated実配線、vNext、architecture.md §14/§21）。
+/// `Reducer.ActivatePolicy`は書込みなのでADR-012の単一スレッドアクセス不変条件の対象——Snapshot/Explain
+/// と同じ「他スレッドはキューへ積むだけ、実際の適用はReducer所有スレッドが次の`Run`ループで行う」方式にする。
+type ActivatePolicyRequest = PolicyIR * TaskCompletionSource<unit>
+
 /// `WmState`＋リビジョン番号から`SnapshotDto`を組み立てる純粋関数（FCIS、ADR-002）。分類の判断
 /// そのものは`Wm.Core.Windows.registryManagementSnapshot`（Functional Core）に閉じており、ここで
 /// やっているのはその結果を`SnapshotDto`/`WindowSnapshotDto`（Wm.DebugProtocol、§17の依存方向で
@@ -237,6 +242,7 @@ type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
     let harness = EffectHarness(reducer, liveNow)
     let queries = ConcurrentQueue<SnapshotQuery>()
     let explainQueries = ConcurrentQueue<ExplainQuery>()
+    let activateRequests = ConcurrentQueue<ActivatePolicyRequest>()
     let cts = new CancellationTokenSource()
 
     let projectSnapshot () : SnapshotDto = snapshotOf reducer.State reducer.Sequence
@@ -268,6 +274,16 @@ type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
         explainQueries.Enqueue(w, tcs)
         tcs.Task
 
+    /// PolicyActivated実配線（vNext）：`op=deploy`が検証・保存・Journal記録に成功した新Policyを、
+    /// 実際にReducerへ反映させるための書込み要求口。`EnqueueSnapshotQuery`/`EnqueueExplainQuery`と
+    /// 同じキュー方式——返した`Task`は、次の`Run`ループでReducer所有スレッドが実際に
+    /// `Reducer.ActivatePolicy`を呼び終えるまで完了しない（§14「クライアントの自己申告を信用しない」
+    /// と同じ精神で、`op=deploy`の応答自体も「本当にswapが終わった後」まで待ってから返せるようにする）。
+    member _.EnqueueActivatePolicy(policy: PolicyIR) : Task<unit> =
+        let tcs = TaskCompletionSource<unit>(TaskCreationOptions.RunContinuationsAsynchronously)
+        activateRequests.Enqueue(policy, tcs)
+        tcs.Task
+
     /// 他スレッドから呼んでよい、スレッドセーフな停止要求。
     member _.RequestStop() = cts.Cancel()
 
@@ -297,5 +313,10 @@ type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
             while explainQueries.TryDequeue(&eq) do
                 let w, tcs = eq
                 tcs.SetResult(explainOf reducer.State.Windows reducer.RecentTrace w)
+            let mutable aq = Unchecked.defaultof<ActivatePolicyRequest>
+            while activateRequests.TryDequeue(&aq) do
+                let policy, tcs = aq
+                reducer.ActivatePolicy policy
+                tcs.SetResult(())
             Thread.Sleep(tickMs)
         harness.Stop()

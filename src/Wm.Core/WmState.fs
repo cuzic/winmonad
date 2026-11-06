@@ -25,7 +25,12 @@ open Wm.Layouts.LayoutRegistry
 /// `step`が各段へ配線する環境（状態ではない。§3.3「RuntimePolicyは環境なので決定性ゲートの対象外」）。
 /// Windowsドメインの実装に伴い、段⑤が読む採用中Policy用のフィールドを追加する（ADR-019実装順14）。
 /// `PatternSet`は`Policy`から一度だけ計算し（SHA256のパターンハッシュをstepごとに再計算しないため）、
-/// 両者は常に対になって更新される（`PolicyActivated`の配線は未実装、21章の未決事項のまま）。
+/// 両者は常に対になって更新される。PolicyActivated実配線（vNext、architecture.md §14/§21）：
+/// `InputEvent.PolicyActivated`自体は依然`step`で一切パターンマッチされない（下記の未配線のまま、
+/// 使われない値として残す）——実際のライブ反映は`step`の外側、`Wm.Runtime.Reducer.ActivatePolicy`が
+/// この`RuntimePolicy`環境そのものを丸ごと入れ替える経路で行う（`step`の純粋な署名——環境を引数で
+/// 受け取るだけで返り値に含まない——を変えないための設計判断、`Reducer.fs`の`ActivatePolicy`型直前
+/// コメント参照）。
 type RuntimePolicy =
     { Topology: TopologyConfig
       Policy: PolicyIR
@@ -75,7 +80,11 @@ type WmState =
 /// フォールバック、`Topology.fs`型直前のコメント参照）。同じ`WorkspaceId`が複数回現れる場合は
 /// `Map.ofList`の「後が勝つ」規則に委ねる——`PolicyAnalyzer.checkDuplicateWorkspaceAssignments`
 /// （同ラウンドで追加）がこの状況自体を`Error`として検出するので、ここでは暗黙の規則をこれ以上
-/// 明文化しない。Policy再適用（`PolicyActivated`）時の再読込は依然未配線のまま（21章の未決事項）。
+/// 明文化しない。Policy再適用（`PolicyActivated`）時の再読込は依然未配線のまま——vNextの
+/// `Reducer.ActivatePolicy`（PolicyActivated実配線）は`RuntimePolicy.Policy`/`PatternSet`だけを
+/// 入れ替え、ここ（`WmState.Topology.Assignments`、`initial`が一度だけ呼ばれた時点の値）は
+/// 意図的に対象外のまま——`op=deploy`でWorkspaceAssignmentsを変えても、既存のTopology割当へは
+/// Host再起動まで反映されない既知のギャップとして21章に残す。
 let initial (runtimePolicy: RuntimePolicy) : WmState =
     { Topology = Topology.initial (runtimePolicy.Policy.WorkspaceAssignments |> Map.ofList)
       Workspaces = WorkspaceSet.empty

@@ -1046,7 +1046,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe17 cts17.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid17 (fun () -> residentHost17.EnqueueSnapshotQuery().Result) (fun () -> residentHost17.Policy) (fun () -> residentHost17.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost17.EnqueueExplainQuery(w)) (fun c -> residentHost17.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round")) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid17 (fun () -> residentHost17.EnqueueSnapshotQuery().Result) (fun () -> residentHost17.Policy) (fun () -> residentHost17.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost17.EnqueueExplainQuery(w)) (fun c -> residentHost17.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread17.IsBackground <- true
         acceptThread17.Start()
@@ -1112,7 +1112,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoopWithTimeout pipe18 cts18.Token shortTimeoutMs18 (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid18 (fun () -> residentHost18.EnqueueSnapshotQuery().Result) (fun () -> residentHost18.Policy) (fun () -> residentHost18.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost18.EnqueueExplainQuery(w)) (fun c -> residentHost18.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round")) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid18 (fun () -> residentHost18.EnqueueSnapshotQuery().Result) (fun () -> residentHost18.Policy) (fun () -> residentHost18.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost18.EnqueueExplainQuery(w)) (fun c -> residentHost18.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread18.IsBackground <- true
         acceptThread18.Start()
@@ -1190,7 +1190,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe19 cts19.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid19 (fun () -> residentHost19.EnqueueSnapshotQuery().Result) (fun () -> residentHost19.Policy) (fun () -> residentHost19.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost19.EnqueueExplainQuery(w)) (fun c -> residentHost19.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round")) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid19 (fun () -> residentHost19.EnqueueSnapshotQuery().Result) (fun () -> residentHost19.Policy) (fun () -> residentHost19.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost19.EnqueueExplainQuery(w)) (fun c -> residentHost19.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread19.IsBackground <- true
         acceptThread19.Start()
@@ -1269,7 +1269,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe20 cts20.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid20 (fun () -> residentHost20.EnqueueSnapshotQuery().Result) (fun () -> residentHost20.Policy) (fun () -> residentHost20.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost20.EnqueueExplainQuery(w)) (fun c -> residentHost20.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round")) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid20 (fun () -> residentHost20.EnqueueSnapshotQuery().Result) (fun () -> residentHost20.Policy) (fun () -> residentHost20.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost20.EnqueueExplainQuery(w)) (fun c -> residentHost20.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread20.IsBackground <- true
         acceptThread20.Start()
@@ -1339,7 +1339,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe21 cts21.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid21 (fun () -> residentHost21.EnqueueSnapshotQuery().Result) (fun () -> residentHost21.Policy) (fun () -> residentHost21.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost21.EnqueueExplainQuery(w)) (fun c -> residentHost21.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round")) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid21 (fun () -> residentHost21.EnqueueSnapshotQuery().Result) (fun () -> residentHost21.Policy) (fun () -> residentHost21.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost21.EnqueueExplainQuery(w)) (fun c -> residentHost21.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread21.IsBackground <- true
         acceptThread21.Start()
@@ -1453,7 +1453,7 @@ let main argv =
                             (fun () -> residentHost22.RecentJournal(defaultJournalEntryCount))
                             (fun w -> residentHost22.EnqueueExplainQuery(w))
                             (fun c -> residentHost22.AnalyzeCandidate(c))
-                            (fun (_: PolicyDto) -> DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))
+                            (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round")))
                             reqCt)
                             .GetAwaiter()
                             .GetResult()
@@ -1566,7 +1566,7 @@ let main argv =
                             (fun () -> residentHost23.RecentJournal(defaultJournalEntryCount))
                             (fun w -> residentHost23.EnqueueExplainQuery(w))
                             (fun c -> residentHost23.AnalyzeCandidate(c))
-                            (fun (_: PolicyDto) -> DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))
+                            (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round")))
                             reqCt)
                             .GetAwaiter()
                             .GetResult()
@@ -1766,7 +1766,7 @@ let main argv =
                             (fun () -> residentHost25.RecentJournal(defaultJournalEntryCount))
                             (fun w -> residentHost25.EnqueueExplainQuery(w))
                             (fun c -> residentHost25.AnalyzeCandidate(c))
-                            (fun (_: PolicyDto) -> DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))
+                            (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round")))
                             reqCt)
                             .GetAwaiter()
                             .GetResult()
@@ -1813,8 +1813,11 @@ let main argv =
 
     // Round 26：Deploy Inspect操作（op=deploy、v2.150、§14の続き）。クライアントが候補Policyを送り、
     // Hostが自分でArtifactIdentityを組み立てて現行Analyzerで再分析し、クリーンなら
-    // artifacts/policy/へ保存してJournalにPolicyActivatedを記録する。ユーザー決定2026-11-06：
-    // このスライスはReducerの実行中Policyをswapしない（Host再起動が必要、§21の未決事項のまま）。
+    // artifacts/policy/へ保存してJournalにPolicyActivatedを記録する。v2.150時点のユーザー決定
+    // 2026-11-06では、ここまでがこのスライスの範囲でReducerの実行中Policyはswapしなかったが、
+    // vNext（PolicyActivated実配線、同日「次のゴール」決定）で`deployCandidateOf`自体が実際に
+    // ライブ反映まで行うよう拡張された——このRound自体はそれを直接検証しないが（Round 27が検証）、
+    // 副作用として同じ拡張を受けている。
     printfn "\n--- Round 26: Deploy Inspect op (op=deploy) analyzes+persists+journals a candidate Policy through the real Named Pipe ---"
     let baseDir26 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round26-%s" (Guid.NewGuid().ToString("N")))
     let journalPath26 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round26-%s.ndjson" (Guid.NewGuid().ToString("N")))
@@ -1854,7 +1857,7 @@ let main argv =
                             (fun () -> residentHost26.RecentJournal(defaultJournalEntryCount))
                             (fun w -> residentHost26.EnqueueExplainQuery(w))
                             (fun c -> residentHost26.AnalyzeCandidate(c))
-                            (fun c -> deployCandidateOf baseDir26 reducer26.LayoutRegistry reducer26.JournalPath reducer26.SessionId reducer26.CoreBuildId (liveNow ()) c)
+                            (fun c -> deployCandidateOf baseDir26 reducer26.LayoutRegistry reducer26.JournalPath reducer26.SessionId reducer26.CoreBuildId (liveNow ()) residentHost26.EnqueueActivatePolicy c)
                             reqCt)
                             .GetAwaiter()
                             .GetResult()
@@ -1918,7 +1921,7 @@ let main argv =
         let loopStopped26 = loopThread26.Join(3000)
         removeDiscoveryFile ()
         printfn
-            "Round 26 PASSED (op=deploy deploys a clean candidate Policy, persisting it to artifacts/policy/ and journaling PolicyActivated, and rejects a dirty one (duplicate WindowRuleId) via DeployAnalysisFailedDto, through the real Named Pipe against the Host's own real Analyzer/Registry; Reducer's live Policy is NOT swapped by this slice's design): %b"
+            "Round 26 PASSED (op=deploy deploys a clean candidate Policy, persisting it to artifacts/policy/ and journaling PolicyActivated, and rejects a dirty one (duplicate WindowRuleId) via DeployAnalysisFailedDto, through the real Named Pipe against the Host's own real Analyzer/Registry; op=deploy's live Policy swap itself is verified separately in Round 27): %b"
             (discoveryWriteOk26
              && cleanDeployedOk26
              && dirtyRejectedOk26
@@ -1926,6 +1929,181 @@ let main argv =
              && journalRecordedOk26
              && acceptStopped26
              && loopStopped26)
+
+    // Round 27：PolicyActivated実配線（vNext、architecture.md §14/§21、ユーザー決定2026-11-06
+    // 「次のゴール」）。Round 26まではop=deployが検証・保存・Journal記録までだったが、
+    // `deployCandidateOf`がvNextで`activatePolicy`コールバック（`ResidentHost.EnqueueActivatePolicy`）
+    // を呼ぶよう拡張され、実際にReducerの実行中Policyをswapするようになった。ここで検証するのは
+    // 3点：(1) op=deployの前後でop=policyが返す内容が実際に変わること（＝ライブ反映そのもの）、
+    // (2) swap前に観測され既にByPolicyで確定済みの窓（WindowId 1）は、新Policyの下でも遡って
+    // 再分類されないこと（ユーザー決定2026-11-06「再評価しない」、`Windows.fs`の`reconsider`の
+    // `Classified (_, ByPolicy _) -> record, [], [], []`がこれを保証する——追加実装は無い）、
+    // (3) swap後に新しく観測される窓（WindowId 2）は新Policyで分類されること。`DeployAsync`の
+    // `Task`はHost側で`activatePolicy`の`await`完了後にしか応答を返さないため、`deployResult27`を
+    // 受け取った時点でswap自体は既に完了している保証があり、追加の待機は不要（`Thread.Sleep`による
+    // タイミング依存を避ける、このセッションで繰り返し踏んだFrameInset/3-B系の教訓）。
+    printfn "\n--- Round 27: op=deploy actually swaps the Reducer's live Policy (PolicyActivated wiring) ---"
+    let journalPath27 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round27-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    let baseDir27 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round27-%s" (Guid.NewGuid().ToString("N")))
+    let reducer27 = Reducer(RuntimePolicy.defaults, "phase-b-round27", "wm-host-round27", "no-policy-artifact", Some journalPath27)
+    let residentHost27 = ResidentHost(reducer27, liveNow)
+    let loopThread27 = Thread(fun () -> residentHost27.Run(tickMs = 1))
+    loopThread27.IsBackground <- true
+    loopThread27.Start()
+    Thread.Sleep(50)
+
+    let testMonitor27: MonitorSnapshot =
+        { Id = MonitorId 0L
+          StableKey = "test-monitor-round27"
+          Bounds = { X = 0; Y = 0; Width = 1920; Height = 1080 }
+          WorkArea = { X = 0; Y = 0; Width = 1920; Height = 1080 }
+          Dpi = 96
+          IsPrimary = true }
+    let visibleWindowObserved27 (w: WindowId) : InputEvent =
+        WindowObserved
+            { Id = w
+              Process = None
+              AppIdentity = { Exe = None; HostExe = None; Aumid = None; CoreWindowExe = None }
+              Owner = None
+              IsDialog = None
+              NativeRect = None
+              VisibleFrameRect = None
+              IsVisible = Some { Value = Ok true; SampleSequence = 0L; MonotonicTime = 0L; Source = "round27" }
+              IsMinimized = None
+              IsMaximized = None
+              Style = None
+              Cloak = None
+              Monitor = None
+              MinWidthHint = None
+              TargetIntegrity = None
+              Responsiveness = None
+              Presence = None
+              DpiAwareness = None
+              TitleMatches = None }
+
+    residentHost27.Submit (liveNow ()) "round27" (MonitorTopologyObserved [ testMonitor27 ]) |> ignore
+    Thread.Sleep(900) // Settling(500ms)→Grace(250ms)、Round 22と同じ既定値待ち
+    // swap前に1つ観測・分類させておく（既定Policy、WindowRules無し→DefaultManagement=Tiled）。
+    // これが「swap後も遡って再分類されない」ことの確認対象になる。
+    residentHost27.Submit (liveNow ()) "round27" (visibleWindowObserved27 (WindowId 1L)) |> ignore
+    Thread.Sleep(100)
+
+    let pipeName27 = generatePipeName ()
+    match createRestrictedPipe pipeName27 with
+    | Error e ->
+        printfn "Round 27 FAILED (createRestrictedPipe): %s" e
+        residentHost27.RequestStop()
+        loopThread27.Join(3000) |> ignore
+    | Ok pipe27 ->
+        use pipe27 = pipe27
+        use cts27 = new CancellationTokenSource()
+        let ownRid27 = ownIntegrityRid ()
+
+        let discoveryWriteOk27 =
+            match writeDiscoveryFile pipeName27 with
+            | Ok () -> true
+            | Error _ -> false
+
+        let acceptThread27 =
+            Thread(fun () ->
+                runAcceptLoop pipe27 cts27.Token (fun p principal reqCt ->
+                    try
+                        (handleOneRequestAsync
+                            p
+                            principal
+                            ownRid27
+                            (fun () -> residentHost27.EnqueueSnapshotQuery().Result)
+                            (fun () -> residentHost27.Policy)
+                            (fun () -> residentHost27.RecentJournal(defaultJournalEntryCount))
+                            (fun w -> residentHost27.EnqueueExplainQuery(w))
+                            (fun c -> residentHost27.AnalyzeCandidate(c))
+                            (fun c -> deployCandidateOf baseDir27 reducer27.LayoutRegistry reducer27.JournalPath reducer27.SessionId reducer27.CoreBuildId (liveNow ()) residentHost27.EnqueueActivatePolicy c)
+                            reqCt)
+                            .GetAwaiter()
+                            .GetResult()
+                    with _ -> ()))
+        acceptThread27.IsBackground <- true
+        acceptThread27.Start()
+        Thread.Sleep(100)
+
+        let policyViaClient27 () : PolicyDto option =
+            match connectLocalAsync 2000 |> Async.AwaitTask |> Async.RunSynchronously with
+            | Error _ -> None
+            | Ok client ->
+                use client = client
+                match client.PolicyAsync() |> Async.AwaitTask |> Async.RunSynchronously with
+                | Ok p -> Some p
+                | Error _ -> None
+
+        let deployViaClient27 (candidate: PolicyDto) : DeployResultDto option =
+            match connectLocalAsync 2000 |> Async.AwaitTask |> Async.RunSynchronously with
+            | Error _ -> None
+            | Ok client ->
+                use client = client
+                match client.DeployAsync(candidate) |> Async.AwaitTask |> Async.RunSynchronously with
+                | Ok r -> Some r
+                | Error _ -> None
+
+        // 既定(WindowRules無し)から確実に区別できる新Policy：全窓をFloatingへ（AnyWindow、優先度1）。
+        let newCandidate27 =
+            policyDtoOf
+                { PolicyIR.defaults with
+                    WindowRules = [ { Id = PolicyRuleId "float-all-round27"; Priority = 1; When = AnyWindow; Apply = Floating } ] }
+
+        let policyBeforeDeploy27 = policyViaClient27 ()
+        let deployResult27 = deployViaClient27 newCandidate27
+        let policyAfterDeploy27 = policyViaClient27 ()
+
+        // swap後に新しい窓(WindowId 2)を観測→新Policy(Floating)で分類されるはず。
+        residentHost27.Submit (liveNow ()) "round27" (visibleWindowObserved27 (WindowId 2L)) |> ignore
+        Thread.Sleep(100)
+
+        let snapshotAfter27 =
+            match connectLocalAsync 2000 |> Async.AwaitTask |> Async.RunSynchronously with
+            | Error _ -> None
+            | Ok client ->
+                use client = client
+                match client.SnapshotAsync() |> Async.AwaitTask |> Async.RunSynchronously with
+                | Ok s -> Some s
+                | Error _ -> None
+
+        let managementOf (snap: SnapshotDto option) (w: WindowId) : Management option =
+            snap
+            |> Option.bind (fun s -> s.Windows |> List.tryFind (fun ws -> ws.Window = w))
+            |> Option.bind (fun ws -> ws.Management)
+
+        let deploySucceededOk27 =
+            match deployResult27 with
+            | Some(DeploySucceededDto _) -> true
+            | _ -> false
+
+        let policyLiveSwapOk27 =
+            match policyBeforeDeploy27, policyAfterDeploy27 with
+            | Some before, Some after -> List.isEmpty before.WindowRules && not (List.isEmpty after.WindowRules)
+            | _ -> false
+
+        let oldWindowNotReclassifiedOk27 = managementOf snapshotAfter27 (WindowId 1L) = Some Tiled
+        let newWindowUsesNewPolicyOk27 = managementOf snapshotAfter27 (WindowId 2L) = Some Floating
+
+        printfn
+            "Round 27 policy before=%A, deploy result=%A, policy after=%A, window1(old)=%A, window2(new)=%A"
+            policyBeforeDeploy27 deployResult27 policyAfterDeploy27
+            (managementOf snapshotAfter27 (WindowId 1L)) (managementOf snapshotAfter27 (WindowId 2L))
+
+        cts27.Cancel()
+        let acceptStopped27 = acceptThread27.Join(3000)
+        residentHost27.RequestStop()
+        let loopStopped27 = loopThread27.Join(3000)
+        removeDiscoveryFile ()
+        printfn
+            "Round 27 PASSED (op=deploy actually swaps the Reducer's live Policy through the real Named Pipe: op=policy reflects the new candidate right after op=deploy returns, a window already Classified by the old Policy before the swap is NOT retroactively reclassified, and a window observed after the swap IS classified under the new Policy): %b"
+            (discoveryWriteOk27
+             && deploySucceededOk27
+             && policyLiveSwapOk27
+             && oldWindowNotReclassifiedOk27
+             && newWindowUsesNewPolicyOk27
+             && acceptStopped27
+             && loopStopped27)
 
     printfn "\nDone."
     0
