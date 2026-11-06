@@ -21,6 +21,7 @@ open System.Threading
 open System.Threading.Tasks
 open System.Windows.Forms
 open Wm.Contracts.CoreCommand
+open Wm.Contracts.Identifiers
 open Wm.Contracts.SharedVocabulary
 open Wm.Core.Windows
 open Wm.Runtime.Reducer
