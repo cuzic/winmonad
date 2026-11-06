@@ -292,10 +292,13 @@ let handleOneRequestAsync
             match principal, ownRid with
             | Ok p, Some own -> p.IntegrityRid >= own
             | _ -> false
+        // TODO(診断用、v2.145のRound 20回帰調査): 原因が分かったら削除する。
+        printfn "handleOneRequestAsync: principal=%A ownRid=%A authorized=%b" principal ownRid authorized
         if authorized then
             let! requestBytes = readFramedMessageAsync pipe ct
             match parseRequest requestBytes with
-            | Error _ -> ()
+            | Error e ->
+                printfn "handleOneRequestAsync: parseRequest Error %s" e
             | Ok SnapshotRequest ->
                 let json = snapshotDtoToJson (getSnapshot ())
                 do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
