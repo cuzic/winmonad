@@ -4,11 +4,10 @@
 /// §10.1「REPL式はクライアント側で実行される」の原則どおり、`Wm.Core`/`Wm.Host`（net8.0-windows
 /// 専用）には一切依存しない（`Wm.Contracts`/`Wm.DebugProtocol`のみ、plain net8.0）。
 ///
-/// §10.3の概念コード（`let! wm = WmClient.connectLocalAsync ()`、`let! snapshot = wm.SnapshotAsync()`）
-/// のうち、今回実装するのは接続＋`SnapshotAsync`/`PolicyAsync`/`JournalAsync`/`ExplainAsync`
-/// （v2.145/v2.147）——Inspectの残り（Analyzer、§14のPinnedPolicy/DeployablePolicyが前提）・
-/// Fork/Probe/Intervene/Deployは後続のスライス（memory `project_named_pipe_ipc_task_breakdown.md`
-/// 参照）。
+/// §10.3の概念コード（`let! wm = WmClient.connectLocalAsync ()`、`let! snapshot = wm.SnapshotAsync()`、
+/// `let! diagnostics = wm.AnalyzeAsync(rules)`）のうち、Inspectの5操作（Snapshot/Policy/Journal/
+/// Explain/Analyzer、v2.145/v2.147/v2.149）を実装済み——Fork/Probe/Intervene/Deployは後続のスライス
+/// （memory `project_named_pipe_ipc_task_breakdown.md`参照）。
 module Wm.ReplClient.WmClient
 
 open System
@@ -28,6 +27,8 @@ open Wm.DebugProtocol.Journal
 open Wm.DebugProtocol.JournalJson
 open Wm.DebugProtocol.Explain
 open Wm.DebugProtocol.ExplainJson
+open Wm.DebugProtocol.Analyzer
+open Wm.DebugProtocol.AnalyzerJson
 open Wm.DebugProtocol.WireFraming
 
 /// 接続済みのクライアント。コンストラクタは`internal`——`connectAsync`/`connectLocalAsync`
@@ -80,6 +81,13 @@ type WmClient internal (pipe: NamedPipeClientStream) =
                 let (WindowId wid) = w
                 req.["window"] <- JsonValue.Create(wid))
             explainOptionOfJson
+
+    /// §10.2「Inspect」のうちAnalyzer（v2.149で追加、§14完成により前提解消）。§10.3
+    /// 「`wm.AnalyzeAsync(rules)`」——候補`PolicyDto`を送り、Hostが自分の採用中のLayout Registryに
+    /// 対して現行Analyzerで実際に分析した結果を受け取る。クライアントの自己申告（候補policyが
+    /// すでに分析済みだという主張）は無く、常にHost側で再実行する（§14と同じ原則）。
+    member this.AnalyzeAsync(candidate: PolicyDto) : Task<Result<AnalyzerReportDto, TransportError>> =
+        this.RequestAsync "analyze" (fun req -> req.["policy"] <- policyDtoToJson candidate) analyzerReportDtoOfJson
 
 /// パイプ名を直接知っている場合に使う経路。§10.1「クライアントは`TokenImpersonationLevel.Impersonation`
 /// で接続する」（F42、ユーザー決定2026-11-05——サーバーが`RunAsClient`で実トークンを読むにはこれが

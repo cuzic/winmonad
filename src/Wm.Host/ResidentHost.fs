@@ -28,8 +28,10 @@ open Wm.DebugProtocol.Snapshot
 open Wm.DebugProtocol.Policy
 open Wm.DebugProtocol.Journal
 open Wm.DebugProtocol.Explain
+open Wm.DebugProtocol.Analyzer
 open Wm.Policy.PolicyTypes
 open Wm.Policy.MonitorSelector
+open Wm.Policy.PolicyAnalyzer
 open Wm.Core.DecisionTrace
 open Wm.Layouts.LayoutRegistry
 open Wm.Layouts.PlanValidator
@@ -175,6 +177,26 @@ let private decisionTraceDtoOf (t: DecisionTrace) : DecisionTraceDto =
     | PlanRejected (layoutId, errors) -> PlanRejectedDto (layoutId, errors |> List.map validationErrorDtoOf)
     | FrameInsetApplied (requestId, desiredVisible, dispatchedNative) -> FrameInsetAppliedDto (requestId, desiredVisible, dispatchedNative)
 
+/// `Wm.Policy.PolicyAnalyzer.AnalyzerIssue`から`AnalyzerIssueDto`への射影（v2.149、Analyzer Inspect）。
+let private analyzerIssueDtoOf (issue: AnalyzerIssue) : AnalyzerIssueDto =
+    match issue with
+    | DuplicateWindowRuleId rid -> DuplicateWindowRuleIdDto rid
+    | DuplicateLayoutRuleId rid -> DuplicateLayoutRuleIdDto rid
+    | AnalyzerIssue.UnregisteredLayout(layoutId, apiVersion, ruleId) -> UnregisteredLayoutDto(layoutId, apiVersion, ruleId)
+    | InvalidMasterRatio(ratio, ruleId) -> InvalidMasterRatioDto(ratio, ruleId)
+    | InvalidColumnCount(count, ruleId) -> InvalidColumnCountDto(count, ruleId)
+    | DuplicateWorkspaceAssignment wsid -> DuplicateWorkspaceAssignmentDto wsid
+
+let private analyzerReportDtoOf (report: AnalyzerReport) : AnalyzerReportDto =
+    { Errors = report.Errors |> List.map analyzerIssueDtoOf }
+
+/// Analyzer Inspect（architecture.md §10.2、v2.149）：クライアントが送ってきた候補`PolicyDto`を、
+/// Hostが自分の採用中のLayout Registryに対して現行Analyzerで実際に分析する——§14「クライアントの
+/// 自己申告を信用しない」と同じ原則で、Analyzer自身の実行はこのスライスでも常にHost側で行う。
+let analyzeCandidateOf (registry: Registry) (candidate: PolicyDto) : AnalyzerReportDto =
+    let manifest = Registry.toManifest registry
+    analyzerReportDtoOf (Wm.Policy.PolicyAnalyzer.analyze manifest (policyIrOf candidate))
+
 /// Journal Inspect（architecture.md §10.2、v2.147）：直近`n`件を新しい順で返す。ユーザー決定
 /// 2026-11-05：カーソル型APIやセッション全体ではなく、シンプルに直近N件だけ。ファイルの読み取りと
 /// 同時刻の書き込み（`Reducer.Submit`が別スレッドから`appendEntry`する可能性）が競合する稀なケースは
@@ -225,6 +247,10 @@ type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
     /// ファイル自体への読み取りはReducer所有スレッドが書き込み中のものと競合しうる——
     /// `recentJournalOf`が例外を飲んで最善努力にしているので、キュー経由にせず直接読んでよい。
     member _.RecentJournal(n: int) : JournalDto = recentJournalOf reducer.JournalPath n
+
+    /// Analyzer Inspect（v2.149）。`reducer.LayoutRegistry`は`Policy`と同じ理由で不変の環境値なので
+    /// 直接読んでよい。
+    member _.AnalyzeCandidate(candidate: PolicyDto) : AnalyzerReportDto = analyzeCandidateOf reducer.LayoutRegistry candidate
 
     /// 他スレッド（将来のNamed Pipe接続スレッド）から呼ぶ。即座には解決しない——次の`Run`ループの
     /// イテレーションで、Reducer所有スレッドがキューを汲んで`SetResult`する。

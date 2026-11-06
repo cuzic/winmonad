@@ -104,6 +104,7 @@ open Wm.Host.InspectPipeServer
 open Wm.DebugProtocol.Snapshot
 open Wm.DebugProtocol.SnapshotJson
 open Wm.DebugProtocol.Explain
+open Wm.DebugProtocol.Analyzer
 open Wm.DebugProtocol.WireFraming
 open Wm.ReplClient.WmClient
 
@@ -1043,7 +1044,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe17 cts17.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid17 (fun () -> residentHost17.EnqueueSnapshotQuery().Result) (fun () -> residentHost17.Policy) (fun () -> residentHost17.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost17.EnqueueExplainQuery(w)) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid17 (fun () -> residentHost17.EnqueueSnapshotQuery().Result) (fun () -> residentHost17.Policy) (fun () -> residentHost17.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost17.EnqueueExplainQuery(w)) (fun c -> residentHost17.AnalyzeCandidate(c)) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread17.IsBackground <- true
         acceptThread17.Start()
@@ -1109,7 +1110,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoopWithTimeout pipe18 cts18.Token shortTimeoutMs18 (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid18 (fun () -> residentHost18.EnqueueSnapshotQuery().Result) (fun () -> residentHost18.Policy) (fun () -> residentHost18.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost18.EnqueueExplainQuery(w)) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid18 (fun () -> residentHost18.EnqueueSnapshotQuery().Result) (fun () -> residentHost18.Policy) (fun () -> residentHost18.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost18.EnqueueExplainQuery(w)) (fun c -> residentHost18.AnalyzeCandidate(c)) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread18.IsBackground <- true
         acceptThread18.Start()
@@ -1187,7 +1188,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe19 cts19.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid19 (fun () -> residentHost19.EnqueueSnapshotQuery().Result) (fun () -> residentHost19.Policy) (fun () -> residentHost19.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost19.EnqueueExplainQuery(w)) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid19 (fun () -> residentHost19.EnqueueSnapshotQuery().Result) (fun () -> residentHost19.Policy) (fun () -> residentHost19.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost19.EnqueueExplainQuery(w)) (fun c -> residentHost19.AnalyzeCandidate(c)) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread19.IsBackground <- true
         acceptThread19.Start()
@@ -1266,7 +1267,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe20 cts20.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid20 (fun () -> residentHost20.EnqueueSnapshotQuery().Result) (fun () -> residentHost20.Policy) (fun () -> residentHost20.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost20.EnqueueExplainQuery(w)) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid20 (fun () -> residentHost20.EnqueueSnapshotQuery().Result) (fun () -> residentHost20.Policy) (fun () -> residentHost20.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost20.EnqueueExplainQuery(w)) (fun c -> residentHost20.AnalyzeCandidate(c)) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread20.IsBackground <- true
         acceptThread20.Start()
@@ -1336,7 +1337,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe21 cts21.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid21 (fun () -> residentHost21.EnqueueSnapshotQuery().Result) (fun () -> residentHost21.Policy) (fun () -> residentHost21.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost21.EnqueueExplainQuery(w)) reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid21 (fun () -> residentHost21.EnqueueSnapshotQuery().Result) (fun () -> residentHost21.Policy) (fun () -> residentHost21.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost21.EnqueueExplainQuery(w)) (fun c -> residentHost21.AnalyzeCandidate(c)) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread21.IsBackground <- true
         acceptThread21.Start()
@@ -1449,6 +1450,7 @@ let main argv =
                             (fun () -> residentHost22.Policy)
                             (fun () -> residentHost22.RecentJournal(defaultJournalEntryCount))
                             (fun w -> residentHost22.EnqueueExplainQuery(w))
+                            (fun c -> residentHost22.AnalyzeCandidate(c))
                             reqCt)
                             .GetAwaiter()
                             .GetResult()
@@ -1560,6 +1562,7 @@ let main argv =
                             (fun () -> residentHost23.Policy)
                             (fun () -> residentHost23.RecentJournal(defaultJournalEntryCount))
                             (fun w -> residentHost23.EnqueueExplainQuery(w))
+                            (fun c -> residentHost23.AnalyzeCandidate(c))
                             reqCt)
                             .GetAwaiter()
                             .GetResult()
@@ -1717,6 +1720,91 @@ let main argv =
     printfn
         "Round 24 PASSED (§14 PolicyArtifact: canonical hash reproducible, save/load round-trip, Deploy accepts clean/rejects dirty via real Analyzer, link accepts registered/rejects unregistered Layout, Rollback trusts only Host's own activation record, report-only mode journals PolicyStaleAnalysis without blocking adoption): %b"
         allPassed24
+
+    // Round 25：Analyzer Inspect操作（v2.149、§14完成により前提解消）。クライアントが候補Policyを
+    // 送り、Hostが自分の採用中Layout Registryに対して現行Analyzerで実際に分析した結果（クリーン/
+    // 重複RuleIdで実際に拒否の両方）が、本物のNamed Pipeを通して正しく届くことを確認する。
+    printfn "\n--- Round 25: Analyzer Inspect op (op=analyze) analyzes a candidate Policy through the real Named Pipe ---"
+    let journalPath25 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round25-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    let reducer25 = Reducer(RuntimePolicy.defaults, "phase-b-round25", "wm-host-round25", "no-policy-artifact", Some journalPath25)
+    let residentHost25 = ResidentHost(reducer25, liveNow)
+    let loopThread25 = Thread(fun () -> residentHost25.Run(tickMs = 1))
+    loopThread25.IsBackground <- true
+    loopThread25.Start()
+    Thread.Sleep(50)
+
+    let pipeName25 = generatePipeName ()
+    match createRestrictedPipe pipeName25 with
+    | Error e ->
+        printfn "Round 25 FAILED (createRestrictedPipe): %s" e
+        residentHost25.RequestStop()
+        loopThread25.Join(3000) |> ignore
+    | Ok pipe25 ->
+        use pipe25 = pipe25
+        use cts25 = new CancellationTokenSource()
+        let ownRid25 = ownIntegrityRid ()
+
+        let discoveryWriteOk25 =
+            match writeDiscoveryFile pipeName25 with
+            | Ok () -> true
+            | Error _ -> false
+
+        let acceptThread25 =
+            Thread(fun () ->
+                runAcceptLoop pipe25 cts25.Token (fun p principal reqCt ->
+                    try
+                        (handleOneRequestAsync
+                            p
+                            principal
+                            ownRid25
+                            (fun () -> residentHost25.EnqueueSnapshotQuery().Result)
+                            (fun () -> residentHost25.Policy)
+                            (fun () -> residentHost25.RecentJournal(defaultJournalEntryCount))
+                            (fun w -> residentHost25.EnqueueExplainQuery(w))
+                            (fun c -> residentHost25.AnalyzeCandidate(c))
+                            reqCt)
+                            .GetAwaiter()
+                            .GetResult()
+                    with _ -> ()))
+        acceptThread25.IsBackground <- true
+        acceptThread25.Start()
+        Thread.Sleep(100)
+
+        let cleanCandidate25 = policyDtoOf { PolicyIR.defaults with WindowRules = PolicyIR.recommendedWindowRules }
+        let dirtyCandidate25 =
+            policyDtoOf
+                { PolicyIR.defaults with
+                    WindowRules =
+                        [ { Id = PolicyRuleId "dup-round25"; Priority = 1; When = AnyWindow; Apply = Tiled }
+                          { Id = PolicyRuleId "dup-round25"; Priority = 2; When = AnyWindow; Apply = Floating } ] }
+
+        let analyzeViaClient25 (candidate: PolicyDto) =
+            match connectLocalAsync 2000 |> Async.AwaitTask |> Async.RunSynchronously with
+            | Error _ -> None
+            | Ok client ->
+                use client = client
+                match client.AnalyzeAsync(candidate) |> Async.AwaitTask |> Async.RunSynchronously with
+                | Ok report -> Some report
+                | Error _ -> None
+
+        let cleanReport25 = analyzeViaClient25 cleanCandidate25
+        let dirtyReport25 = analyzeViaClient25 dirtyCandidate25
+
+        let cleanOk25 = match cleanReport25 with Some r -> List.isEmpty r.Errors | None -> false
+        let dirtyFlaggedOk25 =
+            match dirtyReport25 with
+            | Some r -> r.Errors |> List.exists (function DuplicateWindowRuleIdDto(PolicyRuleId "dup-round25") -> true | _ -> false)
+            | None -> false
+
+        printfn "Round 25 discovery write=%b, clean report=%A, dirty report=%A" discoveryWriteOk25 cleanReport25 dirtyReport25
+
+        cts25.Cancel()
+        let acceptStopped25 = acceptThread25.Join(3000)
+        residentHost25.RequestStop()
+        let loopStopped25 = loopThread25.Join(3000)
+        removeDiscoveryFile ()
+        printfn "Round 25 PASSED (op=analyze correctly reports a clean candidate Policy as clean and a dirty one (duplicate WindowRuleId) as flagged, through the real Named Pipe against the Host's own real Analyzer/Registry): %b"
+            (discoveryWriteOk25 && cleanOk25 && dirtyFlaggedOk25 && acceptStopped25 && loopStopped25)
 
     printfn "\nDone."
     0

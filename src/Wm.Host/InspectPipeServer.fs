@@ -42,6 +42,8 @@ open Wm.DebugProtocol.Journal
 open Wm.DebugProtocol.JournalJson
 open Wm.DebugProtocol.Explain
 open Wm.DebugProtocol.ExplainJson
+open Wm.DebugProtocol.Analyzer
+open Wm.DebugProtocol.AnalyzerJson
 open Wm.DebugProtocol.WireFraming
 
 module private Native =
@@ -260,6 +262,7 @@ type InspectRequest =
     | PolicyRequest
     | JournalRequest
     | ExplainRequest of WindowId
+    | AnalyzeRequest of PolicyDto
 
 /// Journal Inspect（v2.147）が返す直近件数。ユーザー決定2026-11-06：直近50〜100件、ここでは
 /// その中央寄りの値を既定にする。
@@ -281,6 +284,12 @@ let private parseRequest (bytes: byte[]) : Result<InspectRequest, string> =
             | "policy" -> Ok PolicyRequest
             | "journal" -> Ok JournalRequest
             | "explain" -> Ok(ExplainRequest(WindowId(root.GetProperty("window").GetInt64())))
+            | "analyze" ->
+                // `policyDtoOfJson`は`JsonNode`を要求する——外側のリクエスト全体は（この関数の既存の
+                // 流儀どおり）`JsonDocument`/`JsonElement`で読んでいるため、候補Policyの部分だけ
+                // `JsonNode.Parse`で再度読み直す（`GetRawText()`で元のJSON部分文字列を取り出す）。
+                let policyNode = JsonNode.Parse(root.GetProperty("policy").GetRawText())
+                Ok(AnalyzeRequest(policyDtoOfJson policyNode))
             | other -> Error(sprintf "unknown op '%s'" other)
     with ex ->
         Error(sprintf "malformed request: %s" ex.Message)
@@ -310,14 +319,13 @@ let private drainUntilClientClosesAsync (pipe: NamedPipeServerStream) (ct: Cance
 /// 1接続ぶんのInspectハンドラ本体。`principal`/`ownRid`による多層防御（カーネルのDACL/ラベルを
 /// 通過したはずの接続だが、ここでも「同一ユーザー・Host自身の整合性レベル以上」を再確認する）→
 /// 1件のリクエストを読む→各`get*`/`explainWindow`を呼んで応答する、という最小の往復を実装する。
-/// Inspect（§10.2「Snapshot、Policy、Journal、Explain、Analyzerを見る」）のうちSnapshot/Policy/
-/// Journal/Explainの4つがこのスライスまでの対象——Analyzerのみ後続（§14のPinnedPolicy/
-/// DeployablePolicyが前提のため、ユーザー決定2026-11-06で別の大きめのスライスへ切り出した）。
-/// `explainWindow`は`Task`を返す——`ResidentHost.EnqueueExplainQuery`がADR-012の単一スレッド
-/// アクセス不変条件を守るためキュー経由にしているため（`getSnapshot`/`getPolicy`/`getJournal`は
-/// 不変の環境値または最善努力の読み取りで、キュー不要）。`ct`は`runAcceptLoop`が接続ごとに
-/// `requestTimeoutMs`で組み立てたデッドライン（5-E対応）：読取・応答送信どちらが詰まっても
-/// このトークンの期限切れで中断される。
+/// Inspect（§10.2「Snapshot、Policy、Journal、Explain、Analyzerを見る」）の全5操作がこのスライス
+/// までの対象——§14（PinnedPolicy/DeployablePolicy、Analyzerの前提）がv2.148で実装済みになった
+/// ため、Analyzerもこのスライスで追加した。`explainWindow`は`Task`を返す——`ResidentHost.EnqueueExplainQuery`
+/// がADR-012の単一スレッドアクセス不変条件を守るためキュー経由にしているため（`getSnapshot`/
+/// `getPolicy`/`getJournal`/`analyzeCandidate`は不変の環境値または最善努力の読み取りで、キュー
+/// 不要）。`ct`は`runAcceptLoop`が接続ごとに`requestTimeoutMs`で組み立てたデッドライン（5-E対応）：
+/// 読取・応答送信どちらが詰まってもこのトークンの期限切れで中断される。
 let handleOneRequestAsync
     (pipe: NamedPipeServerStream)
     (principal: Result<ClientPrincipal, string>)
@@ -326,6 +334,7 @@ let handleOneRequestAsync
     (getPolicy: unit -> PolicyDto)
     (getJournal: unit -> JournalDto)
     (explainWindow: WindowId -> Task<ExplainDto option>)
+    (analyzeCandidate: PolicyDto -> AnalyzerReportDto)
     (ct: CancellationToken)
     : Task =
     task {
@@ -352,6 +361,10 @@ let handleOneRequestAsync
             | Ok(ExplainRequest w) ->
                 let! explain = explainWindow w
                 let json = explainOptionToJson explain
+                do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
+                do! drainUntilClientClosesAsync pipe ct
+            | Ok(AnalyzeRequest candidate) ->
+                let json = analyzerReportDtoToJson (analyzeCandidate candidate)
                 do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
                 do! drainUntilClientClosesAsync pipe ct
     }

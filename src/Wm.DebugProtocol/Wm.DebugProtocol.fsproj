@@ -13,6 +13,8 @@
     <Compile Include="JournalJson.fs" />
     <Compile Include="Explain.fs" />
     <Compile Include="ExplainJson.fs" />
+    <Compile Include="Analyzer.fs" />
+    <Compile Include="AnalyzerJson.fs" />
     <Compile Include="WireFraming.fs" />
   </ItemGroup>
 
