@@ -2485,7 +2485,7 @@ let main argv =
             HotkeyModifiers = MOD_CONTROL ||| MOD_SHIFT // CI実演用キーマップ。実アプリ衝突の懸念が無いCI実機だけで使う。
             MutexName = mutexName30
             RescanIntervalMs = 2_000L
-            HeartbeatTimeoutMs = 15_000L }
+            HeartbeatTimeoutMs = 20_000L }
 
     use testFormA30 = new Form(Text = "wm-host-round30-a", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(50, 50, 300, 200))
     use testFormB30 = new Form(Text = "wm-host-round30-b", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(400, 50, 300, 200))
@@ -2521,7 +2521,14 @@ let main argv =
         let mutable afterA30 = beforeA30
         let mutable afterB30 = beforeB30
         let deadline30 = Environment.TickCount64 + 15000L
+        // `testFormA30`/`testFormB30`はこのスレッド（main/Round30のテストスレッド）が所有している
+        // ため、別スレッド（`wmThread`）の`observeWindow`が`GetWindowTextW`（`WM_GETTEXT`を
+        // クロススレッドでSendMessageする）等でこの窓を問い合わせるたびに、このスレッドが
+        // メッセージを汲み続けないと応答できない——`Application.DoEvents()`を外すと`wmThread`側が
+        // 永久にブロックする自己デッドロックになる（実機CIで実際に踏んだ、既存の全ラウンドが
+        // `pump`/`DoEvents`を欠かさない理由と同じ地雷）。
         while Environment.TickCount64 < deadline30 && (afterA30 = beforeA30 || afterB30 = beforeB30) do
+            Application.DoEvents()
             Thread.Sleep(50)
             afterA30 <- rectOf30 testFormA30
             afterB30 <- rectOf30 testFormB30
@@ -2530,9 +2537,20 @@ let main argv =
         // 問2：LOCATIONCHANGEのdirty集合合流が機能し、一度安定したら再ディスパッチが続かない
         // （v2.122の既存の「既にtargetと一致する発見はSetRectを発行しない」規律が、この新しい
         // 常駐経路でも壊れていない）ことを確認する。
-        Thread.Sleep(3000)
+        for _ in 1 .. 60 do
+            Application.DoEvents()
+            Thread.Sleep(50)
         let stableA30 = rectOf30 testFormA30 = afterA30
         let stableB30 = rectOf30 testFormB30 = afterB30
+
+        // ここから先のホットキー終了・再起動の検証は自作テスト窓を一切必要としない——むしろ
+        // 残したままだと、再起動する3台目の`wmThread`がこの2枚を再度`GetWindowTextW`で問い合わせ、
+        // それは実質`SendMessage(WM_GETTEXT)`としてこのテストスレッド（別スレッド所有）への配送を
+        // 要求する。このテストスレッドが以後`DoEvents`を呼ばない区間があれば自己デッドロックになる
+        // （このRound自体が実機CIで最初に踏んだ地雷と同じ種類）——先に閉じて対象を無くす。
+        testFormA30.Close()
+        testFormB30.Close()
+        Application.DoEvents()
 
         // ホットキーでの終了（CI実演用キーマップ：Ctrl+Shift+Q）を実際に押して確認する。
         let pressChord30 (modifiers: byte list) (key: byte) =

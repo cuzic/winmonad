@@ -110,6 +110,22 @@ extern bool QueryFullProcessImageNameW(IntPtr hProcess, uint32 dwFlags, System.T
 [<DllImport("user32.dll", CharSet = CharSet.Unicode)>]
 extern int GetWindowTextW(IntPtr hWnd, System.Text.StringBuilder lpString, int nMaxCount)
 
+// 常駐ループ化（`Wm.Host.ResidentLoop`）で実際に露見した地雷：`GetWindowTextW`は対象窓が別スレッド
+// （自プロセス内の別スレッド、または別プロセス）が所有する場合`WM_GETTEXT`を内部で`SendMessage`する
+// （素のGetWindowTextWは成否もタイムアウトも扱えない）。対象の所有スレッドがメッセージを汲み続けて
+// いない（ハングしている、または単にポンプを呼んでいない——どちらも送信側からは区別できない）と
+// `GetWindowTextW`はその場で無期限にブロックする。これは本行追加時点で初めて実機CIで踏んだ
+// （Round 30で自プロセス別スレッド所有の自作テスト窓を問い合わせて実際にデッドロックした）が、
+// 実運用では「ハングした実アプリの窓のタイトルを問い合わせる」という、この設計がそもそも避けたい
+// シナリオでも同じ理由で発生しうる既存の潜在的な穴だった（90行目付近の`IsHungAppWindow`の
+// コメントが「`SendMessageTimeout`のような実際に待つ確認は後回し」と明記していた、その後回しが
+// この時点まで一度も実装されていなかった）。`SendMessageTimeoutW`+`SMTO_ABORTIFHUNG`で置き換える。
+[<DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)>]
+extern IntPtr SendMessageTimeoutW(IntPtr hWnd, uint32 Msg, IntPtr wParam, System.Text.StringBuilder lParam, uint32 fuFlags, uint32 uTimeout, IntPtr& lpdwResult)
+
+let WM_GETTEXT = 0x000Du
+let SMTO_ABORTIFHUNG = 0x0002u
+
 let PROCESS_QUERY_LIMITED_INFORMATION = 0x1000u
 
 // Phase B ラウンド7：ホットキー（architecture.md §8.1、Phase 0のF11で`Alt+J`等がCI実機で

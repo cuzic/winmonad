@@ -164,13 +164,25 @@ let private queryExePath (hWnd: IntPtr) : Result<string, NativeCallRecord> =
             CloseHandle(hProcess) |> ignore
 
 /// 生のタイトル文字列（R4-8：`WindowSnapshot`へ一切載せない。呼び出し側(`attachTitleMatches`)が
-/// 即座に`TitleMatchVector`へ変換してから捨てる、一時的な戻り値専用）。`GetWindowTextW`の戻り値0は
-/// 「タイトルが空」という正当な結果であり得る（オーナー窓等）ので、`queryVisible`等と同じ理由で
-/// 常に`Ok`（失敗シグナルとして扱わない）。
+/// 即座に`TitleMatchVector`へ変換してから捨てる、一時的な戻り値専用）。
+///
+/// 常駐ループ化で実際に踏んだ地雷（`Native.fs`の`SendMessageTimeoutW`直前のコメント参照）：
+/// 素の`GetWindowTextW`は対象窓の所有スレッドへ`WM_GETTEXT`を`SendMessage`するため、その
+/// 所有スレッドがメッセージを汲み続けていない（本当にハングしている、または単にこの瞬間ポンプを
+/// 呼んでいない——送信側からは区別できない）と無期限にブロックする。`SendMessageTimeoutW`＋
+/// `SMTO_ABORTIFHUNG`＋短いタイムアウトで置き換え、タイムアウト・ハング検知時は`Error`を返す
+/// （`queryVisible`等と違い、この失敗は「タイトルが空」という正当な結果と区別する必要がある——
+/// `LatestWins`信念は`Error`を「今回は学習できなかった」として前の値を保つ、§4.5の既定どおり）。
 let queryRawTitleForPolicyMatching (hWnd: IntPtr) : Result<string, NativeCallRecord> =
+    let sw = Stopwatch.StartNew()
     let sb = Text.StringBuilder(512)
-    GetWindowTextW(hWnd, sb, sb.Capacity) |> ignore
-    Ok (sb.ToString())
+    let mutable rawResult = IntPtr.Zero
+    let sent = SendMessageTimeoutW(hWnd, WM_GETTEXT, IntPtr sb.Capacity, sb, SMTO_ABORTIFHUNG, 200u, &rawResult)
+    sw.Stop()
+    if sent <> IntPtr.Zero then
+        Ok (sb.ToString())
+    else
+        Error { Api = "SendMessageTimeoutW(WM_GETTEXT)"; Space = Win32LastError; Code = Marshal.GetLastWin32Error(); ElapsedUs = elapsedUsOf sw }
 
 /// P0-2（Opus敵対的相談`opus-review-resident-daemon.md`）：Core（`Wm.Core.Windows.isCandidate`の
 /// 型直前のコメント）は「非ツール窓（`WS_EX_TOOLWINDOW`相当）はShellの列挙時点で既に除外されている
