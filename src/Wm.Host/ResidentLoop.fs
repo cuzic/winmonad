@@ -128,12 +128,14 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
         Error "another winmonad --resident instance is already running (named mutex held)"
     else
 
+    eprintfn "[wm-host-resident-debug] mutex acquired"
     Directory.CreateDirectory(config.AppDataDir) |> ignore
     let journalPath = Path.Combine(config.AppDataDir, "wm-host-resident.ndjson")
     let runtimePolicy = { RuntimePolicy.defaults with Policy = config.Policy; PatternSet = buildTitlePatternSet config.Policy }
     let reducer = Reducer(runtimePolicy, "wm-host-resident", "wm-host-resident", "no-policy-artifact", Some journalPath)
     let sw = Stopwatch.StartNew()
     let liveNow () = sw.ElapsedMilliseconds
+    eprintfn "[wm-host-resident-debug] reducer constructed"
 
     let hiddenHwnds = ConcurrentDictionary<IntPtr, unit>()
     let dirty = ConcurrentDictionary<IntPtr, unit>()
@@ -141,6 +143,7 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
     let mutable lastRescanAt = Environment.TickCount64
     let mutable monitorHandles = enumerateMonitorHandles ()
     let titleMatcher = computeTitleMatchVector runtimePolicy.PatternSet
+    eprintfn "[wm-host-resident-debug] monitor handles enumerated: %d" monitorHandles.Length
 
     // `handleTick`/`handleEvent`は`ResidentHost`自身を閉じ込めたいが、`ResidentHost`の構築には
     // そのフックを渡す必要がある（前方参照）——可変セル経由で後から結び付ける。
@@ -179,6 +182,7 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
 
     let residentHost = ResidentHost(reducer, liveNow, onDispatch = handleDispatch, onTick = handleTick)
     residentHostCell <- Some residentHost
+    eprintfn "[wm-host-resident-debug] residentHost constructed"
 
     // P0-2：`isManageableTopLevel`はCREATEだけでなく、ほぼ全イベント種別の前段で確認する——
     // `Wm.Core.Windows.withRecord`は未知の`WindowId`に対しても`WindowRecord.initial`を既定値に
@@ -259,6 +263,7 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
     watchdogThread.IsBackground <- true
     watchdogThread.Name <- "wm-host-resident-watchdog"
     watchdogThread.Start()
+    eprintfn "[wm-host-resident-debug] watchdog thread started"
 
     // Named Pipe（Phase C）。失敗しても常駐ループ自体は続ける——配置機能はIPCに依存しない。
     let pipeName = generatePipeName ()
@@ -299,6 +304,7 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
             acceptThread.IsBackground <- true
             acceptThread.Name <- "wm-host-resident-pipe-accept"
             acceptThread.Start()
+            eprintfn "[wm-host-resident-debug] pipe accept thread started"
             Some acceptThread, Some pipe
 
     // 問1：フック登録・ホットキー窓の生成・初回のフル列挙・`Run()`の呼び出しは、すべて
@@ -307,6 +313,8 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
     // `Application.DoEvents()`の中でメッセージを取り出す時にだけ配送されるため）。
     let wmThread =
         Thread(fun () ->
+          try
+            eprintfn "[wm-host-resident-debug] wmThread started, apartment=%A" (Thread.CurrentThread.GetApartmentState())
             // ウォッチドッグ（問4）の心拍は`Run()`開始後は`handleTick`が1tickごとに更新するが、
             // `Run()`開始前のセットアップ（フック登録・ホットキー登録・初回のフル列挙——実窓数に
             // 比例し、busy desktopでは未検証なだけ遅くなりうる、opus-review-resident-daemon.md
@@ -323,9 +331,11 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
                             dirty.[hwnd] <- ()
                     with _ -> ())
             lastHeartbeat <- Environment.TickCount64
+            eprintfn "[wm-host-resident-debug] hooks registered"
 
             let hotkeyForm = new ResidentHotkeyForm(onHotkey, onDisplayChange, onEndSession)
             hotkeyForm.Show()
+            eprintfn "[wm-host-resident-debug] hotkeyForm shown"
             let hotkeyRegistrations =
                 [ 1, uint32 VK_J, "FocusNext"
                   2, uint32 VK_K, "SwapWithMaster"
@@ -336,15 +346,20 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
             for name, ok in hotkeyRegistrations do
                 if not ok then eprintfn "[wm-host-resident] RegisterHotKey failed for %s (already bound by another app?)" name
             lastHeartbeat <- Environment.TickCount64
+            eprintfn "[wm-host-resident-debug] hotkeys registered: %A" hotkeyRegistrations
 
             // 初回のフル列挙（フック・ホットキー登録の後、`Run()`の前）。1件ごとに心拍を打つので、
             // 窓数が多い実デスクトップでも合計時間ではなく1窓あたりの観測コストだけが基準になる。
             submit (liveNow ()) "wm-host-resident" (MonitorTopologyObserved (enumerateMonitors monitorHandles))
             lastHeartbeat <- Environment.TickCount64
-            for snapshot in enumerateTopLevelWindows (liveNow ()) monitorHandles titleMatcher do
+            eprintfn "[wm-host-resident-debug] monitors submitted, enumerating top-level windows..."
+            let windows0 = enumerateTopLevelWindows (liveNow ()) monitorHandles titleMatcher
+            eprintfn "[wm-host-resident-debug] enumerated %d manageable top-level windows" windows0.Length
+            for snapshot in windows0 do
                 for input in normalize (RawFirstSeen snapshot) do
                     submit (liveNow ()) "wm-host-resident" input
                 lastHeartbeat <- Environment.TickCount64
+            eprintfn "[wm-host-resident-debug] initial enumeration submitted, entering Run()"
 
             try
                 residentHost.Run(tickMs = config.TickMs)
@@ -365,7 +380,9 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
                 for KeyValue(hwnd, _) in hiddenHwnds do
                     try ShowWindowAsync(hwnd, SW_RESTORE) |> ignore with _ -> ()
                 removeDiscoveryFile ()
-                mutex.Dispose())
+                mutex.Dispose()
+          with ex ->
+            eprintfn "[wm-host-resident-debug] FATAL in wmThread: %s" (ex.ToString()))
     wmThread.IsBackground <- true
     wmThread.Name <- "wm-host-resident-wm"
     // `Form`/`RegisterHotKey`はWinFormsの一般的な前提としてSTAを要求する——既存のRound 2/7等は
