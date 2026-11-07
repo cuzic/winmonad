@@ -188,6 +188,19 @@ let main argv =
     // 呼ぶ必要がある。
     Application.SetHighDpiMode(HighDpiMode.PerMonitorV2) |> ignore
 
+    // `--resident --policy=observe|recommended`：常駐ループ（`Wm.Host.ResidentLoop`、
+    // opus-review-resident-daemon.md）。既存の無引数デフォルト（Round 1〜29の直列実行、
+    // `phase-b-shell.yml`が前提にしている）は変更しない——`--resident`は明示的な別モードとして
+    // 分岐する。`--policy`は必須（Opus敵対的相談の推奨：段階移行を強制する）。
+    if argv.Length > 0 && argv.[0] = "--resident" then
+        let policyArg = argv |> Array.tryFind (fun a -> a.StartsWith("--policy="))
+        match policyArg |> Option.map (fun a -> a.Substring("--policy=".Length)) with
+        | Some "observe" -> exit (Wm.Host.ResidentLoop.run (Wm.Host.ResidentLoop.ResidentConfig.defaultFor Wm.Host.ResidentLoop.Observe))
+        | Some "recommended" -> exit (Wm.Host.ResidentLoop.run (Wm.Host.ResidentLoop.ResidentConfig.defaultFor Wm.Host.ResidentLoop.Recommended))
+        | _ ->
+            eprintfn "usage: Wm.Host.exe --resident --policy=observe|recommended"
+            exit 1
+
     let journalPath = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round1-%s.ndjson" (Guid.NewGuid().ToString("N")))
     printfn "Phase B round 1+2: real-Windows observation slice"
     printfn "Journal: %s" journalPath
@@ -2450,6 +2463,102 @@ let main argv =
              && revisionOk29
              && acceptStopped29
              && loopStopped29)
+
+    // Round 30：常駐ループ（`--resident`、`Wm.Host.ResidentLoop`）の配線が実際に動くことを、
+    // §7.1の規律（実アンビエント窓を実際に動かす実験は自作テスト窓・隔離Reducerだけが対象）を
+    // 守ったまま確認する。Opus敵対的相談`opus-review-resident-daemon.md`の推奨どおり、
+    // 「CI専用の分岐」を作らず、Policy自体で対象を絞る——`DefaultManagement = Excluded`＋
+    // `AppIs(Exe, 自分のexe) -> Tiled`にすれば、本番と同じ`ResidentLoop.startResident`経路を、
+    // アンビエント窓には一切作用させないまま実行できる。
+    printfn "\n--- Round 30: --resident daemon loop wiring (hooks before enumerate, P0-1/P0-2 fixes, watchdog, clean shutdown, single-instance) ---"
+    let ownExePath30 = Process.GetCurrentProcess().MainModule.FileName
+    let policy30 =
+        { PolicyIR.defaults with
+            DefaultManagement = Excluded
+            WindowRules = [ { Id = PolicyRuleId "round30-self"; Priority = 1; When = AppIs (Exe, ownExePath30); Apply = Tiled } ] }
+    let appDataDir30 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round30-%s" (Guid.NewGuid().ToString("N")))
+    let mutexName30 = sprintf "wm-host-round30-mutex-%s" (Guid.NewGuid().ToString("N"))
+    let config30 =
+        { Wm.Host.ResidentLoop.ResidentConfig.defaultFor Wm.Host.ResidentLoop.Observe with
+            Policy = policy30
+            AppDataDir = appDataDir30
+            HotkeyModifiers = MOD_CONTROL ||| MOD_SHIFT // CI実演用キーマップ。実アプリ衝突の懸念が無いCI実機だけで使う。
+            MutexName = mutexName30
+            RescanIntervalMs = 2_000L
+            HeartbeatTimeoutMs = 2_000L }
+
+    use testFormA30 = new Form(Text = "wm-host-round30-a", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(50, 50, 300, 200))
+    use testFormB30 = new Form(Text = "wm-host-round30-b", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(400, 50, 300, 200))
+    testFormA30.Show()
+    testFormB30.Show()
+    for _ in 1 .. 10 do
+        Application.DoEvents()
+        Thread.Sleep(20)
+
+    let rectOf30 (form: Form) : RECT =
+        let mutable r = RECT()
+        GetWindowRect(form.Handle, &r) |> ignore
+        r
+    let beforeA30 = rectOf30 testFormA30
+    let beforeB30 = rectOf30 testFormB30
+
+    match Wm.Host.ResidentLoop.startResident config30 with
+    | Error e ->
+        printfn "Round 30 FAILED (startResident): %s" e
+        printfn "Round 30 PASSED (...): false"
+    | Ok handle30 ->
+        // 問5：単一インスタンス強制——同じMutexNameでの2台目は拒否されるはず。
+        let secondInstanceRejected30 =
+            match Wm.Host.ResidentLoop.startResident config30 with
+            | Error _ -> true
+            | Ok secondHandle30 ->
+                secondHandle30.RequestStop()
+                secondHandle30.WaitForExit(3000) |> ignore
+                false
+
+        // フック登録→ホットキー登録→初回のフル列挙→Run()が実際に進み、自作窓2枚だけがTiled判定
+        // され、実際にSetRectが発行されて矩形が動くまで待つ（既存ラウンドと同じ実時間ポーリング）。
+        let mutable afterA30 = beforeA30
+        let mutable afterB30 = beforeB30
+        let deadline30 = Environment.TickCount64 + 5000L
+        while Environment.TickCount64 < deadline30 && (afterA30 = beforeA30 || afterB30 = beforeB30) do
+            Thread.Sleep(50)
+            afterA30 <- rectOf30 testFormA30
+            afterB30 <- rectOf30 testFormB30
+        let dispatchedRealSetRect30 = afterA30 <> beforeA30 && afterB30 <> beforeB30
+
+        // 問2：LOCATIONCHANGEのdirty集合合流が機能し、一度安定したら再ディスパッチが続かない
+        // （v2.122の既存の「既にtargetと一致する発見はSetRectを発行しない」規律が、この新しい
+        // 常駐経路でも壊れていない）ことを確認する。
+        Thread.Sleep(3000)
+        let stableA30 = rectOf30 testFormA30 = afterA30
+        let stableB30 = rectOf30 testFormB30 = afterB30
+
+        // ホットキーでの終了（CI実演用キーマップ：Ctrl+Shift+Q）を実際に押して確認する。
+        let pressChord30 (modifiers: byte list) (key: byte) =
+            for m in modifiers do keybd_event (m, 0uy, 0u, UIntPtr.Zero)
+            keybd_event (key, 0uy, 0u, UIntPtr.Zero)
+            keybd_event (key, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
+            for m in List.rev modifiers do keybd_event (m, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
+        pressChord30 [ VK_LCONTROL; VK_LSHIFT ] VK_Q
+        for _ in 1 .. 20 do
+            Application.DoEvents()
+            Thread.Sleep(50)
+        let exitedCleanly30 = handle30.WaitForExit(5000)
+
+        // Mutex解放後の再起動が成功することを確認する（正常終了時の後片付けが本当に完了した証拠）。
+        let restartAfterCleanShutdownOk30 =
+            match Wm.Host.ResidentLoop.startResident config30 with
+            | Ok handle30b ->
+                handle30b.RequestStop()
+                handle30b.WaitForExit(3000)
+            | Error _ -> false
+
+        printfn "Round 30 summary: dispatchedRealSetRect=%b stable(A=%b,B=%b) secondInstanceRejected=%b exitedCleanly=%b restartAfterCleanShutdownOk=%b"
+            dispatchedRealSetRect30 stableA30 stableB30 secondInstanceRejected30 exitedCleanly30 restartAfterCleanShutdownOk30
+        printfn
+            "Round 30 PASSED (--resident hooks real WinEvents before enumerating, admits only self-created top-level windows via the fixed IsDialog/isManageableTopLevel path, dispatches a real SetRect under a recommendedWindowRules-style Policy, settles without a redispatch loop, enforces single-instance, and shuts down cleanly on its own hotkey): %b"
+            (dispatchedRealSetRect30 && stableA30 && stableB30 && secondInstanceRejected30 && exitedCleanly30 && restartAfterCleanShutdownOk30)
 
     printfn "\nDone."
     0

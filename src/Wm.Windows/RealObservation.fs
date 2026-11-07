@@ -172,6 +172,34 @@ let queryRawTitleForPolicyMatching (hWnd: IntPtr) : Result<string, NativeCallRec
     GetWindowTextW(hWnd, sb, sb.Capacity) |> ignore
     Ok (sb.ToString())
 
+/// P0-2（Opus敵対的相談`opus-review-resident-daemon.md`）：Core（`Wm.Core.Windows.isCandidate`の
+/// 型直前のコメント）は「非ツール窓（`WS_EX_TOOLWINDOW`相当）はShellの列挙時点で既に除外されている
+/// 前提」と明記しているが、この判定を実装するコードがどこにも無かった——システム全体のWinEvent購読
+/// （`EVENT_OBJECT_CREATE`/`SHOW`は`idObject = OBJID_WINDOW`のままボタン等の子コントロールにも発火
+/// する）やトップレベル窓の全体列挙に、子窓・ツール窓が素通りしていた。`enumerateTopLevelWindows`と
+/// 常駐ループのライブイベント経路の両方から呼ぶ。
+let isManageableTopLevel (hWnd: IntPtr) : bool =
+    GetAncestor(hWnd, GA_ROOT) = hWnd
+    && (GetWindowLong(hWnd, GWL_STYLE) &&& WS_CHILD) = 0
+    && (GetWindowLong(hWnd, GWL_EXSTYLE) &&& WS_EX_TOOLWINDOW) = 0
+
+let private queryOwner (hWnd: IntPtr) : Result<WindowId option, NativeCallRecord> =
+    let owner = GetWindow(hWnd, GW_OWNER)
+    Ok (if owner = IntPtr.Zero then None else Some (WindowId (owner.ToInt64())))
+
+/// P0-1（Opus敵対的相談`opus-review-resident-daemon.md`）：`IsDialog`が`None`固定だったため、
+/// `PolicyIR.recommendedWindowRules`の`DialogIs true -> Floating`（Priority 50）が常に`Unformed`で
+/// 止まり、他の全ての実窓が`AwaitingEvidence`→`ClassificationTimeoutMs`後に`Floating`へ落ちていた
+/// （`DefaultManagement = Tiled`が実窓では一切効かない、「何もタイルしないWM」になっていた）。
+/// ダイアログクラス（`#32770`、`MessageBox`/コモンダイアログが使う標準クラス名）と
+/// `WS_EX_DLGMODALFRAME`のいずれかを満たせばダイアログとみなす——`queryVisible`等と同じ理由で
+/// 常に`Ok`（「ダイアログではない」も正当な結果であり、失敗ではない）。
+let private queryIsDialog (hWnd: IntPtr) : Result<bool, NativeCallRecord> =
+    let sb = Text.StringBuilder(256)
+    GetClassNameW(hWnd, sb, sb.Capacity) |> ignore
+    let exStyle = GetWindowLong(hWnd, GWL_EXSTYLE)
+    Ok (sb.ToString() = "#32770" || (exStyle &&& WS_EX_DLGMODALFRAME) <> 0)
+
 let queryMonitor (monitorHandles: IntPtr list) (hWnd: IntPtr) : Result<MonitorId, NativeCallRecord> =
     let hMonitor = MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST)
     match monitorIdOf monitorHandles hMonitor with
@@ -193,8 +221,8 @@ let observeWindow (now: int64) (monitorHandles: IntPtr list) (titleMatcher: stri
     { Id = w
       Process = None
       AppIdentity = { Exe = Some (obs now (queryExePath hWnd)); HostExe = None; Aumid = None; CoreWindowExe = None }
-      Owner = None
-      IsDialog = None
+      Owner = Some (obs now (queryOwner hWnd))
+      IsDialog = Some (obs now (queryIsDialog hWnd))
       NativeRect = Some (obs now nativeRectResult)
       VisibleFrameRect = Some (obs now (queryVisibleFrameRect hWnd))
       IsVisible = Some (obs now (queryVisible hWnd))
@@ -222,4 +250,4 @@ let enumerateTopLevelWindows (now: int64) (monitorHandles: IntPtr list) (titleMa
     let hwnds = ResizeArray<IntPtr>()
     let cb = EnumChildProc(fun hWnd _ -> hwnds.Add(hWnd) |> ignore; true)
     EnumWindows(cb, IntPtr.Zero) |> ignore
-    hwnds |> Seq.map (observeWindow now monitorHandles titleMatcher) |> List.ofSeq
+    hwnds |> Seq.filter isManageableTopLevel |> Seq.map (observeWindow now monitorHandles titleMatcher) |> List.ofSeq

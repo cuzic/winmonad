@@ -21,6 +21,7 @@ open System.Threading
 open System.Threading.Tasks
 open System.Windows.Forms
 open Wm.Contracts.CoreCommand
+open Wm.Contracts.ErrorTypes
 open Wm.Core.WmState
 open Wm.Core.Windows
 open Wm.Runtime.Reducer
@@ -295,8 +296,13 @@ let explainOf (registry: Wm.Core.Windows.WindowRegistry) (recentTrace: DecisionT
 
 /// Reducerを1つ所有し、常駐ループとして回り続ける骨格。`Run()`を呼んだスレッドだけがReducer状態へ
 /// 触れる（ADR-012の単一スレッドアクセス不変条件をSnapshotクエリにも適用する）。
-type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
-    let harness = EffectHarness(reducer, liveNow)
+/// `onDispatch`/`onTick`は常駐ループ化（`Wm.Host.ResidentLoop`、opus-review-resident-daemon.md）向けの
+/// 追加の任意フック——既存の29ラウンドはどちらも渡さないため、挙動は完全に変わらない（`EffectHarness`
+/// 自身の`?onDispatch`/`?onSkip`と同じ追加の仕方）。`onDispatch`は`SetPresence`等のEffect適用結果を
+/// 監視して「直前に隠した窓」を追跡する用途（§8.4のウォッチドッグ復旧、Round 12と同じ形）、
+/// `onTick`は`Run`の1ループごとに呼ばれ、ハートビート更新やLOCATIONCHANGEの合流処理（問2）に使う。
+type ResidentHost(reducer: Reducer, liveNow: unit -> int64, ?onDispatch: Effect -> Result<unit, NativeCallRecord> -> unit, ?onTick: unit -> unit) =
+    let harness = EffectHarness(reducer, liveNow, ?onDispatch = onDispatch)
     let queries = ConcurrentQueue<SnapshotQuery>()
     let explainQueries = ConcurrentQueue<ExplainQuery>()
     let tryPolicyQueries = ConcurrentQueue<TryPolicyQuery>()
@@ -388,6 +394,11 @@ type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
     /// （WinEventコールバック等、既存Round群と同じ使い方）。
     member _.Submit (now: int64) (source: string) (input: InputEvent) = harness.Submit now source input
 
+    /// `Run()`を回しているスレッド（WinEvent/ホットキーのコールバックも同じスレッド上で配送される、
+    /// `opus-review-resident-daemon.md`問1）からだけ読む想定——`Policy`/`RecentJournal`と違い、
+    /// `State`自体は可変（ADR-012）なので、他スレッドからの読み取りはこの型が保証する安全性の外。
+    member _.Reducer = reducer
+
     /// 呼び出したスレッドをブロックして常駐ループを回す。`RequestStop()`が呼ばれるまで戻らない
     /// （`Application.DoEvents()`でメッセージポンプする既存の確立済み方式——EffectHarness.Pumpと同じ
     /// 土台を、固定時間ではなく`RequestStop`まで無期限に続ける点だけが違う）。
@@ -428,5 +439,6 @@ type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
                 let seq = reducer.Sequence
                 let result = harness.Submit (liveNow ()) "intervene" (InterveneRequested req)
                 tcs.SetResult(interveneResultDtoOf seq result)
+            onTick |> Option.iter (fun f -> f ())
             Thread.Sleep(tickMs)
         harness.Stop()

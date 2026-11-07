@@ -133,11 +133,42 @@ extern IntPtr GetForegroundWindow()
 let WM_HOTKEY = 0x0312
 let MOD_CONTROL = 0x0002u
 let MOD_SHIFT = 0x0004u
+let MOD_ALT = 0x0001u
 let KEYEVENTF_KEYUP = 2u
 let VK_LCONTROL = 0xA2uy
 let VK_LSHIFT = 0xA0uy
 let VK_J = 0x4Auy
 let VK_K = 0x4Buy
+let VK_Q = 0x51u
+let VK_1 = 0x31u
+let VK_2 = 0x32u
+
+// 常駐ループ化（`Wm.Host.ResidentLoop`、opus-review-resident-daemon.md）向けに追加。
+let WM_DISPLAYCHANGE = 0x007Eu
+let WM_QUERYENDSESSION = 0x0011u
+let WM_ENDSESSION = 0x0016u
+
+type ConsoleCtrlDelegate = delegate of uint32 -> bool
+
+[<DllImport("kernel32.dll", SetLastError = true)>]
+extern bool SetConsoleCtrlHandler(ConsoleCtrlDelegate handler, bool add)
+
+let CTRL_C_EVENT = 0u
+let CTRL_BREAK_EVENT = 1u
+let CTRL_CLOSE_EVENT = 2u
+
+[<DllImport("kernel32.dll", SetLastError = true)>]
+extern IntPtr GetStdHandle(int nStdHandle)
+
+[<DllImport("kernel32.dll", SetLastError = true)>]
+extern bool GetConsoleMode(IntPtr hConsoleHandle, uint32& lpMode)
+
+[<DllImport("kernel32.dll", SetLastError = true)>]
+extern bool SetConsoleMode(IntPtr hConsoleHandle, uint32 dwMode)
+
+let STD_INPUT_HANDLE = -10
+let ENABLE_QUICK_EDIT_MODE = 0x0040u
+let ENABLE_EXTENDED_FLAGS = 0x0080u
 
 // Phase B ラウンド10：`RequestClose`（§8.4「窓を破壊・終了するEffectを提供しない」、WM_CLOSEによる
 // 丁寧な要求——アプリは`WM_CLOSE`を無視・キャンセルできる）。`PostMessage`はキューへ投函するだけで
@@ -160,6 +191,29 @@ extern int GetWindowLong(IntPtr hWnd, int nIndex)
 let GWL_STYLE = -16
 let WS_CAPTION = 0x00C00000
 let WS_THICKFRAME = 0x00040000
+let WS_CHILD = 0x40000000
+
+// 常駐ループ化（Opus敵対的相談`opus-review-resident-daemon.md`のP0-1/P0-2）向けに追加。
+// P0-2「管理対象候補になるトップレベル窓かどうか」をShell側で判定するための属性
+// （`WS_EX_TOOLWINDOW`、子窓判定の`GetAncestor`）と、P0-1「`IsDialog`/`Owner`が実装されずに
+// `None`固定だった」を埋めるための属性（`GetWindow(GW_OWNER)`、ダイアログクラス名判定用の
+// `GetClassName`、`WS_EX_DLGMODALFRAME`）。
+let GWL_EXSTYLE = -20
+let WS_EX_TOOLWINDOW = 0x00000080
+let WS_EX_DLGMODALFRAME = 0x00000001
+
+[<DllImport("user32.dll", SetLastError = true)>]
+extern IntPtr GetAncestor(IntPtr hWnd, uint32 gaFlags)
+
+let GA_ROOT = 2u
+
+[<DllImport("user32.dll", SetLastError = true)>]
+extern IntPtr GetWindow(IntPtr hWnd, uint32 uCmd)
+
+let GW_OWNER = 4u
+
+[<DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)>]
+extern int GetClassNameW(IntPtr hWnd, Text.StringBuilder lpClassName, int nMaxCount)
 
 /// spikes/Phase0CiSpikes/Program.fsの`suppressCrashDialogs`と同じ理由・同じシグネチャ：子プロセスの
 /// 未処理例外がWindows Error Reporting UIを出すと、親の`StandardOutput.ReadLine()`を無期限に
