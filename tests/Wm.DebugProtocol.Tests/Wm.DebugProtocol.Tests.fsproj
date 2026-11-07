@@ -13,6 +13,7 @@
     <Compile Include="AnalyzerJsonTests.fs" />
     <Compile Include="DeployJsonTests.fs" />
     <Compile Include="InterveneJsonTests.fs" />
+    <Compile Include="TryPolicyJsonTests.fs" />
     <Compile Include="WireFramingTests.fs" />
   </ItemGroup>
 

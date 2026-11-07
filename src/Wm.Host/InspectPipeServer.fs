@@ -48,6 +48,8 @@ open Wm.DebugProtocol.Deploy
 open Wm.DebugProtocol.DeployJson
 open Wm.DebugProtocol.Intervene
 open Wm.DebugProtocol.InterveneJson
+open Wm.DebugProtocol.TryPolicy
+open Wm.DebugProtocol.TryPolicyJson
 open Wm.DebugProtocol.WireFraming
 
 module private Native =
@@ -310,6 +312,9 @@ type InspectRequest =
     /// `Wm.Contracts.CoreCommand.InterveneRequest`（Host自身がPID/イメージパスを埋めた後のCore向け型）
     /// と紛れないようにするため——ワイヤから受け取る段階ではまだその型にはなっていない。
     | InterveneOp of InterveneRequestDto
+    /// `op=trypolicy`（architecture.md §10.2/§10.3、v2.152、「Fork」ではなく正直に「TryPolicy」と
+    /// 呼ぶ——`opus-review-fork-design.md`参照）。
+    | TryPolicyRequest of PolicyDto
 
 /// Journal Inspect（v2.147）が返す直近件数。ユーザー決定2026-11-06：直近50〜100件、ここでは
 /// その中央寄りの値を既定にする。
@@ -349,6 +354,9 @@ let private parseRequest (bytes: byte[]) : Result<InspectRequest, string> =
                     else
                         None
                 Ok(InterveneOp { CorrelationId = correlationId; Command = interveneCommandDtoOfJson commandNode })
+            | "trypolicy" ->
+                let policyNode = JsonNode.Parse(root.GetProperty("policy").GetRawText())
+                Ok(TryPolicyRequest(policyDtoOfJson policyNode))
             | other -> Error(sprintf "unknown op '%s'" other)
     with ex ->
         Error(sprintf "malformed request: %s" ex.Message)
@@ -390,6 +398,10 @@ let private drainUntilClientClosesAsync (pipe: NamedPipeServerStream) (ct: Cance
 /// `(correlationId, pid, image, cmd) -> Result<Task<InterveneResultDto>, string>`で、PID/イメージパスは
 /// このハンドラが`getClientAttribution pipe`で接続自身から取得して渡す（クライアントの自己申告では
 /// ない）。`Error`（レート制限）はキュー/Reducerに一切触れず`InterveneRejectedDto`へそのまま落とす。
+/// v2.152で`op=trypolicy`（Opus敵対的相談`opus-review-fork-design.md`の結論：本格的なFork/
+/// Counterfactual SimulationはADR-006でPhase Dまで先送りのまま、§10.3が実際に必要とする唯一の
+/// 具体例——候補Policyとの分類差分——だけを実装、「Fork」ではなく「TryPolicy」と呼ぶ）も追加——
+/// `State`が可変なのでExplainと同じキュー経由。
 /// `ct`は`runAcceptLoop`が接続ごとに`requestTimeoutMs`で組み立てたデッドライン（5-E対応）：読取・応答
 /// 送信どちらが詰まってもこのトークンの期限切れで中断される。
 let handleOneRequestAsync
@@ -403,6 +415,7 @@ let handleOneRequestAsync
     (analyzeCandidate: PolicyDto -> AnalyzerReportDto)
     (deployCandidate: PolicyDto -> Task<DeployResultDto>)
     (intervene: string option -> int -> string -> InterveneCommandDto -> Result<Task<InterveneResultDto>, string>)
+    (tryPolicy: PolicyDto -> Task<TryPolicyResultDto>)
     (ct: CancellationToken)
     : Task =
     task {
@@ -447,6 +460,11 @@ let handleOneRequestAsync
                     | Error msg -> Task.FromResult(InterveneRejectedDto msg)
                     | Ok t -> t
                 let json = interveneResultDtoToJson interveneResult
+                do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
+                do! drainUntilClientClosesAsync pipe ct
+            | Ok(TryPolicyRequest candidate) ->
+                let! result = tryPolicy candidate
+                let json = tryPolicyResultDtoToJson result
                 do! writeFramedMessageAsync pipe (Encoding.UTF8.GetBytes(json.ToJsonString())) ct
                 do! drainUntilClientClosesAsync pipe ct
     }

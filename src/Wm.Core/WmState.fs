@@ -5,6 +5,7 @@ module Wm.Core.WmState
 
 open Wm.Contracts.Identifiers
 open Wm.Contracts.ErrorTypes
+open Wm.Contracts.Observation
 open Wm.Contracts.CoreCommand
 open Wm.Contracts.Timers
 open Wm.Contracts.GatedEffect
@@ -190,6 +191,87 @@ let private classificationCtx (runtimePolicy: RuntimePolicy) (now: int64) (state
       ClassificationTimeoutMs = runtimePolicy.ClassificationTimeoutMs
       Movability = state.Placement.Movability
       MinWidth = state.Placement.MinWidth }
+
+/// `op=trypolicy`（architecture.md §10.2/§10.3、v2.152）の計算結果。Opus敵対的相談
+/// `opus-review-fork-design.md`の結論：本格的なFork/Counterfactual SimulationはADR-006でPhase D
+/// まで意図的に先送りされたまま残し、代わりに§10.3が実際に必要とする唯一の具体例——候補Policyの下で
+/// 各窓がどう分類されるかの差分——だけを実装する（「Fork」ではなく「Policy Diff」と呼ぶ、ユーザー
+/// 決定2026-11-06）。`WouldClassifyAs`/`WouldAwaitEvidence`は`PolicyEvaluator.ClassificationResult`の
+/// `Resolved`/`AwaitingEvidence`をそのまま写す。`Undeterminable`は下記`remapTitleMatches`参照。
+type ClassifyOutcome =
+    | WouldClassifyAs of Management * matchedRule: PolicyRuleId option
+    | WouldAwaitEvidence of blockedBy: PolicyRuleId
+    /// タイトル証拠の付け替えができなかった（Opusレビュー F-a）：`ClassInputBeliefs.TitleMatches`は
+    /// 採用中の`TitlePatternSet`のハッシュに紐付いた`TitleMatchVector`しか持たず、生タイトル文字列
+    /// 自体はどこにも保存されない（E-6）。候補のPolicyが参照する`TitleContains`パターンのうち、
+    /// 現在のPatternSetで一度も測定されていないものがあれば、安全に付け替えられず「分からない」と
+    /// しか言えない——`missingTitlePatterns`がその一覧。
+    | Undeterminable of missingTitlePatterns: string list
+
+/// 候補の`TitlePatternSet`が元のものと異なる場合、観測済みの`TitleMatchVector`（元のPatternSetの
+/// 添字空間）を候補の添字空間へパターン文字列で付け替える。候補が参照する全パターンが元のPatternSet
+/// にも存在すれば安全に付け替えられる（`Believed`のまま）。1つでも無ければ、どのルールが本当に
+/// ブロックされるかを厳密には判定できないため、安全側に倒してスロット全体を`Unformed`にし
+/// （`selectManagement`は該当ルールで`AwaitingEvidence`に落ちる）、呼び出し側が`Undeterminable`として
+/// 報告する。元のPatternSet自体が現在のPolicy（`livePatternSet`）と食い違う場合（直近のPolicy
+/// live swap後、まだ再観測されていない窓）も同様に付け替えを諦める——既知の限界（architecture.md
+/// §21）。
+let private remapTitleMatches
+    (livePatternSet: TitlePatternSet)
+    (candidatePatternSet: TitlePatternSet)
+    (slot: BeliefSlot<TitleMatchVector>)
+    : BeliefSlot<TitleMatchVector> * string list = // 2番目はmissingPatterns（候補が参照するが元のPatternSetに無いパターン文字列）
+    match slot with
+    | Unformed gaps -> Unformed gaps, []
+    | Believed b when b.Value.PatternSetHash = candidatePatternSet.PatternSetHash -> Believed b, []
+    | Believed b when b.Value.PatternSetHash <> livePatternSet.PatternSetHash -> Unformed [], candidatePatternSet.Patterns
+    | Believed b ->
+        let missing = candidatePatternSet.Patterns |> List.filter (fun p -> not (Map.containsKey p livePatternSet.IndexOf))
+        if not (List.isEmpty missing) then
+            Unformed [], missing
+        else
+            let remapped =
+                candidatePatternSet.IndexOf
+                |> Map.toList
+                |> List.choose (fun (pattern, candidateIdx) ->
+                    let liveIdx = Map.find pattern livePatternSet.IndexOf
+                    if Set.contains liveIdx b.Value.Matches then Some candidateIdx else None)
+                |> Set.ofList
+            Believed { b with Value = { PatternSetHash = candidatePatternSet.PatternSetHash; Matches = remapped } }, []
+
+/// `op=trypolicy`本体。`state`の各窓を、候補の`RuntimePolicy`（`Policy`/`PatternSet`を候補に
+/// 差し替えた環境、`Movability`/`MinWidth`/`ActiveWorkspace`/`ForegroundWindow`は現在の実際の値の
+/// まま）の下で再評価する——§14/Analyzerと同じ「クライアントの自己申告を信用しない、Hostが自分の
+/// 現在の状態に対して実際に評価し直す」原則。`livePatternSet`は現在実際に採用中の`RuntimePolicy`の
+/// `PatternSet`（呼び出し側が`buildTitlePatternSet`で算出、`Policy`から一意に決まるので別に保持する
+/// 必要は無い）——`remapTitleMatches`が観測済みタイトル証拠をどの添字空間から読むかを知るために使う。
+let classifyAllUnder (livePatternSet: TitlePatternSet) (candidate: RuntimePolicy) (now: int64) (state: WmState) : (WindowId * ClassifyOutcome) list =
+    let candidateCtx = classificationCtx candidate now state
+    state.Windows.Records
+    |> Map.toList
+    |> List.map (fun (w, _) ->
+        let identity =
+            Map.tryFind w state.Windows.Identity
+            |> Option.defaultValue { Exe = Unformed []; HostExe = Unformed []; Aumid = Unformed []; CoreWindowExe = Unformed []; Process = Unformed [] }
+        let inputs =
+            Map.tryFind w state.Windows.ClassInputs
+            |> Option.defaultValue
+                { IsDialog = LatestWins.unformed
+                  Owner = LatestWins.unformed
+                  IsVisible = LatestWins.unformed
+                  Cloak = LatestWins.unformed
+                  TitleMatches = LatestWins.unformed }
+        let baseView = Windows.classificationView candidateCtx w identity inputs
+        let remappedTitleMatches, missingPatterns = remapTitleMatches livePatternSet candidate.PatternSet inputs.TitleMatches.Slot
+        let view = { baseView with TitleMatches = remappedTitleMatches }
+        let outcome =
+            if not (List.isEmpty missingPatterns) then
+                Undeterminable missingPatterns
+            else
+                match selectManagement candidateCtx.PatternSet view candidateCtx.Policy with
+                | Resolved(m, ruleId) -> WouldClassifyAs(m, ruleId)
+                | ClassificationResult.AwaitingEvidence ruleId -> WouldAwaitEvidence ruleId
+        w, outcome)
 
 /// Windowsが出した`WindowClassified`/`WindowUnmanaged`をWorkspaces/Focusへ反映する（§7.1段⑤→Workspaces）。
 /// `WindowClassified`の`home`が`None`（「新しい好みは無い」、Windows.fsの`resolveHome`参照）なら、

@@ -72,6 +72,12 @@ type Reducer(runtimePolicy: RuntimePolicy, sessionId: string, coreBuildId: strin
     member _.ActivatePolicy(policy: PolicyIR) : unit =
         runtimePolicy <- { runtimePolicy with Policy = policy; PatternSet = buildTitlePatternSet policy }
 
+    /// `op=trypolicy`（architecture.md §10.2/§10.3、v2.152）が候補Policyの下での再分類を計算する際、
+    /// `{ reducer.RuntimePolicy with Policy = candidate; PatternSet = ... }`で候補環境を組み立てる
+    /// ために必要な、現在の環境値一式。`Policy`単体のアクセサと同じ理由（最善努力の一貫性、`ActivatePolicy`
+    /// 呼出し直前・直後どちらの値を読むかはタイミング次第）で、Reducer所有スレッド以外からも読める。
+    member _.RuntimePolicy = runtimePolicy
+
     /// Deploy Inspect（architecture.md §14/§10.2、v2.150）がJournal記録（`PolicyActivatedKind`）に
     /// 使うSessionId。コンストラクタで渡されたまま再代入されない不変の環境値。
     member _.SessionId = sessionId

@@ -108,6 +108,7 @@ open Wm.DebugProtocol.Explain
 open Wm.DebugProtocol.Analyzer
 open Wm.DebugProtocol.Deploy
 open Wm.DebugProtocol.Intervene
+open Wm.DebugProtocol.TryPolicy
 open Wm.DebugProtocol.WireFraming
 open Wm.ReplClient.WmClient
 
@@ -1047,7 +1048,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe17 cts17.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid17 (fun () -> residentHost17.EnqueueSnapshotQuery().Result) (fun () -> residentHost17.Policy) (fun () -> residentHost17.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost17.EnqueueExplainQuery(w)) (fun c -> residentHost17.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))) (fun (_: string option) (_: int) (_: string) (_: InterveneCommandDto) -> Error "not-exercised-this-round") reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid17 (fun () -> residentHost17.EnqueueSnapshotQuery().Result) (fun () -> residentHost17.Policy) (fun () -> residentHost17.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost17.EnqueueExplainQuery(w)) (fun c -> residentHost17.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))) (fun (_: string option) (_: int) (_: string) (_: InterveneCommandDto) -> Error "not-exercised-this-round") (fun (_: PolicyDto) -> Task.FromResult({ Revision = -1L; Outcomes = [] })) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread17.IsBackground <- true
         acceptThread17.Start()
@@ -1113,7 +1114,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoopWithTimeout pipe18 cts18.Token shortTimeoutMs18 (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid18 (fun () -> residentHost18.EnqueueSnapshotQuery().Result) (fun () -> residentHost18.Policy) (fun () -> residentHost18.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost18.EnqueueExplainQuery(w)) (fun c -> residentHost18.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))) (fun (_: string option) (_: int) (_: string) (_: InterveneCommandDto) -> Error "not-exercised-this-round") reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid18 (fun () -> residentHost18.EnqueueSnapshotQuery().Result) (fun () -> residentHost18.Policy) (fun () -> residentHost18.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost18.EnqueueExplainQuery(w)) (fun c -> residentHost18.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))) (fun (_: string option) (_: int) (_: string) (_: InterveneCommandDto) -> Error "not-exercised-this-round") (fun (_: PolicyDto) -> Task.FromResult({ Revision = -1L; Outcomes = [] })) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread18.IsBackground <- true
         acceptThread18.Start()
@@ -1191,7 +1192,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe19 cts19.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid19 (fun () -> residentHost19.EnqueueSnapshotQuery().Result) (fun () -> residentHost19.Policy) (fun () -> residentHost19.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost19.EnqueueExplainQuery(w)) (fun c -> residentHost19.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))) (fun (_: string option) (_: int) (_: string) (_: InterveneCommandDto) -> Error "not-exercised-this-round") reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid19 (fun () -> residentHost19.EnqueueSnapshotQuery().Result) (fun () -> residentHost19.Policy) (fun () -> residentHost19.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost19.EnqueueExplainQuery(w)) (fun c -> residentHost19.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))) (fun (_: string option) (_: int) (_: string) (_: InterveneCommandDto) -> Error "not-exercised-this-round") (fun (_: PolicyDto) -> Task.FromResult({ Revision = -1L; Outcomes = [] })) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread19.IsBackground <- true
         acceptThread19.Start()
@@ -1270,7 +1271,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe20 cts20.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid20 (fun () -> residentHost20.EnqueueSnapshotQuery().Result) (fun () -> residentHost20.Policy) (fun () -> residentHost20.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost20.EnqueueExplainQuery(w)) (fun c -> residentHost20.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))) (fun (_: string option) (_: int) (_: string) (_: InterveneCommandDto) -> Error "not-exercised-this-round") reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid20 (fun () -> residentHost20.EnqueueSnapshotQuery().Result) (fun () -> residentHost20.Policy) (fun () -> residentHost20.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost20.EnqueueExplainQuery(w)) (fun c -> residentHost20.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))) (fun (_: string option) (_: int) (_: string) (_: InterveneCommandDto) -> Error "not-exercised-this-round") (fun (_: PolicyDto) -> Task.FromResult({ Revision = -1L; Outcomes = [] })) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread20.IsBackground <- true
         acceptThread20.Start()
@@ -1340,7 +1341,7 @@ let main argv =
             Thread(fun () ->
                 runAcceptLoop pipe21 cts21.Token (fun p principal reqCt ->
                     try
-                        (handleOneRequestAsync p principal ownRid21 (fun () -> residentHost21.EnqueueSnapshotQuery().Result) (fun () -> residentHost21.Policy) (fun () -> residentHost21.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost21.EnqueueExplainQuery(w)) (fun c -> residentHost21.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))) (fun (_: string option) (_: int) (_: string) (_: InterveneCommandDto) -> Error "not-exercised-this-round") reqCt).GetAwaiter().GetResult()
+                        (handleOneRequestAsync p principal ownRid21 (fun () -> residentHost21.EnqueueSnapshotQuery().Result) (fun () -> residentHost21.Policy) (fun () -> residentHost21.RecentJournal(defaultJournalEntryCount)) (fun w -> residentHost21.EnqueueExplainQuery(w)) (fun c -> residentHost21.AnalyzeCandidate(c)) (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round"))) (fun (_: string option) (_: int) (_: string) (_: InterveneCommandDto) -> Error "not-exercised-this-round") (fun (_: PolicyDto) -> Task.FromResult({ Revision = -1L; Outcomes = [] })) reqCt).GetAwaiter().GetResult()
                     with _ -> ()))
         acceptThread21.IsBackground <- true
         acceptThread21.Start()
@@ -1456,6 +1457,7 @@ let main argv =
                             (fun c -> residentHost22.AnalyzeCandidate(c))
                             (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round")))
                             (fun (_: string option) (_: int) (_: string) (_: InterveneCommandDto) -> Error "not-exercised-this-round")
+                            (fun (_: PolicyDto) -> Task.FromResult({ Revision = -1L; Outcomes = [] }))
                             reqCt)
                             .GetAwaiter()
                             .GetResult()
@@ -1570,6 +1572,7 @@ let main argv =
                             (fun c -> residentHost23.AnalyzeCandidate(c))
                             (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round")))
                             (fun (_: string option) (_: int) (_: string) (_: InterveneCommandDto) -> Error "not-exercised-this-round")
+                            (fun (_: PolicyDto) -> Task.FromResult({ Revision = -1L; Outcomes = [] }))
                             reqCt)
                             .GetAwaiter()
                             .GetResult()
@@ -1771,6 +1774,7 @@ let main argv =
                             (fun c -> residentHost25.AnalyzeCandidate(c))
                             (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round")))
                             (fun (_: string option) (_: int) (_: string) (_: InterveneCommandDto) -> Error "not-exercised-this-round")
+                            (fun (_: PolicyDto) -> Task.FromResult({ Revision = -1L; Outcomes = [] }))
                             reqCt)
                             .GetAwaiter()
                             .GetResult()
@@ -1863,6 +1867,7 @@ let main argv =
                             (fun c -> residentHost26.AnalyzeCandidate(c))
                             (fun c -> deployCandidateOf baseDir26 reducer26.LayoutRegistry reducer26.JournalPath reducer26.SessionId reducer26.CoreBuildId (liveNow ()) residentHost26.EnqueueActivatePolicy c)
                             (fun correlationId pid image cmd -> residentHost26.EnqueueIntervene(correlationId, pid, image, cmd))
+                            (fun c -> residentHost26.EnqueueTryPolicyQuery(c))
                             reqCt)
                             .GetAwaiter()
                             .GetResult()
@@ -2024,6 +2029,7 @@ let main argv =
                             (fun c -> residentHost27.AnalyzeCandidate(c))
                             (fun c -> deployCandidateOf baseDir27 reducer27.LayoutRegistry reducer27.JournalPath reducer27.SessionId reducer27.CoreBuildId (liveNow ()) residentHost27.EnqueueActivatePolicy c)
                             (fun correlationId pid image cmd -> residentHost27.EnqueueIntervene(correlationId, pid, image, cmd))
+                            (fun c -> residentHost27.EnqueueTryPolicyQuery(c))
                             reqCt)
                             .GetAwaiter()
                             .GetResult()
@@ -2194,6 +2200,7 @@ let main argv =
                             (fun c -> residentHost28.AnalyzeCandidate(c))
                             (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round")))
                             (fun correlationId pid image cmd -> residentHost28.EnqueueIntervene(correlationId, pid, image, cmd))
+                            (fun c -> residentHost28.EnqueueTryPolicyQuery(c))
                             reqCt)
                             .GetAwaiter()
                             .GetResult()
@@ -2287,6 +2294,162 @@ let main argv =
              && rateLimitTriggeredOk28
              && acceptStopped28
              && loopStopped28)
+
+    // Round 29：TryPolicy操作（op=trypolicy、architecture.md §10.2/§10.3、v2.152）。ユーザーが
+    // 「次のゴール」として選択したFork設計ラウンドの結果（Opus敵対的相談`opus-review-fork-design.md`）
+    // ：本格的なFork（Journal replay + Counterfactual Simulation）はADR-006でPhase Dまで意図的に
+    // 先送りされたままの既存決定であり、Intervene同様のGate改定は不要——代わりに§10.3が実際に必要
+    // とする唯一の具体例（候補Policyとの分類差分）だけを、Analyzerと同じ形のHost側読み取り専用
+    // 操作として実装する。検証する3点：(1) 候補Policyが既存のタイトルパターンだけを使う場合、観測
+    // 済みのTitleMatchVectorを正しく付け替えて実際に異なる分類を計算できること（Opusレビュー F-a
+    // の「安全に付け替えられるケース」）、(2) 候補Policyが一度も測定されていない新しいタイトル
+    // パターンを使う場合、`Undeterminable`として正直に報告すること（F-aの中核：生タイトルは
+    // どこにも保存されないため、これ以上は原理的に分からない）、(3) `Revision`が計算時点の
+    // `reducer.Sequence`と一致すること。
+    printfn "\n--- Round 29: TryPolicy op (op=trypolicy) diffs classification under a candidate Policy through the real Named Pipe ---"
+    let journalPath29 = Path.Combine(Path.GetTempPath(), sprintf "wm-host-round29-%s.ndjson" (Guid.NewGuid().ToString("N")))
+    // 2つのタイトルパターンを使う（"TextEdit"は常にマッチしないダミー）——候補Aが"Notepad"だけを
+    // 参照する1パターンのPolicyになることで、候補のPatternSetハッシュが元のものと実際に異なる
+    // （パターン集合の要素数が違う）genuineな付け替えケースをテストできる（Opusレビュー F-aの
+    // 「安全に付け替えられるケース」の回帰テスト、ハッシュが偶然一致してしまう退化ケースを避ける）。
+    let livePolicy29 =
+        { PolicyIR.defaults with
+            WindowRules =
+                [ { Id = PolicyRuleId "title-rule-round29-textedit"; Priority = 2; When = TitleContains "TextEdit"; Apply = Tiled }
+                  { Id = PolicyRuleId "title-rule-round29"; Priority = 1; When = TitleContains "Notepad"; Apply = Floating } ] }
+    let liveRuntimePolicy29 = { RuntimePolicy.defaults with Policy = livePolicy29; PatternSet = buildTitlePatternSet livePolicy29 }
+    let reducer29 = Reducer(liveRuntimePolicy29, "phase-b-round29", "wm-host-round29", "no-policy-artifact", Some journalPath29)
+    let residentHost29 = ResidentHost(reducer29, liveNow)
+    let loopThread29 = Thread(fun () -> residentHost29.Run(tickMs = 1))
+    loopThread29.IsBackground <- true
+    loopThread29.Start()
+    Thread.Sleep(50)
+
+    let testMonitor29: MonitorSnapshot =
+        { Id = MonitorId 0L
+          StableKey = "test-monitor-round29"
+          Bounds = { X = 0; Y = 0; Width = 1920; Height = 1080 }
+          WorkArea = { X = 0; Y = 0; Width = 1920; Height = 1080 }
+          Dpi = 96
+          IsPrimary = true }
+    let visibleWindowObserved29 (w: WindowId) (titleVector: TitleMatchVector) : InputEvent =
+        WindowObserved
+            { Id = w
+              Process = None
+              AppIdentity = { Exe = None; HostExe = None; Aumid = None; CoreWindowExe = None }
+              Owner = None
+              IsDialog = None
+              NativeRect = None
+              VisibleFrameRect = None
+              IsVisible = Some { Value = Ok true; SampleSequence = 0L; MonotonicTime = 0L; Source = "round29" }
+              IsMinimized = None
+              IsMaximized = None
+              Style = None
+              Cloak = None
+              Monitor = None
+              MinWidthHint = None
+              TargetIntegrity = None
+              Responsiveness = None
+              Presence = None
+              DpiAwareness = None
+              TitleMatches = Some { Value = Ok titleVector; SampleSequence = 0L; MonotonicTime = 0L; Source = "round29" } }
+
+    residentHost29.Submit (liveNow ()) "round29" (MonitorTopologyObserved [ testMonitor29 ]) |> ignore
+    Thread.Sleep(900)
+    let notepadVector29 = computeTitleMatchVector liveRuntimePolicy29.PatternSet "My Notepad Window"
+    residentHost29.Submit (liveNow ()) "round29" (visibleWindowObserved29 (WindowId 1L) notepadVector29) |> ignore
+    Thread.Sleep(100)
+
+    let pipeName29 = generatePipeName ()
+    match createRestrictedPipe pipeName29 with
+    | Error e ->
+        printfn "Round 29 FAILED (createRestrictedPipe): %s" e
+        residentHost29.RequestStop()
+        loopThread29.Join(3000) |> ignore
+    | Ok pipe29 ->
+        use pipe29 = pipe29
+        use cts29 = new CancellationTokenSource()
+        let ownRid29 = ownIntegrityRid ()
+
+        let discoveryWriteOk29 =
+            match writeDiscoveryFile pipeName29 with
+            | Ok () -> true
+            | Error _ -> false
+
+        let acceptThread29 =
+            Thread(fun () ->
+                runAcceptLoop pipe29 cts29.Token (fun p principal reqCt ->
+                    try
+                        (handleOneRequestAsync
+                            p
+                            principal
+                            ownRid29
+                            (fun () -> residentHost29.EnqueueSnapshotQuery().Result)
+                            (fun () -> residentHost29.Policy)
+                            (fun () -> residentHost29.RecentJournal(defaultJournalEntryCount))
+                            (fun w -> residentHost29.EnqueueExplainQuery(w))
+                            (fun c -> residentHost29.AnalyzeCandidate(c))
+                            (fun (_: PolicyDto) -> Task.FromResult(DeployIntegrityFailedDto("not-exercised-this-round", "not-exercised-this-round")))
+                            (fun (_: string option) (_: int) (_: string) (_: InterveneCommandDto) -> Error "not-exercised-this-round")
+                            (fun c -> residentHost29.EnqueueTryPolicyQuery(c))
+                            reqCt)
+                            .GetAwaiter()
+                            .GetResult()
+                    with _ -> ()))
+        acceptThread29.IsBackground <- true
+        acceptThread29.Start()
+        Thread.Sleep(100)
+
+        let tryPolicyViaClient29 (candidate: PolicyDto) : TryPolicyResultDto option =
+            match connectLocalAsync 2000 |> Async.AwaitTask |> Async.RunSynchronously with
+            | Error _ -> None
+            | Ok client ->
+                use client = client
+                match client.TryPolicyAsync(candidate) |> Async.AwaitTask |> Async.RunSynchronously with
+                | Ok r -> Some r
+                | Error _ -> None
+
+        let outcomeOf29 (result: TryPolicyResultDto option) (w: WindowId) : TryPolicyOutcomeDto option =
+            result |> Option.bind (fun r -> r.Outcomes |> List.tryFind (fun (ww, _) -> ww = w) |> Option.map snd)
+
+        // 候補A：同じタイトルパターン("Notepad")を使うが、Applyが違う——安全に付け替えられるケース。
+        let candidateA29 =
+            policyDtoOf
+                { PolicyIR.defaults with
+                    WindowRules = [ { Id = PolicyRuleId "title-rule-round29-a"; Priority = 1; When = TitleContains "Notepad"; Apply = Excluded } ] }
+        let resultA29 = tryPolicyViaClient29 candidateA29
+        let candidateAOk29 = outcomeOf29 resultA29 (WindowId 1L) = Some(WouldClassifyAsDto(Excluded, Some(PolicyRuleId "title-rule-round29-a")))
+
+        // 候補B：一度も測定されていない新しいタイトルパターン("Calculator")——Undeterminableになるはず。
+        let candidateB29 =
+            policyDtoOf
+                { PolicyIR.defaults with
+                    WindowRules = [ { Id = PolicyRuleId "title-rule-round29-b"; Priority = 1; When = TitleContains "Calculator"; Apply = Excluded } ] }
+        let resultB29 = tryPolicyViaClient29 candidateB29
+        let candidateBOk29 =
+            match outcomeOf29 resultB29 (WindowId 1L) with
+            | Some(UndeterminableDto missing) -> List.contains "Calculator" missing
+            | _ -> false
+
+        let revisionOk29 = match resultA29 with Some r -> r.Revision = reducer29.Sequence | None -> false
+
+        printfn "Round 29 candidateA outcome=%A, candidateB outcome=%A, revision=%A (reducer.Sequence=%d)"
+            (outcomeOf29 resultA29 (WindowId 1L)) (outcomeOf29 resultB29 (WindowId 1L))
+            (resultA29 |> Option.map (fun r -> r.Revision)) reducer29.Sequence
+
+        cts29.Cancel()
+        let acceptStopped29 = acceptThread29.Join(3000)
+        residentHost29.RequestStop()
+        let loopStopped29 = loopThread29.Join(3000)
+        removeDiscoveryFile ()
+        printfn
+            "Round 29 PASSED (op=trypolicy correctly remaps an observed TitleMatchVector to a candidate Policy that reuses the same title pattern and computes a real classification diff, honestly reports Undeterminable for a candidate pattern never measured under the live Policy, and Revision matches reducer.Sequence, through the real Named Pipe against the Host's own real state): %b"
+            (discoveryWriteOk29
+             && candidateAOk29
+             && candidateBOk29
+             && revisionOk29
+             && acceptStopped29
+             && loopStopped29)
 
     printfn "\nDone."
     0

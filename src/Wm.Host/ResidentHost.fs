@@ -31,7 +31,9 @@ open Wm.DebugProtocol.Journal
 open Wm.DebugProtocol.Explain
 open Wm.DebugProtocol.Analyzer
 open Wm.DebugProtocol.Intervene
+open Wm.DebugProtocol.TryPolicy
 open Wm.Policy.PolicyTypes
+open Wm.Policy.PolicyEvaluator
 open Wm.Policy.MonitorSelector
 open Wm.Policy.PolicyAnalyzer
 open Wm.Core.DecisionTrace
@@ -46,6 +48,10 @@ type SnapshotQuery = TaskCompletionSource<SnapshotDto>
 /// 違い——ADR-012の単一スレッドアクセス不変条件を厳密に守るため——Snapshotと同じキュー方式にする
 /// （対象のWindowIdを添えるだけの違い）。
 type ExplainQuery = Wm.Contracts.Identifiers.WindowId * TaskCompletionSource<ExplainDto option>
+
+/// 1件のTryPolicy問い合わせ（v2.152）。`tryPolicyOf`が読む`reducer.State`は可変なので、Explainと
+/// 同じ理由でキュー方式にする（対象の候補`PolicyDto`を添えるだけの違い）。
+type TryPolicyQuery = PolicyDto * TaskCompletionSource<TryPolicyResultDto>
 
 /// 1件のIntervene要求（architecture.md §10.2/§10.3、v2.151）。`InterveneRequest`はHost自身が
 /// クライアントPID/イメージパスを埋めた後の値（`InspectPipeServer.fs`参照）。`Reducer.Submit`
@@ -234,6 +240,27 @@ let analyzeCandidateOf (registry: Registry) (candidate: PolicyDto) : AnalyzerRep
     let manifest = Registry.toManifest registry
     analyzerReportDtoOf (Wm.Policy.PolicyAnalyzer.analyze manifest (policyIrOf candidate))
 
+/// `Wm.Core.WmState.ClassifyOutcome`から`TryPolicyOutcomeDto`への射影。
+let private tryPolicyOutcomeDtoOf (outcome: ClassifyOutcome) : TryPolicyOutcomeDto =
+    match outcome with
+    | WouldClassifyAs(m, ruleId) -> WouldClassifyAsDto(m, ruleId)
+    | WouldAwaitEvidence ruleId -> WouldAwaitEvidenceDto ruleId
+    | Undeterminable missing -> UndeterminableDto missing
+
+/// `op=trypolicy`（architecture.md §10.2/§10.3、v2.152）：候補`PolicyDto`の下で、Hostの現在の
+/// `reducer.State`にある各窓がどう分類されるかを計算する。Opus敵対的相談`opus-review-fork-design.md`
+/// の結論どおり、本格的なFork（Journal replay + Counterfactual Simulation、ADR-006でPhase Dまで
+/// 先送り）ではなく、§10.3が実際に必要とする唯一の具体例（候補Policyとの分類差分）だけを実装した
+/// ——「Fork」ではなく正直に「TryPolicy」と呼ぶ。`liveRuntimePolicy`は`reducer.RuntimePolicy`
+/// （不変の環境値、`ActivatePolicy`直後は最善努力の一貫性）。
+let tryPolicyOf (liveRuntimePolicy: RuntimePolicy) (now: int64) (state: Wm.Core.WmState.WmState) (sequence: int64) (candidate: PolicyDto) : TryPolicyResultDto =
+    let candidateIr = policyIrOf candidate
+    let candidateRuntimePolicy = { liveRuntimePolicy with Policy = candidateIr; PatternSet = buildTitlePatternSet candidateIr }
+    let outcomes =
+        classifyAllUnder liveRuntimePolicy.PatternSet candidateRuntimePolicy now state
+        |> List.map (fun (w, outcome) -> w, tryPolicyOutcomeDtoOf outcome)
+    { Revision = sequence; Outcomes = outcomes }
+
 /// Journal Inspect（architecture.md §10.2、v2.147）：直近`n`件を新しい順で返す。ユーザー決定
 /// 2026-11-05：カーソル型APIやセッション全体ではなく、シンプルに直近N件だけ。ファイルの読み取りと
 /// 同時刻の書き込み（`Reducer.Submit`が別スレッドから`appendEntry`する可能性）が競合する稀なケースは
@@ -272,6 +299,7 @@ type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
     let harness = EffectHarness(reducer, liveNow)
     let queries = ConcurrentQueue<SnapshotQuery>()
     let explainQueries = ConcurrentQueue<ExplainQuery>()
+    let tryPolicyQueries = ConcurrentQueue<TryPolicyQuery>()
     let activateRequests = ConcurrentQueue<ActivatePolicyRequest>()
     let interveneRequests = ConcurrentQueue<InterveneQueueRequest>()
     // Intervene（v2.151）のレート制限（Opus敵対的相談Q3「暴走した誤爆スクリプトがJournalの80件
@@ -308,6 +336,14 @@ type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
     member _.EnqueueExplainQuery(w: Wm.Contracts.Identifiers.WindowId) : Task<ExplainDto option> =
         let tcs = TaskCompletionSource<ExplainDto option>(TaskCreationOptions.RunContinuationsAsynchronously)
         explainQueries.Enqueue(w, tcs)
+        tcs.Task
+
+    /// `op=trypolicy`（architecture.md §10.2/§10.3、v2.152）。`EnqueueExplainQuery`と同じキュー方式
+    /// ——`tryPolicyOf`が読む`reducer.State`は可変なので、ADR-012の単一スレッドアクセス不変条件を
+    /// 厳密に守る。
+    member _.EnqueueTryPolicyQuery(candidate: PolicyDto) : Task<TryPolicyResultDto> =
+        let tcs = TaskCompletionSource<TryPolicyResultDto>(TaskCreationOptions.RunContinuationsAsynchronously)
+        tryPolicyQueries.Enqueue(candidate, tcs)
         tcs.Task
 
     /// PolicyActivated実配線（vNext）：`op=deploy`が検証・保存・Journal記録に成功した新Policyを、
@@ -372,6 +408,10 @@ type ResidentHost(reducer: Reducer, liveNow: unit -> int64) =
             while explainQueries.TryDequeue(&eq) do
                 let w, tcs = eq
                 tcs.SetResult(explainOf reducer.State.Windows reducer.RecentTrace w)
+            let mutable tpq = Unchecked.defaultof<TryPolicyQuery>
+            while tryPolicyQueries.TryDequeue(&tpq) do
+                let candidate, tcs = tpq
+                tcs.SetResult(tryPolicyOf reducer.RuntimePolicy (liveNow ()) reducer.State reducer.Sequence candidate)
             let mutable aq = Unchecked.defaultof<ActivatePolicyRequest>
             while activateRequests.TryDequeue(&aq) do
                 let policy, tcs = aq

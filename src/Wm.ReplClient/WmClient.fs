@@ -8,8 +8,10 @@
 /// `let! diagnostics = wm.AnalyzeAsync(rules)`）のうち、Inspectの5操作（Snapshot/Policy/Journal/
 /// Explain/Analyzer、v2.145/v2.147/v2.149）とDeploy（v2.150、§14のPolicyArtifact検証＋保存＋
 /// Journal記録に加え、vNextでReducerの実行中Policyの実際のswapまで、PolicyActivated実配線）、
-/// Intervene（v2.151、`SetManagement`/`ClearUserOverride`限定の最初のスライス）を実装済み——
-/// Fork/Probeは後続のスライス（memory `project_named_pipe_ipc_task_breakdown.md`参照）。
+/// Intervene（v2.151、`SetManagement`/`ClearUserOverride`限定の最初のスライス）、TryPolicy
+/// （v2.152、§10.3の`fork.TryPolicyAsync`が実際に必要とした唯一の用途だけを実装——本格的なFork
+/// 本体は未実装、ADR-006でPhase Dまで先送りのまま）を実装済み——Fork本体/Probeは後続のスライス
+/// （memory `project_named_pipe_ipc_task_breakdown.md`参照）。
 module Wm.ReplClient.WmClient
 
 open System
@@ -35,6 +37,8 @@ open Wm.DebugProtocol.Deploy
 open Wm.DebugProtocol.DeployJson
 open Wm.DebugProtocol.Intervene
 open Wm.DebugProtocol.InterveneJson
+open Wm.DebugProtocol.TryPolicy
+open Wm.DebugProtocol.TryPolicyJson
 open Wm.DebugProtocol.WireFraming
 
 /// 接続済みのクライアント。コンストラクタは`internal`——`connectAsync`/`connectLocalAsync`
@@ -123,6 +127,16 @@ type WmClient internal (pipe: NamedPipeClientStream) =
                 req.["correlationId"] <- (correlationId |> Option.map JsonValue.Create<string> |> Option.defaultValue null)
                 req.["command"] <- interveneCommandDtoToJson command)
             interveneResultDtoOfJson
+
+    /// `op=trypolicy`（architecture.md §10.2/§10.3、v2.152）。Opus敵対的相談`opus-review-fork-design.md`
+    /// の結論：本格的なFork（Journal replay + Counterfactual Simulation、ADR-006でPhase Dまで先送り）
+    /// ではなく、§10.3が実際に必要とする唯一の具体例——候補Policyの下で現在の各窓がどう分類される
+    /// かの差分——だけを実装した。「Fork」ではなく正直に「TryPolicy」と呼ぶ——`ForkAsync`/
+    /// `TryPolicyAsync`風の§10.3のAPI例が想定する、Snapshotを疑似OSへコピーして別の時間軸で試す
+    /// という意味でのFork（§10.4）ではない。候補`PolicyDto`だけを送り、Hostが自分の現在の状態に
+    /// 対して実際に評価し直す（§14/Analyzerと同じ「クライアントの自己申告を信用しない」原則）。
+    member this.TryPolicyAsync(candidate: PolicyDto) : Task<Result<TryPolicyResultDto, TransportError>> =
+        this.RequestAsync "trypolicy" (fun req -> req.["policy"] <- policyDtoToJson candidate) tryPolicyResultDtoOfJson
 
 /// パイプ名を直接知っている場合に使う経路。§10.1「クライアントは`TokenImpersonationLevel.Impersonation`
 /// で接続する」（F42、ユーザー決定2026-11-05——サーバーが`RunAsClient`で実トークンを読むにはこれが
