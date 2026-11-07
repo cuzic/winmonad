@@ -87,7 +87,7 @@ let ``候補のPatternSetが元と違っても(要素数が変わりハッシュ
         { PolicyIR.defaults with
             WindowRules = [ { Id = PolicyRuleId "candidate-notepad"; Priority = 1; When = TitleContains "Notepad"; Apply = Excluded } ] }
     let candidateRuntimePolicy = { liveRuntimePolicy with Policy = candidatePolicy; PatternSet = buildTitlePatternSet candidatePolicy }
-    Assert.NotEqual(liveRuntimePolicy.PatternSet.PatternSetHash, candidateRuntimePolicy.PatternSet.PatternSetHash)
+    Assert.NotEqual<string>(liveRuntimePolicy.PatternSet.PatternSetHash, candidateRuntimePolicy.PatternSet.PatternSetHash)
     let outcomes = classifyAllUnder liveRuntimePolicy.PatternSet candidateRuntimePolicy 2L state
     Assert.Equal<(WindowId * ClassifyOutcome) list>(
         [ WindowId 1L, WouldClassifyAs(Excluded, Some(PolicyRuleId "candidate-notepad")) ],
