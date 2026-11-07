@@ -89,7 +89,10 @@ module ResidentConfig =
           MutexName = "winmonad-resident-singleton"
           TickMs = 15
           RescanIntervalMs = 10_000L
-          HeartbeatTimeoutMs = 2_000L }
+          // 2秒は短すぎた（Round 30の実機CI検証で誤発火：初回のフル列挙という1回限りのコストが
+          // `onTick`を一度も経由せずに積み上がるため）。実デスクトップの窓数に比例して伸びうる
+          // 初回列挙そのものを安全に飲み込めるよう、十分に余裕を持たせる。
+          HeartbeatTimeoutMs = 10_000L }
 
 type private ResidentHotkeyForm(onHotkey: int -> unit, onDisplayChange: unit -> unit, onEndSession: unit -> unit) =
     inherit Form(Text = "winmonad-resident-hotkey-sink", ShowInTaskbar = false, Width = 1, Height = 1)
@@ -304,6 +307,14 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
     // `Application.DoEvents()`の中でメッセージを取り出す時にだけ配送されるため）。
     let wmThread =
         Thread(fun () ->
+            // ウォッチドッグ（問4）の心拍は`Run()`開始後は`handleTick`が1tickごとに更新するが、
+            // `Run()`開始前のセットアップ（フック登録・ホットキー登録・初回のフル列挙——実窓数に
+            // 比例し、busy desktopでは未検証なだけ遅くなりうる、opus-review-resident-daemon.md
+            // 問2が指摘した同種の不確実性）は1回も`onTick`を経由しない。各ステップの直後にも
+            // 心拍を打つことで、ウォッチドッグが「セットアップの合計時間」ではなく「個々のステップの
+            // 所要時間」だけを基準に判定するようにする（セットアップがどれだけ実窓数に比例して
+            // 長くなっても誤発火しない）。
+            lastHeartbeat <- Environment.TickCount64
             let eventHooks = hookEvents handleEvent
             let locationHook =
                 hookSingleEvent EVENT_OBJECT_LOCATIONCHANGE (fun _ hwnd ->
@@ -311,6 +322,7 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
                         if Map.containsKey (WindowId (hwnd.ToInt64())) reducer.State.Windows.Records then
                             dirty.[hwnd] <- ()
                     with _ -> ())
+            lastHeartbeat <- Environment.TickCount64
 
             let hotkeyForm = new ResidentHotkeyForm(onHotkey, onDisplayChange, onEndSession)
             hotkeyForm.Show()
@@ -323,12 +335,16 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
                 |> List.map (fun (id, vk, name) -> name, RegisterHotKey(hotkeyForm.Handle, id, config.HotkeyModifiers, vk))
             for name, ok in hotkeyRegistrations do
                 if not ok then eprintfn "[wm-host-resident] RegisterHotKey failed for %s (already bound by another app?)" name
+            lastHeartbeat <- Environment.TickCount64
 
-            // 初回のフル列挙（フック・ホットキー登録の後、`Run()`の前）。
+            // 初回のフル列挙（フック・ホットキー登録の後、`Run()`の前）。1件ごとに心拍を打つので、
+            // 窓数が多い実デスクトップでも合計時間ではなく1窓あたりの観測コストだけが基準になる。
             submit (liveNow ()) "wm-host-resident" (MonitorTopologyObserved (enumerateMonitors monitorHandles))
+            lastHeartbeat <- Environment.TickCount64
             for snapshot in enumerateTopLevelWindows (liveNow ()) monitorHandles titleMatcher do
                 for input in normalize (RawFirstSeen snapshot) do
                     submit (liveNow ()) "wm-host-resident" input
+                lastHeartbeat <- Environment.TickCount64
 
             try
                 residentHost.Run(tickMs = config.TickMs)

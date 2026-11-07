@@ -2485,7 +2485,7 @@ let main argv =
             HotkeyModifiers = MOD_CONTROL ||| MOD_SHIFT // CI実演用キーマップ。実アプリ衝突の懸念が無いCI実機だけで使う。
             MutexName = mutexName30
             RescanIntervalMs = 2_000L
-            HeartbeatTimeoutMs = 2_000L }
+            HeartbeatTimeoutMs = 10_000L } // 2秒は実機CIで誤発火した(ResidentConfig.defaultForのコメント参照)
 
     use testFormA30 = new Form(Text = "wm-host-round30-a", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(50, 50, 300, 200))
     use testFormB30 = new Form(Text = "wm-host-round30-b", StartPosition = FormStartPosition.Manual, Bounds = Rectangle(400, 50, 300, 200))
@@ -2520,7 +2520,7 @@ let main argv =
         // され、実際にSetRectが発行されて矩形が動くまで待つ（既存ラウンドと同じ実時間ポーリング）。
         let mutable afterA30 = beforeA30
         let mutable afterB30 = beforeB30
-        let deadline30 = Environment.TickCount64 + 5000L
+        let deadline30 = Environment.TickCount64 + 10000L
         while Environment.TickCount64 < deadline30 && (afterA30 = beforeA30 || afterB30 = beforeB30) do
             Thread.Sleep(50)
             afterA30 <- rectOf30 testFormA30
