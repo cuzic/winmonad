@@ -92,7 +92,7 @@ module ResidentConfig =
           // 2秒は短すぎた（Round 30の実機CI検証で誤発火：初回のフル列挙という1回限りのコストが
           // `onTick`を一度も経由せずに積み上がるため）。実デスクトップの窓数に比例して伸びうる
           // 初回列挙そのものを安全に飲み込めるよう、十分に余裕を持たせる。
-          HeartbeatTimeoutMs = 10_000L }
+          HeartbeatTimeoutMs = 60_000L }
 
 type private ResidentHotkeyForm(onHotkey: int -> unit, onDisplayChange: unit -> unit, onEndSession: unit -> unit) =
     inherit Form(Text = "winmonad-resident-hotkey-sink", ShowInTaskbar = false, Width = 1, Height = 1)
@@ -353,8 +353,9 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
             submit (liveNow ()) "wm-host-resident" (MonitorTopologyObserved (enumerateMonitors monitorHandles))
             lastHeartbeat <- Environment.TickCount64
             eprintfn "[wm-host-resident-debug] monitors submitted, enumerating top-level windows..."
+            let enumSw = Stopwatch.StartNew()
             let windows0 = enumerateTopLevelWindows (liveNow ()) monitorHandles titleMatcher
-            eprintfn "[wm-host-resident-debug] enumerated %d manageable top-level windows" windows0.Length
+            eprintfn "[wm-host-resident-debug] enumerated %d manageable top-level windows in %dms" windows0.Length enumSw.ElapsedMilliseconds
             for snapshot in windows0 do
                 for input in normalize (RawFirstSeen snapshot) do
                     submit (liveNow ()) "wm-host-resident" input
