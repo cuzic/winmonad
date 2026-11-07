@@ -92,7 +92,7 @@ module ResidentConfig =
           // 2秒は短すぎた（Round 30の実機CI検証で誤発火：初回のフル列挙という1回限りのコストが
           // `onTick`を一度も経由せずに積み上がるため）。実デスクトップの窓数に比例して伸びうる
           // 初回列挙そのものを安全に飲み込めるよう、十分に余裕を持たせる。
-          HeartbeatTimeoutMs = 60_000L }
+          HeartbeatTimeoutMs = 15_000L }
 
 type private ResidentHotkeyForm(onHotkey: int -> unit, onDisplayChange: unit -> unit, onEndSession: unit -> unit) =
     inherit Form(Text = "winmonad-resident-hotkey-sink", ShowInTaskbar = false, Width = 1, Height = 1)
@@ -352,10 +352,28 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
             // 窓数が多い実デスクトップでも合計時間ではなく1窓あたりの観測コストだけが基準になる。
             submit (liveNow ()) "wm-host-resident" (MonitorTopologyObserved (enumerateMonitors monitorHandles))
             lastHeartbeat <- Environment.TickCount64
-            eprintfn "[wm-host-resident-debug] monitors submitted, enumerating top-level windows..."
-            let enumSw = Stopwatch.StartNew()
-            let windows0 = enumerateTopLevelWindows (liveNow ()) monitorHandles titleMatcher
-            eprintfn "[wm-host-resident-debug] enumerated %d manageable top-level windows in %dms" windows0.Length enumSw.ElapsedMilliseconds
+            eprintfn "[wm-host-resident-debug] monitors submitted, enumerating top-level windows (manual instrumented loop)..."
+            let hwndsDbg = ResizeArray<IntPtr>()
+            let cbDbg = EnumChildProc(fun hWnd _ -> hwndsDbg.Add(hWnd) |> ignore; true)
+            let enumWindowsSw = Stopwatch.StartNew()
+            EnumWindows(cbDbg, IntPtr.Zero) |> ignore
+            eprintfn "[wm-host-resident-debug] EnumWindows returned %d raw hwnds in %dms" hwndsDbg.Count enumWindowsSw.ElapsedMilliseconds
+            lastHeartbeat <- Environment.TickCount64
+            let windows0 = ResizeArray<WindowSnapshot>()
+            for i in 0 .. hwndsDbg.Count - 1 do
+                let hwnd = hwndsDbg.[i]
+                let swFilter = Stopwatch.StartNew()
+                let manageable = isManageableTopLevel hwnd
+                if swFilter.ElapsedMilliseconds > 50L then
+                    eprintfn "[wm-host-resident-debug] window %d/%d hwnd=%A isManageableTopLevel took %dms" i hwndsDbg.Count hwnd swFilter.ElapsedMilliseconds
+                if manageable then
+                    let swObs = Stopwatch.StartNew()
+                    let snap = observeWindow (liveNow ()) monitorHandles titleMatcher hwnd
+                    if swObs.ElapsedMilliseconds > 50L then
+                        eprintfn "[wm-host-resident-debug] window %d/%d hwnd=%A observeWindow took %dms" i hwndsDbg.Count hwnd swObs.ElapsedMilliseconds
+                    windows0.Add(snap)
+                lastHeartbeat <- Environment.TickCount64
+            eprintfn "[wm-host-resident-debug] enumerated %d manageable top-level windows (manual loop complete)" windows0.Count
             for snapshot in windows0 do
                 for input in normalize (RawFirstSeen snapshot) do
                     submit (liveNow ()) "wm-host-resident" input
