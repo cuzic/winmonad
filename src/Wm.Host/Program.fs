@@ -2540,7 +2540,7 @@ let main argv =
             keybd_event (key, 0uy, 0u, UIntPtr.Zero)
             keybd_event (key, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
             for m in List.rev modifiers do keybd_event (m, 0uy, KEYEVENTF_KEYUP, UIntPtr.Zero)
-        pressChord30 [ VK_LCONTROL; VK_LSHIFT ] VK_Q
+        pressChord30 [ VK_LCONTROL; VK_LSHIFT ] (byte VK_Q)
         for _ in 1 .. 20 do
             Application.DoEvents()
             Thread.Sleep(50)
