@@ -150,7 +150,7 @@ let private formatBinding (b: HotkeyBinding) : string =
 /// 次に押されたキーをそのまま新しい割り当てとして受け取る（`KeyPreview`＋Form自身の`KeyDown`）。
 /// 保存は呼び出し側の`onSave`コールバックに新しい`HotkeyBindings`を渡すだけ——ファイルへの永続化・
 /// 実際の`RegisterHotKey`再登録は呼び出し側（`startResident`）の責務にする。
-type private SettingsForm(initial: HotkeyBindings, onSave: HotkeyBindings -> unit) as this =
+type private SettingsForm(initial: HotkeyBindings, onSave: HotkeyBindings -> unit, onError: exn -> unit) as this =
     inherit Form(
         Text = "winmonad — ショートカットキー設定",
         Width = 420,
@@ -174,8 +174,10 @@ type private SettingsForm(initial: HotkeyBindings, onSave: HotkeyBindings -> uni
             let label = Label(Text = actionLabel action, Left = 12, Top = y + 3, Width = 220)
             let button = Button(Left = 240, Top = y, Width = 150, Text = formatBinding (bindingOf action))
             button.Click.Add(fun _ ->
-                listeningAction <- Some action
-                button.Text <- "キーを押してください…")
+                try
+                    listeningAction <- Some action
+                    button.Text <- "キーを押してください…"
+                with ex -> onError ex)
             buttons.[action] <- button
             this.Controls.Add(label)
             this.Controls.Add(button))
@@ -184,39 +186,43 @@ type private SettingsForm(initial: HotkeyBindings, onSave: HotkeyBindings -> uni
         let saveButton = Button(Text = "保存", Left = 150, Top = buttonsTop, Width = 80)
         let cancelButton = Button(Text = "キャンセル", Left = 240, Top = buttonsTop, Width = 80)
         saveButton.Click.Add(fun _ ->
-            let keys = HotkeyBindings.toList pending |> List.map (fun (_, _, b) -> b.Modifiers, b.Vk)
-            if keys |> List.distinct |> List.length <> keys.Length then
-                MessageBox.Show(this, "同じキー組み合わせが複数の操作に割り当てられています。重複を解消してください。",
-                    "winmonad", MessageBoxButtons.OK, MessageBoxIcon.Warning) |> ignore
-            else
-                onSave pending
-                this.Close())
-        cancelButton.Click.Add(fun _ -> this.Close())
+            try
+                let keys = HotkeyBindings.toList pending |> List.map (fun (_, _, b) -> b.Modifiers, b.Vk)
+                if keys |> List.distinct |> List.length <> keys.Length then
+                    MessageBox.Show(this, "同じキー組み合わせが複数の操作に割り当てられています。重複を解消してください。",
+                        "winmonad", MessageBoxButtons.OK, MessageBoxIcon.Warning) |> ignore
+                else
+                    onSave pending
+                    this.Close()
+            with ex -> onError ex)
+        cancelButton.Click.Add(fun _ -> try this.Close() with ex -> onError ex)
         this.Controls.Add(saveButton)
         this.Controls.Add(cancelButton)
         this.AcceptButton <- saveButton
         this.CancelButton <- cancelButton
 
         this.KeyDown.Add(fun e ->
-            match listeningAction with
-            | None -> ()
-            | Some action ->
-                let vk = e.KeyCode
-                let isModifierOnly =
-                    vk = Keys.ControlKey || vk = Keys.Menu || vk = Keys.ShiftKey
-                    || vk = Keys.LWin || vk = Keys.RWin || vk = Keys.None
-                if not isModifierOnly then
-                    e.Handled <- true
-                    e.SuppressKeyPress <- true
-                    let modifiers =
-                        (if e.Control then MOD_CONTROL else 0u)
-                        ||| (if e.Alt then MOD_ALT else 0u)
-                        ||| (if e.Shift then MOD_SHIFT else 0u)
-                    let effectiveModifiers = if modifiers = 0u then MOD_CONTROL ||| MOD_ALT else modifiers
-                    let binding = { Modifiers = effectiveModifiers; Vk = uint32 vk }
-                    pending <- HotkeyBindings.withBinding action binding pending
-                    buttons.[action].Text <- formatBinding binding
-                    listeningAction <- None)
+            try
+                match listeningAction with
+                | None -> ()
+                | Some action ->
+                    let vk = e.KeyCode
+                    let isModifierOnly =
+                        vk = Keys.ControlKey || vk = Keys.Menu || vk = Keys.ShiftKey
+                        || vk = Keys.LWin || vk = Keys.RWin || vk = Keys.None
+                    if not isModifierOnly then
+                        e.Handled <- true
+                        e.SuppressKeyPress <- true
+                        let modifiers =
+                            (if e.Control then MOD_CONTROL else 0u)
+                            ||| (if e.Alt then MOD_ALT else 0u)
+                            ||| (if e.Shift then MOD_SHIFT else 0u)
+                        let effectiveModifiers = if modifiers = 0u then MOD_CONTROL ||| MOD_ALT else modifiers
+                        let binding = { Modifiers = effectiveModifiers; Vk = uint32 vk }
+                        pending <- HotkeyBindings.withBinding action binding pending
+                        buttons.[action].Text <- formatBinding binding
+                        listeningAction <- None
+            with ex -> onError ex)
 
 type PolicyMode =
     /// Effectを一切発行しない（`DefaultManagement = Excluded`、ルール無し）。配線（フック・
@@ -279,6 +285,16 @@ type ResidentHandle =
       KeepAlive: obj
       /// テスト・診断用——Snapshot/Explain等のクエリを直接投げられる（Round 30参照）。
       ResidentHost: ResidentHost }
+
+/// `printfn`/`eprintfn`はリモート起動（`Start-Process`でのリダイレクト等）では確実に届かないことが
+/// 実機検証で分かった（出力がバッファされたまま、プロセスが`Environment.Exit`等で即終了すると
+/// フラッシュされない）。タスクトレイ・設定画面の例外はファイルへ同期書き込みで残す——ここが
+/// 無ければ「操作中に落ちた気がする」という報告からは原因を一切追えない。
+let private logCrash (appDataDir: string) (context: string) (ex: exn) : unit =
+    try
+        let line = sprintf "[%s] %s: %s\n" (DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff")) context (ex.ToString())
+        File.AppendAllText(Path.Combine(appDataDir, "crash.log"), line)
+    with _ -> ()
 
 /// 常駐ループを1つ起動する。`config.MutexName`の名前付きMutexを先に取得できなければ
 /// （＝既に別の`--resident`インスタンスが動いている）`Error`を返し、何も起動しない（問5）。
@@ -473,9 +489,21 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
     // この1本のスレッド上で、この順序で行う（Opus敵対的相談：フックとホットキー窓はRun()を呼ぶ
     // のと同じスレッドで、Run()の前に登録する——OUTOFCONTEXTコールバックはそのスレッドが
     // `Application.DoEvents()`の中でメッセージを取り出す時にだけ配送されるため）。
+    // AppDomain全体の最後の保険。これが発火した後もプロセスは終了するが、原因をファイルに残せる
+    // （実機検証で、タスクトレイ操作中の例外が記録を一切残さずプロセスを終了させた実例があった）。
+    AppDomain.CurrentDomain.UnhandledException.Add(fun e ->
+        match e.ExceptionObject with
+        | :? exn as ex -> logCrash config.AppDataDir "appdomain-unhandled" ex
+        | _ -> ())
+
     let wmThread =
         Thread(fun () ->
           try
+            // `Application.DoEvents()`経由でメッセージを配送する間に、どこかのイベントハンドラが
+            // 自前のtry/withで拾いきれなかった例外を投げた場合の保険（WinFormsの既定の
+            // ThreadExceptionダイアログは常駐プロセスには出せないため、ログに残すだけにする）。
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException)
+            Application.ThreadException.Add(fun e -> logCrash config.AppDataDir "application-thread-exception" e.Exception)
             // ウォッチドッグ（問4）の心拍は`Run()`開始後は`handleTick`が1tickごとに更新するが、
             // `Run()`開始前のセットアップ（フック登録・ホットキー登録・初回のフル列挙）は1回も
             // `onTick`を経由しない。各ステップの直後にも心拍を打つことで、ウォッチドッグが
@@ -516,10 +544,16 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
             // トレイ（Explorerの通知領域）が無い環境（最小構成のCIランナー等）でも常駐ループ自体は
             // 止めない——失敗したら警告を出すだけでトレイ無しで続行する（RegisterHotKey失敗と同じ方針）。
             let openSettings () =
-                use settingsForm = new SettingsForm(currentBindings, fun newBindings ->
-                    HotkeyBindings.save hotkeyBindingsPath newBindings
-                    reregisterHotkeys newBindings)
-                settingsForm.ShowDialog(hotkeyForm) |> ignore
+                try
+                    use settingsForm =
+                        new SettingsForm(
+                            currentBindings,
+                            (fun newBindings ->
+                                HotkeyBindings.save hotkeyBindingsPath newBindings
+                                reregisterHotkeys newBindings),
+                            (fun ex -> logCrash config.AppDataDir "settings-form" ex))
+                    settingsForm.ShowDialog(hotkeyForm) |> ignore
+                with ex -> logCrash config.AppDataDir "open-settings" ex
             let trayIcon =
                 try
                     let icon = new NotifyIcon(Text = "winmonad (resident)")
@@ -530,12 +564,19 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
                     trayMenu.Items.Add(new ToolStripSeparator()) |> ignore
                     let quitMenuItem = trayMenu.Items.Add("終了(&Q)")
                     icon.ContextMenuStrip <- trayMenu
-                    settingsMenuItem.Click.Add(fun _ -> openSettings ())
-                    quitMenuItem.Click.Add(fun _ -> residentHost.RequestStop())
-                    icon.DoubleClick.Add(fun _ -> openSettings ())
+                    // ここから下はすべてUIイベントハンドラ——例外を自前で握らないとwmThread全体が
+                    // 落ち（finallyが走った後プロセスがexitする、問1参照）、常駐ループ全体が
+                    // ユーザー操作一つで終了してしまう。実機検証で実際にこの経路でクラッシュした。
+                    settingsMenuItem.Click.Add(fun _ ->
+                        try openSettings () with ex -> logCrash config.AppDataDir "tray-settings-click" ex)
+                    quitMenuItem.Click.Add(fun _ ->
+                        try residentHost.RequestStop() with ex -> logCrash config.AppDataDir "tray-quit-click" ex)
+                    icon.DoubleClick.Add(fun _ ->
+                        try openSettings () with ex -> logCrash config.AppDataDir "tray-doubleclick" ex)
                     icon.Visible <- true
                     Some icon
                 with ex ->
+                    logCrash config.AppDataDir "tray-icon-setup" ex
                     eprintfn "[wm-host-resident] tray icon setup failed, continuing without it: %s" ex.Message
                     None
             lastHeartbeat <- Environment.TickCount64
@@ -574,6 +615,7 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
             // セットアップ中（フック登録〜初回列挙）の未処理例外はネイティブコールバック境界の外
             // （P/Invoke呼出しそのものの中ではない）なので、ここで受け止めればプロセス全体を落とさず
             // 済む——問1の「各コールバックはtry/catchで包む」をスレッド本体自体にも適用する。
+            logCrash config.AppDataDir "wmthread-fatal" ex
             eprintfn "[wm-host-resident] FATAL in wmThread: %s" (ex.ToString()))
     wmThread.IsBackground <- true
     wmThread.Name <- "wm-host-resident-wm"
