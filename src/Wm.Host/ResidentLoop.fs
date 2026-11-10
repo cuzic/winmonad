@@ -32,8 +32,11 @@ module Wm.Host.ResidentLoop
 
 open System
 open System.Collections.Concurrent
+open System.Collections.Generic
 open System.Diagnostics
+open System.Drawing
 open System.IO
+open System.Text.Json
 open System.Threading
 open System.Threading.Tasks
 open System.Windows.Forms
@@ -56,6 +59,162 @@ open Wm.Host.PolicyArtifact
 open Wm.Host.InspectPipeServer
 open Wm.DebugProtocol.Intervene
 open Wm.DebugProtocol.TryPolicy
+
+/// タスクトレイアイコン・ショートカットキー設定画面向け。常駐ホットキーは固定の5個の操作に対応する
+/// Win32 `RegisterHotKey`の組（修飾キー＋VK）として永続化する（`%LOCALAPPDATA%\winmonad\hotkeys.json`）。
+/// ケース名に`Hk`を付けているのは、`Wm.Contracts.CoreCommand.CoreCommand`の`FocusNext`/
+/// `SwapWithMaster`ケースと同名になり（本ファイルは`open Wm.Contracts.CoreCommand`済み）、裸の
+/// ケース識別子が曖昧になるのを避けるため（`onHotkey`の`UserCommand FocusNext`はCoreCommand側を指す）。
+type HotkeyAction =
+    | HkFocusNext
+    | HkSwapWithMaster
+    | HkSwitchWorkspace1
+    | HkSwitchWorkspace2
+    | HkQuit
+
+let private actionLabel (action: HotkeyAction) : string =
+    match action with
+    | HkFocusNext -> "次のウィンドウへフォーカス移動"
+    | HkSwapWithMaster -> "マスターウィンドウと入れ替え"
+    | HkSwitchWorkspace1 -> "ワークスペース 1 に切替"
+    | HkSwitchWorkspace2 -> "ワークスペース 2 に切替"
+    | HkQuit -> "終了"
+
+let private allHotkeyActions = [ HkFocusNext; HkSwapWithMaster; HkSwitchWorkspace1; HkSwitchWorkspace2; HkQuit ]
+
+type HotkeyBinding = { Modifiers: uint32; Vk: uint32 }
+
+type HotkeyBindings =
+    { FocusNext: HotkeyBinding
+      SwapWithMaster: HotkeyBinding
+      SwitchWorkspace1: HotkeyBinding
+      SwitchWorkspace2: HotkeyBinding
+      Quit: HotkeyBinding }
+
+module HotkeyBindings =
+    let defaultWith (modifiers: uint32) : HotkeyBindings =
+        { FocusNext = { Modifiers = modifiers; Vk = uint32 VK_J }
+          SwapWithMaster = { Modifiers = modifiers; Vk = uint32 VK_K }
+          SwitchWorkspace1 = { Modifiers = modifiers; Vk = VK_1 }
+          SwitchWorkspace2 = { Modifiers = modifiers; Vk = VK_2 }
+          Quit = { Modifiers = modifiers; Vk = VK_Q } }
+
+    /// `RegisterHotKey`のID（1〜5、既存のWndProcディスパッチと一致させる）順に並べたもの。
+    let toList (b: HotkeyBindings) : (int * HotkeyAction * HotkeyBinding) list =
+        [ 1, HkFocusNext, b.FocusNext
+          2, HkSwapWithMaster, b.SwapWithMaster
+          3, HkSwitchWorkspace1, b.SwitchWorkspace1
+          4, HkSwitchWorkspace2, b.SwitchWorkspace2
+          5, HkQuit, b.Quit ]
+
+    let withBinding (action: HotkeyAction) (binding: HotkeyBinding) (b: HotkeyBindings) : HotkeyBindings =
+        match action with
+        | HkFocusNext -> { b with FocusNext = binding }
+        | HkSwapWithMaster -> { b with SwapWithMaster = binding }
+        | HkSwitchWorkspace1 -> { b with SwitchWorkspace1 = binding }
+        | HkSwitchWorkspace2 -> { b with SwitchWorkspace2 = binding }
+        | HkQuit -> { b with Quit = binding }
+
+    let path (appDataDir: string) : string = Path.Combine(appDataDir, "hotkeys.json")
+
+    let private jsonOptions = JsonSerializerOptions(WriteIndented = true)
+
+    let save (filePath: string) (b: HotkeyBindings) : unit =
+        File.WriteAllText(filePath, JsonSerializer.Serialize(b, jsonOptions))
+
+    /// 既存ファイルがあれば読む（壊れていたら既定値にフォールバック）。無ければ既定値を書き出して
+    /// 返す——設定画面を一度も開かないユーザーでも、手で編集できるファイルが最初から存在するように。
+    let loadOrCreate (filePath: string) (defaultModifiers: uint32) : HotkeyBindings =
+        try
+            if File.Exists filePath then
+                JsonSerializer.Deserialize<HotkeyBindings>(File.ReadAllText filePath)
+            else
+                let defaults = defaultWith defaultModifiers
+                save filePath defaults
+                defaults
+        with _ ->
+            defaultWith defaultModifiers
+
+let private modifierNames (m: uint32) : string list =
+    [ if m &&& MOD_CONTROL <> 0u then yield "Ctrl"
+      if m &&& MOD_ALT <> 0u then yield "Alt"
+      if m &&& MOD_SHIFT <> 0u then yield "Shift" ]
+
+let private vkName (vk: uint32) : string =
+    try (enum<Keys> (int vk)).ToString() with _ -> sprintf "0x%02X" vk
+
+let private formatBinding (b: HotkeyBinding) : string =
+    String.Join("+", modifierNames b.Modifiers @ [ vkName b.Vk ])
+
+/// タスクトレイの「ショートカットキー設定」メニューから開くダイアログ。キー割り当てボタンを押すと
+/// 次に押されたキーをそのまま新しい割り当てとして受け取る（`KeyPreview`＋Form自身の`KeyDown`）。
+/// 保存は呼び出し側の`onSave`コールバックに新しい`HotkeyBindings`を渡すだけ——ファイルへの永続化・
+/// 実際の`RegisterHotKey`再登録は呼び出し側（`startResident`）の責務にする。
+type private SettingsForm(initial: HotkeyBindings, onSave: HotkeyBindings -> unit) as this =
+    inherit Form(
+        Text = "winmonad — ショートカットキー設定",
+        Width = 420,
+        Height = 70 + List.length allHotkeyActions * 32 + 60,
+        FormBorderStyle = FormBorderStyle.FixedDialog,
+        MaximizeBox = false,
+        MinimizeBox = false,
+        StartPosition = FormStartPosition.CenterScreen,
+        KeyPreview = true)
+    let mutable pending = initial
+    let mutable listeningAction : HotkeyAction option = None
+    let buttons = Dictionary<HotkeyAction, Button>()
+
+    let bindingOf (action: HotkeyAction) : HotkeyBinding =
+        HotkeyBindings.toList pending |> List.find (fun (_, a, _) -> a = action) |> fun (_, _, b) -> b
+
+    do
+        allHotkeyActions
+        |> List.iteri (fun i action ->
+            let y = 16 + i * 32
+            let label = Label(Text = actionLabel action, Left = 12, Top = y + 3, Width = 220)
+            let button = Button(Left = 240, Top = y, Width = 150, Text = formatBinding (bindingOf action))
+            button.Click.Add(fun _ ->
+                listeningAction <- Some action
+                button.Text <- "キーを押してください…")
+            buttons.[action] <- button
+            this.Controls.Add(label)
+            this.Controls.Add(button))
+
+        let buttonsTop = 16 + List.length allHotkeyActions * 32 + 16
+        let saveButton = Button(Text = "保存", Left = 150, Top = buttonsTop, Width = 80)
+        let cancelButton = Button(Text = "キャンセル", Left = 240, Top = buttonsTop, Width = 80)
+        saveButton.Click.Add(fun _ ->
+            let keys = HotkeyBindings.toList pending |> List.map (fun (_, _, b) -> b.Modifiers, b.Vk)
+            if keys |> List.distinct |> List.length <> keys.Length then
+                MessageBox.Show(this, "同じキー組み合わせが複数の操作に割り当てられています。重複を解消してください。",
+                    "winmonad", MessageBoxButtons.OK, MessageBoxIcon.Warning) |> ignore
+            else
+                onSave pending
+                this.Close())
+        cancelButton.Click.Add(fun _ -> this.Close())
+        this.Controls.Add(saveButton)
+        this.Controls.Add(cancelButton)
+        this.AcceptButton <- saveButton
+        this.CancelButton <- cancelButton
+
+        this.KeyDown.Add(fun e ->
+            match listeningAction with
+            | None -> ()
+            | Some action ->
+                let vk = e.KeyCode
+                if vk <> Keys.ControlKey && vk <> Keys.Menu && vk <> Keys.ShiftKey
+                   && vk <> Keys.LWin && vk <> Keys.RWin && vk <> Keys.None then
+                    e.Handled <- true
+                    e.SuppressKeyPress <- true
+                    let modifiers =
+                        (if e.Control then MOD_CONTROL else 0u)
+                        ||| (if e.Alt then MOD_ALT else 0u)
+                        ||| (if e.Shift then MOD_SHIFT else 0u)
+                    let effectiveModifiers = if modifiers = 0u then MOD_CONTROL ||| MOD_ALT else modifiers
+                    let binding = { Modifiers = effectiveModifiers; Vk = uint32 vk }
+                    pending <- HotkeyBindings.withBinding action binding pending
+                    buttons.[action].Text <- formatBinding binding
+                    listeningAction <- None))
 
 type PolicyMode =
     /// Effectを一切発行しない（`DefaultManagement = Excluded`、ルール無し）。配線（フック・
@@ -134,6 +293,8 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
     else
 
     Directory.CreateDirectory(config.AppDataDir) |> ignore
+    let hotkeyBindingsPath = HotkeyBindings.path config.AppDataDir
+    let mutable currentBindings = HotkeyBindings.loadOrCreate hotkeyBindingsPath config.HotkeyModifiers
     let journalPath = Path.Combine(config.AppDataDir, "wm-host-resident.ndjson")
     let runtimePolicy = { RuntimePolicy.defaults with Policy = config.Policy; PatternSet = buildTitlePatternSet config.Policy }
     let reducer = Reducer(runtimePolicy, "wm-host-resident", "wm-host-resident", "no-policy-artifact", Some journalPath)
@@ -332,15 +493,49 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
 
             let hotkeyForm = new ResidentHotkeyForm(onHotkey, onDisplayChange, onEndSession)
             hotkeyForm.Show()
-            let hotkeyRegistrations =
-                [ 1, uint32 VK_J, "FocusNext"
-                  2, uint32 VK_K, "SwapWithMaster"
-                  3, VK_1, "SwitchWorkspace(0)"
-                  4, VK_2, "SwitchWorkspace(1)"
-                  5, VK_Q, "Quit" ]
-                |> List.map (fun (id, vk, name) -> name, RegisterHotKey(hotkeyForm.Handle, id, config.HotkeyModifiers, vk))
-            for name, ok in hotkeyRegistrations do
-                if not ok then eprintfn "[wm-host-resident] RegisterHotKey failed for %s (already bound by another app?)" name
+
+            // タスクトレイ設定画面から保存されたキー割り当てで、既存の5個のIDを登録し直す
+            // （WndProcのID→操作ディスパッチ自体は変わらないので、ここは組み合わせの差し替えのみ）。
+            let registerBindings (bindings: HotkeyBindings) =
+                HotkeyBindings.toList bindings
+                |> List.map (fun (id, action, b) -> actionLabel action, RegisterHotKey(hotkeyForm.Handle, id, b.Modifiers, b.Vk))
+                |> List.iter (fun (name, ok) ->
+                    if not ok then eprintfn "[wm-host-resident] RegisterHotKey failed for %s (already bound by another app?)" name)
+            let unregisterBindings () =
+                for id in [ 1; 2; 3; 4; 5 ] do UnregisterHotKey(hotkeyForm.Handle, id) |> ignore
+            let reregisterHotkeys (newBindings: HotkeyBindings) =
+                unregisterBindings ()
+                currentBindings <- newBindings
+                registerBindings newBindings
+            registerBindings currentBindings
+            lastHeartbeat <- Environment.TickCount64
+
+            // タスクトレイアイコン：右クリックでショートカットキー設定画面を開く／終了する。タスク
+            // トレイ（Explorerの通知領域）が無い環境（最小構成のCIランナー等）でも常駐ループ自体は
+            // 止めない——失敗したら警告を出すだけでトレイ無しで続行する（RegisterHotKey失敗と同じ方針）。
+            let openSettings () =
+                use settingsForm = new SettingsForm(currentBindings, fun newBindings ->
+                    HotkeyBindings.save hotkeyBindingsPath newBindings
+                    reregisterHotkeys newBindings)
+                settingsForm.ShowDialog(hotkeyForm) |> ignore
+            let trayIcon =
+                try
+                    let icon = new NotifyIcon(Text = "winmonad (resident)")
+                    // `Icon`を設定する前に`Visible <- true`にすると例外になるので、先にIconを決める。
+                    icon.Icon <- (try Icon.ExtractAssociatedIcon(Application.ExecutablePath) with _ -> SystemIcons.Application)
+                    let trayMenu = new ContextMenuStrip()
+                    let settingsMenuItem = trayMenu.Items.Add("ショートカットキー設定(&S)...")
+                    trayMenu.Items.Add(new ToolStripSeparator()) |> ignore
+                    let quitMenuItem = trayMenu.Items.Add("終了(&Q)")
+                    icon.ContextMenuStrip <- trayMenu
+                    settingsMenuItem.Click.Add(fun _ -> openSettings ())
+                    quitMenuItem.Click.Add(fun _ -> residentHost.RequestStop())
+                    icon.DoubleClick.Add(fun _ -> openSettings ())
+                    icon.Visible <- true
+                    Some icon
+                with ex ->
+                    eprintfn "[wm-host-resident] tray icon setup failed, continuing without it: %s" ex.Message
+                    None
             lastHeartbeat <- Environment.TickCount64
 
             // 初回のフル列挙（フック・ホットキー登録の後、`Run()`の前）。1件ごとに心拍を打つので、
@@ -361,7 +556,8 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
                 pipeCts.Cancel()
                 pipeAcceptThread |> Option.iter (fun t -> t.Join(3000) |> ignore)
                 pipeHandle |> Option.iter (fun p -> try p.Dispose() with _ -> ())
-                for id in [ 1; 2; 3; 4; 5 ] do UnregisterHotKey(hotkeyForm.Handle, id) |> ignore
+                trayIcon |> Option.iter (fun icon -> try icon.Visible <- false; icon.Dispose() with _ -> ())
+                unregisterBindings ()
                 eventHooks.Unhook ()
                 locationHook.Unhook ()
                 // この`finally`自体が`hotkeyForm`を作ったのと同じスレッド上で走っているので、
@@ -411,5 +607,6 @@ let run (config: ResidentConfig) : int =
     | Ok handle ->
         printfn "winmonad resident mode started. AppDataDir / Mutex single-instance check passed."
         printfn "Hotkeys (modifiers as configured): FocusNext / SwapWithMaster / SwitchWorkspace(0/1) / Quit."
+        printfn "Right-click the tray icon to edit shortcut keys or quit."
         handle.WaitForExit(Timeout.Infinite) |> ignore
         0
