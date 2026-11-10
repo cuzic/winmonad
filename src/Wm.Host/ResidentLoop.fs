@@ -202,8 +202,10 @@ type private SettingsForm(initial: HotkeyBindings, onSave: HotkeyBindings -> uni
             | None -> ()
             | Some action ->
                 let vk = e.KeyCode
-                if vk <> Keys.ControlKey && vk <> Keys.Menu && vk <> Keys.ShiftKey
-                   && vk <> Keys.LWin && vk <> Keys.RWin && vk <> Keys.None then
+                let isModifierOnly =
+                    vk = Keys.ControlKey || vk = Keys.Menu || vk = Keys.ShiftKey
+                    || vk = Keys.LWin || vk = Keys.RWin || vk = Keys.None
+                if not isModifierOnly then
                     e.Handled <- true
                     e.SuppressKeyPress <- true
                     let modifiers =
@@ -214,7 +216,7 @@ type private SettingsForm(initial: HotkeyBindings, onSave: HotkeyBindings -> uni
                     let binding = { Modifiers = effectiveModifiers; Vk = uint32 vk }
                     pending <- HotkeyBindings.withBinding action binding pending
                     buttons.[action].Text <- formatBinding binding
-                    listeningAction <- None))
+                    listeningAction <- None)
 
 type PolicyMode =
     /// Effectを一切発行しない（`DefaultManagement = Excluded`、ルール無し）。配線（フック・
