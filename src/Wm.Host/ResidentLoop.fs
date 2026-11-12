@@ -521,17 +521,32 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
                     with _ -> ())
             lastHeartbeat <- Environment.TickCount64
 
-            let hotkeyForm = new ResidentHotkeyForm(onHotkey, onDisplayChange, onEndSession)
+            let mutable hotkeyForm = new ResidentHotkeyForm(onHotkey, onDisplayChange, onEndSession)
             hotkeyForm.Show()
+
+            // 実機検証で、`hotkeyForm`（ホットキー受信専用の隠しウィンドウ）がWM_QUERYENDSESSION/
+            // WM_ENDSESSION等を契機に予期せず破棄される事例を確認した（2026-11-12、タスクトレイの
+            // 「ショートカットキー設定」がObjectDisposedExceptionで無反応になった——`RequestStop`は
+            // 呼ばれていないため`finally`経由の正規の破棄ではない）。破棄されたまま
+            // `RegisterHotKey`/`UnregisterHotKey`/`ShowDialog`の所有者参照に使うと全滅するので、
+            // 使う直前に必ずこれを通し、壊れていたら作り直してホットキーも再登録する。
+            let ensureHotkeyFormAlive () =
+                if hotkeyForm.IsDisposed then
+                    logCrash config.AppDataDir "hotkeyform-recreate"
+                        (Exception "hotkeyForm found disposed outside the normal shutdown path (likely WM_QUERYENDSESSION/WM_ENDSESSION); recreating it to keep hotkeys/settings working")
+                    hotkeyForm <- new ResidentHotkeyForm(onHotkey, onDisplayChange, onEndSession)
+                    hotkeyForm.Show()
 
             // タスクトレイ設定画面から保存されたキー割り当てで、既存の5個のIDを登録し直す
             // （WndProcのID→操作ディスパッチ自体は変わらないので、ここは組み合わせの差し替えのみ）。
             let registerBindings (bindings: HotkeyBindings) =
+                ensureHotkeyFormAlive ()
                 HotkeyBindings.toList bindings
                 |> List.map (fun (id, action, b) -> actionLabel action, RegisterHotKey(hotkeyForm.Handle, id, b.Modifiers, b.Vk))
                 |> List.iter (fun (name, ok) ->
                     if not ok then eprintfn "[wm-host-resident] RegisterHotKey failed for %s (already bound by another app?)" name)
             let unregisterBindings () =
+                ensureHotkeyFormAlive ()
                 for id in [ 1; 2; 3; 4; 5 ] do UnregisterHotKey(hotkeyForm.Handle, id) |> ignore
             let reregisterHotkeys (newBindings: HotkeyBindings) =
                 unregisterBindings ()
@@ -545,6 +560,7 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
             // 止めない——失敗したら警告を出すだけでトレイ無しで続行する（RegisterHotKey失敗と同じ方針）。
             let openSettings () =
                 try
+                    ensureHotkeyFormAlive ()
                     use settingsForm =
                         new SettingsForm(
                             currentBindings,
