@@ -542,9 +542,14 @@ let startResident (config: ResidentConfig) : Result<ResidentHandle, string> =
             let registerBindings (bindings: HotkeyBindings) =
                 ensureHotkeyFormAlive ()
                 HotkeyBindings.toList bindings
-                |> List.map (fun (id, action, b) -> actionLabel action, RegisterHotKey(hotkeyForm.Handle, id, b.Modifiers, b.Vk))
-                |> List.iter (fun (name, ok) ->
-                    if not ok then eprintfn "[wm-host-resident] RegisterHotKey failed for %s (already bound by another app?)" name)
+                |> List.map (fun (id, action, b) -> actionLabel action, formatBinding b, RegisterHotKey(hotkeyForm.Handle, id, b.Modifiers, b.Vk))
+                |> List.iter (fun (name, combo, ok) ->
+                    if not ok then
+                        // `eprintfn`はリモート起動では確実に届かない（292行目のコメント参照）ので、
+                        // 「押しても何も起きない／別アプリが起動する」の原因調査にはこのログが要る。
+                        logCrash config.AppDataDir "register-hotkey-failed"
+                            (Exception (sprintf "%s (%s) already bound by another app on this machine" name combo))
+                        eprintfn "[wm-host-resident] RegisterHotKey failed for %s (already bound by another app?)" name)
             let unregisterBindings () =
                 ensureHotkeyFormAlive ()
                 for id in [ 1; 2; 3; 4; 5 ] do UnregisterHotKey(hotkeyForm.Handle, id) |> ignore
